@@ -33,7 +33,7 @@ from open_webui.utils.filter import (
 )
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.models import check_model_access, get_all_models
-from open_webui.utils.payload import convert_payload_openai_to_ollama
+from open_webui.utils.payload import chat_completion_bypass, convert_payload_openai_to_ollama
 from open_webui.utils.response import (
     convert_response_ollama_to_openai,
     convert_streaming_response_ollama_to_openai,
@@ -159,12 +159,17 @@ async def generate_chat_completion(
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
 
-    # Propagate bypass_filter and bypass_system_prompt via request.state so that
-    # downstream route handlers (openai/ollama) can read them without exposing
-    # them as query parameters.
-    request.state.bypass_filter = bypass_filter
-    request.state.bypass_system_prompt = bypass_system_prompt
+    with chat_completion_bypass(bypass_filter, bypass_system_prompt):
+        return await _generate_chat_completion(request, form_data, user, bypass_filter, bypass_system_prompt)
 
+
+async def _generate_chat_completion(
+    request: Request,
+    form_data: dict,
+    user: Any,
+    bypass_filter: bool,
+    bypass_system_prompt: bool,
+):
     if hasattr(request.state, 'metadata'):
         if 'metadata' not in form_data:
             form_data['metadata'] = request.state.metadata

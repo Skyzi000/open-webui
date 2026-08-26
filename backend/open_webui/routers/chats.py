@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
@@ -41,7 +42,7 @@ from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import get_all_models
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,10 @@ CHAT_CONFIG_KEYS = {
     'CONTEXT_COMPACTION_RETENTION_PERCENTAGE': 'chat.context_compaction.retention_percentage',
     'CONTEXT_COMPACTION_PROMPT_TEMPLATE': 'chat.context_compaction.prompt_template',
     'ENABLE_TOOL_PERMISSIONS': 'chat.tool_permissions.enable',
+    'CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO': 'chat.context_compaction.soft_trigger_ratio',
+    'CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS': 'chat.context_compaction.transient_message_patterns',
+    'ENABLE_EXTERNALIZED_REFS': 'chat.externalized_refs.enable',
+    'EXTERNALIZED_REFS_TOKEN_THRESHOLD': 'chat.externalized_refs.token_threshold',
 }
 
 
@@ -165,6 +170,27 @@ class ChatConfigForm(BaseModel):
     CONTEXT_COMPACTION_RETENTION_PERCENTAGE: int = 40
     CONTEXT_COMPACTION_PROMPT_TEMPLATE: str
     ENABLE_TOOL_PERMISSIONS: bool = False
+    CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO: float = Field(
+        default=0.5, ge=0, lt=1, allow_inf_nan=False
+    )
+    CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS: str = ''
+    ENABLE_EXTERNALIZED_REFS: bool = False
+    EXTERNALIZED_REFS_TOKEN_THRESHOLD: int = Field(default=10000, ge=1000)
+
+    @field_validator('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS')
+    @classmethod
+    def validate_transient_message_patterns(cls, value: str) -> str:
+        for line_number, line in enumerate(value.splitlines(), start=1):
+            pattern = line.strip()
+            if not pattern:
+                continue
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(
+                    f'Invalid transient message regex on line {line_number}: {exc}'
+                ) from exc
+        return value
 
 
 class CompactChatForm(BaseModel):
@@ -221,6 +247,14 @@ async def get_chat_config_values() -> dict:
         config['CONTEXT_COMPACTION_TOKEN_CAP'] = config.get('CONTEXT_COMPACTION_TOKEN_THRESHOLD', 80000)
     if config.get('CONTEXT_COMPACTION_RETENTION_PERCENTAGE') is None:
         config['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] = 40
+    if config.get('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO') is None:
+        config['CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO'] = 0.5
+    if config.get('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS') is None:
+        config['CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS'] = ''
+    if config.get('ENABLE_EXTERNALIZED_REFS') is None:
+        config['ENABLE_EXTERNALIZED_REFS'] = False
+    if config.get('EXTERNALIZED_REFS_TOKEN_THRESHOLD') is None:
+        config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = 10000
     return config
 
 

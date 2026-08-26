@@ -50,7 +50,11 @@
 		CONTEXT_COMPACTION_TOKEN_CAP: 80000,
 		CONTEXT_COMPACTION_RETENTION_PERCENTAGE: 40,
 		CONTEXT_COMPACTION_PROMPT_TEMPLATE: '',
-		ENABLE_TOOL_PERMISSIONS: false
+		ENABLE_TOOL_PERMISSIONS: false,
+		CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO: 0.5,
+		CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS: '',
+		ENABLE_EXTERNALIZED_REFS: false,
+		EXTERNALIZED_REFS_TOKEN_THRESHOLD: 10000
 	};
 	let showTaskParameters = false;
 
@@ -336,6 +340,22 @@
 					</AdminSettingField>
 
 					<AdminSettingField
+						label={$i18n.t('Soft Trigger Ratio')}
+						description={$i18n.t(
+							'Fraction of the token threshold that starts background summary generation. Set to 0 to disable.'
+						)}
+					>
+						<input
+							type="number"
+							min="0"
+							max="0.99"
+							step="0.01"
+							class={inputClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO}
+						/>
+					</AdminSettingField>
+
+					<AdminSettingField
 						label={$i18n.t('Retained Messages')}
 						description={$i18n.t(
 							'Percentage of recent messages to keep after older messages are summarized.'
@@ -372,6 +392,46 @@
 							<code>{'{{MESSAGES}}'}</code>,
 							<code>{'{{CURRENT_DATE}}'}</code>
 						</div>
+					</AdminSettingField>
+
+					<AdminSettingField
+						label={$i18n.t('Transient Message Patterns')}
+						description={$i18n.t(
+							'Newline-separated regular expressions for injected user messages to ignore when choosing compaction boundaries and the current user prompt. Empty disables matching.'
+						)}
+					>
+						<Textarea
+							className={textareaClass}
+							bind:value={chatConfig.CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS}
+							placeholder={$i18n.t('One regular expression per line')}
+						/>
+					</AdminSettingField>
+				{/if}
+
+				<AdminSettingRow
+					label={$i18n.t('Externalized References')}
+					description={$i18n.t(
+						'Replace oversized native-tool text with references that the model can read on demand.'
+					)}
+					let:labelId
+				>
+					<Switch bind:state={chatConfig.ENABLE_EXTERNALIZED_REFS} ariaLabelledbyId={labelId} />
+				</AdminSettingRow>
+
+				{#if chatConfig.ENABLE_EXTERNALIZED_REFS}
+					<AdminSettingField
+						label={$i18n.t('Externalized Reference Token Threshold')}
+						description={$i18n.t(
+							'Native-tool text at or above this token count is replaced with an on-demand reference.'
+						)}
+					>
+						<input
+							type="number"
+							min="1000"
+							step="1000"
+							class={inputClass}
+							bind:value={chatConfig.EXTERNALIZED_REFS_TOKEN_THRESHOLD}
+						/>
 					</AdminSettingField>
 				{/if}
 			</AdminSettingSection>

@@ -1,4 +1,6 @@
+import contextvars
 import logging
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 from open_webui.utils.chat_variables import render_chat_variables, render_user_variables
@@ -12,6 +14,24 @@ from open_webui.utils.misc import (
 from open_webui.utils.task import prompt_template, prompt_variables_template
 
 log = logging.getLogger(__name__)
+
+
+_chat_completion_bypass: contextvars.ContextVar[tuple[bool, bool]] = contextvars.ContextVar(
+    'chat_completion_bypass', default=(False, False)
+)
+
+
+@contextmanager
+def chat_completion_bypass(bypass_filter: bool, bypass_system_prompt: bool):
+    token = _chat_completion_bypass.set((bypass_filter, bypass_system_prompt))
+    try:
+        yield
+    finally:
+        _chat_completion_bypass.reset(token)
+
+
+def get_chat_completion_bypass() -> tuple[bool, bool]:
+    return _chat_completion_bypass.get()
 
 
 async def resolve_system_prompt(
@@ -84,8 +104,8 @@ def apply_model_params_to_body(params: dict, form_data: dict, mappings: dict[str
 
 def apply_params_to_form_data(form_data: dict, model: dict, params: dict | None = None) -> dict:
     payload_params = form_data.pop('params', {}) or {}
-    params = payload_params if params is None else dict(params)
-    custom_params = params.pop('custom_params', {})
+    params = dict(payload_params if params is None else params)
+    custom_params = dict(params.pop('custom_params', {}) or {})
 
     open_webui_params = {
         'stream_response': bool,

@@ -230,6 +230,7 @@ from open_webui.utils.chat_id import (
 from open_webui.utils.chat_variables import (
     normalize_chat_variables,
 )
+from open_webui.utils.context_compaction import forward_with_context_retry
 from open_webui.utils.embeddings import generate_embeddings
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.json_response import apply_orjson_http_json
@@ -237,7 +238,7 @@ from open_webui.utils.logger import start_logger
 from open_webui.utils.middleware import (
     background_tasks_handler,
     build_chat_response_context,
-    drain_approved_tool_calls,
+    prepare_context_overflow_retry,
     process_chat_payload,
     process_chat_response,
 )
@@ -1623,12 +1624,40 @@ async def chat_completion(
 
     async def process_chat(request, form_data, user, metadata, model, tasks=None):
         try:
-            form_data, metadata, events = await process_chat_payload(request, form_data, user, metadata, model)
+            form_data, metadata, events, compaction_state = await process_chat_payload(
+                request,
+                form_data,
+                user,
+                metadata,
+                model,
+                default_model_params=default_model_params,
+                request_params=request_params,
+                resolved_model_id=model_id,
+                resolved_model_params=model_info_params,
+            )
 
-            if await drain_approved_tool_calls(request, form_data, user, model, metadata):
+            if compaction_state.get('paused'):
                 return {'status': True, 'chat_id': metadata.get('chat_id'), 'paused': True}
 
-            response = await chat_completion_handler(request, form_data, user)
+            async def send(candidate):
+                return await chat_completion_handler(
+                    request,
+                    candidate,
+                    user,
+                    bypass_system_prompt=True,
+                )
+
+            async def retry(candidate):
+                return await prepare_context_overflow_retry(
+                    request,
+                    user,
+                    candidate,
+                    metadata,
+                    candidate.get('model') or form_data.get('model'),
+                    compaction_state,
+                )
+
+            response, form_data = await forward_with_context_retry(send, form_data, retry)
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion
@@ -1638,7 +1667,16 @@ async def chat_completion(
             if isinstance(response, JSONResponse) and response.status_code >= 400:
                 raise Exception(get_response_error_detail(response))
 
-            ctx = await build_chat_response_context(request, form_data, user, model, metadata, tasks, events)
+            ctx = await build_chat_response_context(
+                request,
+                form_data,
+                user,
+                model,
+                metadata,
+                tasks,
+                events,
+                compaction_state,
+            )
 
             return await process_chat_response(response, ctx)
         except asyncio.CancelledError:

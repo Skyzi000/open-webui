@@ -43,6 +43,7 @@ from open_webui.utils.payload import (
     apply_model_params_to_body_ollama,
     apply_model_params_to_body_openai,
     apply_system_prompt_to_body,
+    get_chat_completion_bypass,
 )
 from open_webui.utils.session_pool import cleanup_response, get_client_timeout, get_session, stream_wrapper
 from pydantic import BaseModel, ConfigDict, validator
@@ -1100,14 +1101,9 @@ async def generate_chat_completion(
     # This prevents holding a connection during the entire LLM call (30-60+ seconds),
     # which would exhaust the connection pool under concurrent load.
 
-    # bypass_filter and bypass_system_prompt are read from request.state to prevent
-    # external clients from setting them via query parameter. Only internal
-    # server-side callers (e.g. utils/chat.py) should set
-    # request.state.bypass_filter / request.state.bypass_system_prompt = True.
-    bypass_filter = getattr(request.state, 'bypass_filter', False)
+    bypass_filter, bypass_system_prompt = get_chat_completion_bypass()
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
-    bypass_system_prompt = getattr(request.state, 'bypass_system_prompt', False)
 
     metadata = form_data.pop('metadata', None)
     try:
