@@ -10,7 +10,7 @@ import shlex
 import time
 from bisect import bisect_right
 from collections import deque
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -146,12 +146,12 @@ def _measure_text(
     )
 
 
-def _eligible_entry(
+def _is_externalization_eligible(
     text: str,
     *,
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None,
-) -> RefEntry | None:
+) -> bool:
     # A source with at most this many characters can be classified for the token
     # threshold before paying for a digest. Longer valid strings are necessarily
     # over the byte cap and are externalized without tokenizer work.
@@ -159,16 +159,31 @@ def _eligible_entry(
         try:
             encoded_size = len(text.encode('utf-8'))
         except UnicodeEncodeError:
-            return None
+            return False
         if encoded_size <= REF_EXEC_RESPONSE_MAX_BYTES:
             if count_tokens is None:
-                return None
+                return False
             try:
                 tokens = count_tokens(text)
             except Exception:
-                return None
+                return False
             if tokens is None or tokens < threshold_tokens:
-                return None
+                return False
+    return True
+
+
+def _eligible_entry(
+    text: str,
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
+) -> RefEntry | None:
+    if not _is_externalization_eligible(
+        text,
+        threshold_tokens=threshold_tokens,
+        count_tokens=count_tokens,
+    ):
+        return None
     return make_ref_entry(text, kind='tool')
 
 
@@ -250,29 +265,16 @@ async def _capture_projections(
     *,
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None,
-    excluded_tool_call_ids: Iterable[str] = (),
     existing_refs: Iterable[str] = (),
 ) -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
-    excluded = set(excluded_tool_call_ids)
     existing = set(existing_refs)
-    excluded.update(
-        call['id']
-        for message in messages
-        if isinstance(message, dict) and message.get('role') == 'assistant'
-        for call in message.get('tool_calls') or []
-        if isinstance(call, dict)
-        and isinstance(call.get('id'), str)
-        and isinstance(call.get('function'), dict)
-        and call['function'].get('name') == REF_EXEC_TOOL_NAME
-    )
     candidates = [
-        (index, message, message.get('content'))
+        (index, message, source)
         for index, message in enumerate(messages)
         if isinstance(message, dict)
         and message.get('role') == 'tool'
-        and isinstance(message.get('content'), str)
-        and message.get('tool_call_id') not in excluded
-        and message.get('content') not in existing
+        and isinstance((source := message.get('content')), str)
+        and (len(source) not in (69, 72) or source not in existing)
     ]
 
     def classify() -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
@@ -297,8 +299,7 @@ async def externalize_refs(
     native: bool,
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None = None,
-    history_entry: RefEntry | None = None,
-    excluded_tool_call_ids: Iterable[str] = (),
+    history_loader: Callable[[], Awaitable[RefEntry | None]] | None = None,
 ) -> bool:
     """Install or extend one Core-owned reader and project eligible tool messages.
 
@@ -322,9 +323,9 @@ async def externalize_refs(
         messages,
         threshold_tokens=threshold_tokens,
         count_tokens=count_tokens,
-        excluded_tool_call_ids=excluded_tool_call_ids,
         existing_refs=(reader.__externalized_ref_catalog__ if reader is not None else ()),
     )
+    history_entry = await history_loader() if history_loader is not None else None
     if history_entry is not None and (
         not history_entry.ref.startswith('history:') or not _valid_ref(history_entry.ref)
     ):
@@ -339,7 +340,11 @@ async def externalize_refs(
 
     if reader is None:
         catalog: dict[str, RefEntry] = {}
-        reader = _new_reader(catalog)
+        reader = _new_reader(
+            catalog,
+            threshold_tokens=threshold_tokens,
+            count_tokens=count_tokens,
+        )
     else:
         catalog = reader.__externalized_ref_catalog__
 
@@ -765,14 +770,43 @@ def _truncated_marker(next_command: str) -> str:
     return f'\n<auto_compact_ref_truncated>{payload}</auto_compact_ref_truncated>'
 
 
-def _page_source(entry: RefEntry, *, start: int = 1, end: int | None = None) -> str:
+def _truncate_rendered(
+    text: str,
+    marker: str,
+    response_fits: Callable[[str], bool],
+) -> str:
+    if response_fits(text):
+        return text
+    result = marker if response_fits(marker) else ''
+    low = 0
+    high = min(len(text), REF_EXEC_RESPONSE_MAX_BYTES)
+    while low <= high:
+        boundary = (low + high) // 2
+        candidate = text[:boundary] + marker
+        if response_fits(candidate):
+            result = candidate
+            low = boundary + 1
+        else:
+            high = boundary - 1
+    return result
+
+
+def _page_source(
+    entry: RefEntry,
+    response_fits: Callable[[str], bool],
+    *,
+    start: int = 1,
+    end: int | None = None,
+) -> str:
     requested = max(0, start - 1)
     char_start, actual_start = _seek_source_byte(entry, requested)
     effective_end = entry.utf8_bytes if end is None else min(entry.utf8_bytes, end)
     remaining = max(0, effective_end - actual_start)
     if remaining <= REF_EXEC_RESPONSE_MAX_BYTES:
         char_end, _ = _utf8_prefix_end(entry.text, char_start, remaining)
-        return entry.text[char_start:char_end]
+        complete = entry.text[char_start:char_end]
+        if response_fits(complete):
+            return complete
 
     low = 0
     high = min(remaining, REF_EXEC_RESPONSE_MAX_BYTES)
@@ -781,9 +815,12 @@ def _page_source(entry: RefEntry, *, start: int = 1, end: int | None = None) -> 
         budget = (low + high) // 2
         char_end, emitted = _utf8_prefix_end(entry.text, char_start, budget)
         next_byte = actual_start + emitted + 1
-        marker = _truncated_marker(f'tail -c +{next_byte} {entry.ref}')
+        next_command = f'tail -c +{next_byte} {entry.ref}'
+        if effective_end < entry.utf8_bytes:
+            next_command += f' | head -c {effective_end - actual_start - emitted}'
+        marker = _truncated_marker(next_command)
         candidate = entry.text[char_start:char_end] + marker
-        if len(candidate.encode('utf-8')) <= REF_EXEC_RESPONSE_MAX_BYTES:
+        if response_fits(candidate):
             result = candidate
             low = budget + 1
         else:
@@ -791,7 +828,12 @@ def _page_source(entry: RefEntry, *, start: int = 1, end: int | None = None) -> 
     return result
 
 
-def _render_lines(lines: Iterable[_Line], *, preserve_source_newlines: bool) -> str:
+def _render_lines(
+    lines: Iterable[_Line],
+    response_fits: Callable[[str], bool],
+    *,
+    preserve_source_newlines: bool,
+) -> str:
     pieces: list[str] = []
     used = 0
     for line in lines:
@@ -799,48 +841,71 @@ def _render_lines(lines: Iterable[_Line], *, preserve_source_newlines: bool) -> 
         ending = '\n' if preserve_source_newlines and line.has_newline else ''
         piece = separator + line.presented + ending
         size = len(piece.encode('utf-8'))
+        if (
+            not pieces
+            and line.match_start is not None
+            and line.match_end is not None
+            and (size > REF_EXEC_RESPONSE_MAX_BYTES or not response_fits(piece))
+        ):
+            return _grep_excerpt(line, response_fits)
         if used + size <= REF_EXEC_RESPONSE_MAX_BYTES:
             pieces.append(piece)
             used += size
             continue
-        if not pieces and line.match_start is not None and line.match_end is not None:
-            return _grep_excerpt(line)
         marker = _truncated_marker('wc|grep|head|tail|sed')
-        available = max(0, REF_EXEC_RESPONSE_MAX_BYTES - len(marker.encode('utf-8')))
         prefix = ''.join(pieces) + piece
-        char_end, _ = _utf8_prefix_end(prefix, 0, available)
-        return prefix[:char_end] + marker
-    return ''.join(pieces)
+        return _truncate_rendered(prefix, marker, response_fits)
+    result = ''.join(pieces)
+    return _truncate_rendered(result, _truncated_marker('wc|grep|head|tail|sed'), response_fits)
 
 
-def _grep_excerpt(line: _Line) -> str:
+def _grep_excerpt(line: _Line, response_fits: Callable[[str], bool]) -> str:
     match_start = line.match_start or 0
     match_end = line.match_end or match_start
     match = line.text[match_start:match_end]
     match_bytes = len(match.encode('utf-8'))
     prefix_bytes = len(line.display_prefix.encode('utf-8'))
-    if prefix_bytes + match_bytes + 512 >= REF_EXEC_RESPONSE_MAX_BYTES:
-        return 'Error: complete grep match exceeds the response budget; page source bytes with tail -c +N REF'
+    before_match_bytes = len(line.text[:match_start].encode('utf-8'))
+    after_match_bytes = len(line.text[match_end:].encode('utf-8'))
 
     # At most four UTF-8 bytes per character on each side. Reserving 512 bytes
     # for provenance makes this bounded without repeatedly re-encoding the line.
     margin = (REF_EXEC_RESPONSE_MAX_BYTES - prefix_bytes - match_bytes - 512) // 8
-    left = max(0, match_start - max(0, margin))
-    right = min(len(line.text), match_end + max(0, margin))
-    excerpt = line.text[left:right]
-    if line.source_byte_start is not None:
-        match_byte_start = line.source_byte_start + len(line.text[:match_start].encode('utf-8'))
-        metadata = {
-            'match_byte_start': match_byte_start,
-            'match_byte_end': match_byte_start + match_bytes,
-            'omitted_prefix_bytes': len(line.text[:left].encode('utf-8')),
-            'omitted_suffix_bytes': len(line.text[right:].encode('utf-8')),
-        }
-        payload = json.dumps(metadata, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
-        marker = f'\n<auto_compact_ref_excerpt>{payload}</auto_compact_ref_excerpt>'
-    else:
-        marker = _truncated_marker('wc|grep|head|tail|sed')
-    return line.display_prefix + excerpt + marker
+
+    def render(context_chars: int) -> str:
+        left = max(0, match_start - context_chars)
+        right = min(len(line.text), match_end + context_chars)
+        excerpt = line.text[left:right]
+        if line.source_byte_start is None:
+            marker = _truncated_marker('wc|grep|head|tail|sed')
+        else:
+            left_context_bytes = len(line.text[left:match_start].encode('utf-8'))
+            right_context_bytes = len(line.text[match_end:right].encode('utf-8'))
+            match_byte_start = line.source_byte_start + before_match_bytes
+            metadata = {
+                'match_byte_start': match_byte_start,
+                'match_byte_end': match_byte_start + match_bytes,
+                'omitted_prefix_bytes': before_match_bytes - left_context_bytes,
+                'omitted_suffix_bytes': after_match_bytes - right_context_bytes,
+            }
+            payload = json.dumps(metadata, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+            marker = f'\n<auto_compact_ref_excerpt>{payload}</auto_compact_ref_excerpt>'
+        return line.display_prefix + excerpt + marker
+
+    result = render(0)
+    if not response_fits(result):
+        return 'Error: complete grep match exceeds the response budget; page source bytes with tail -c +N REF'
+    low = 1
+    high = max(0, margin)
+    while low <= high:
+        context_chars = (low + high) // 2
+        candidate = render(context_chars)
+        if response_fits(candidate):
+            result = candidate
+            low = context_chars + 1
+        else:
+            high = context_chars - 1
+    return result
 
 
 def _head_bytes(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
@@ -914,24 +979,61 @@ def _apply_stage(lines: Iterable[_Line], stage: _Stage, budget: MatchBudget) -> 
     return lines
 
 
-def _direct_response(stage: _Stage, entry: RefEntry) -> str | None:
+def _bounded_head_page(
+    stages: tuple[_Stage, ...],
+    entry: RefEntry,
+    response_fits: Callable[[str], bool],
+) -> str | None:
+    if len(stages) != 2:
+        return None
+    source, consumer = stages
+    if source.command != 'tail' or source.byte_start is None:
+        return None
+    if consumer.command != 'head' or consumer.byte_count is None:
+        return None
+    return _page_source(
+        entry,
+        response_fits,
+        start=source.byte_start,
+        end=source.byte_start - 1 + consumer.byte_count,
+    )
+
+
+def _direct_wc(entry: RefEntry, flag: str) -> str:
+    if flag == 'c':
+        return str(entry.utf8_bytes)
+    if flag == 'l':
+        return str(entry.line_count)
+    return str(_word_count(entry.text))
+
+
+def _direct_response(
+    stages: tuple[_Stage, ...],
+    entry: RefEntry,
+    response_fits: Callable[[str], bool],
+) -> str | None:
+    bounded_page = _bounded_head_page(stages, entry, response_fits)
+    if bounded_page is not None:
+        return bounded_page
+    if len(stages) != 1:
+        return None
+    stage = stages[0]
     if stage.command == 'cat':
-        return _page_source(entry)
+        return _page_source(entry, response_fits)
     if stage.command == 'head' and stage.byte_count is not None:
-        return _page_source(entry, end=stage.byte_count)
+        return _page_source(entry, response_fits, end=stage.byte_count)
     if stage.command == 'tail' and stage.byte_start is not None:
-        return _page_source(entry, start=stage.byte_start)
+        return _page_source(entry, response_fits, start=stage.byte_start)
     if stage.command == 'tail' and stage.byte_count is not None:
         if stage.byte_count > REF_EXEC_TAIL_MAX_BYTES:
             raise RefExecError('Error: tail byte count exceeds the 8 MiB limit')
-        return _page_source(entry, start=max(1, entry.utf8_bytes - stage.byte_count + 1))
+        return _page_source(
+            entry,
+            response_fits,
+            start=max(1, entry.utf8_bytes - stage.byte_count + 1),
+        )
     if stage.command == 'wc':
-        flag = next(iter(stage.flags))
-        if flag == 'c':
-            return str(entry.utf8_bytes)
-        if flag == 'l':
-            return str(entry.line_count)
-        return str(_word_count(entry.text))
+        return _direct_wc(entry, next(iter(stage.flags)))
     return None
 
 
@@ -943,9 +1045,10 @@ def _initial_lines(stage: _Stage, catalog: dict[str, RefEntry]) -> Iterable[_Lin
     if entry is None:
         raise RefExecError('Error: externalized ref is not available in this request')
     if stage.command == 'stat':
+        digest = entry.ref.split(':', 1)[1]
         value = (
             f'ref={entry.ref} kind={entry.ref.split(":", 1)[0]} utf8_bytes={entry.utf8_bytes} '
-            f'lines={entry.line_count} chars={len(entry.text)} sha256={entry.ref[5:]}'
+            f'lines={entry.line_count} chars={len(entry.text)} sha256={digest}'
         )
         return (_Line(value, False),)
     return _iter_source_lines(entry)
@@ -954,15 +1057,28 @@ def _initial_lines(stage: _Stage, catalog: dict[str, RefEntry]) -> Iterable[_Lin
 def _execute_reader(
     stages: tuple[_Stage, ...],
     catalog: dict[str, RefEntry],
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
 ) -> str:
+    def response_fits(value: str) -> bool:
+        return not _is_externalization_eligible(
+            value,
+            threshold_tokens=threshold_tokens,
+            count_tokens=count_tokens,
+        )
+
     first = stages[0]
     entry = catalog.get(first.ref or '')
     if first.command != 'ls' and entry is None:
         raise RefExecError('Error: externalized ref is not available in this request')
-    if entry is not None and len(stages) == 1:
-        direct = _direct_response(first, entry)
+    if entry is not None:
+        direct = _direct_response(stages, entry, response_fits)
         if direct is not None:
-            return direct
+            return _truncate_rendered(
+                direct,
+                _truncated_marker('wc|grep|head|tail|sed'),
+                response_fits,
+            )
 
     lines = _initial_lines(first, catalog)
     budget = MatchBudget()
@@ -975,7 +1091,11 @@ def _execute_reader(
     preserve = (
         (len(stages) == 1 and first.command == 'head') or final.byte_count is not None or final.byte_start is not None
     )
-    return _render_lines(lines, preserve_source_newlines=preserve)
+    return _render_lines(
+        lines,
+        response_fits,
+        preserve_source_newlines=preserve,
+    )
 
 
 async def _load_history_refs(
@@ -1006,6 +1126,9 @@ async def _load_history_refs(
 
 def _new_reader(
     catalog: dict[str, RefEntry],
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
 ) -> Callable[[str], Any]:
     async def reader(command: str = '') -> str:
         """Read request-local externalized content with bounded text commands.
@@ -1018,7 +1141,13 @@ def _new_reader(
                 return REF_EXEC_USAGE_ERROR
             stages = _parse_command(command)
             await _load_history_refs(stages, catalog)
-            return await asyncio.to_thread(_execute_reader, stages, dict(catalog))
+            return await asyncio.to_thread(
+                _execute_reader,
+                stages,
+                dict(catalog),
+                threshold_tokens,
+                count_tokens,
+            )
         except (RefExecError, MatchBudgetExceeded) as exc:
             return f'Error: {exc}' if not str(exc).startswith('Error:') else str(exc)
         except Exception:

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import codecs
 import copy
-import hashlib
 import json
 import logging
 import math
@@ -57,11 +56,8 @@ _MEDIA_PART_TYPES = {'file', 'image', 'image_url', 'input_audio', 'input_file', 
 _BOUNDARY_KEY = '_open_webui_context_compaction_boundary'
 CONTEXT_COMPACTION_USAGE_ANCHOR_KEY = '_open_webui_context_compaction_usage_anchor'
 CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY = '_open_webui_context_compaction_transient'
-_SUMMARY_META_KEY = 'context_compaction'
-_SUMMARY_META_VERSION = 1
 _DEFAULT_EXCERPT_BYTES = 512
 _DEFAULT_EXCERPT_COUNT = 32
-_HISTORY_FORMAT = 'canonical-history-jsonl-v1'
 _HISTORY_REF_XML_RE = re.compile(r'<history_ref>history:[0-9a-f]{64}</history_ref>')
 _HISTORY_IGNORED_KEYS = frozenset(
     {
@@ -93,29 +89,6 @@ _HISTORY_IGNORED_KEYS = frozenset(
         'feedback',
         'metadata',
         'meta',
-    }
-)
-_FILE_IDENTITY_KEYS = frozenset(
-    {
-        'checksum',
-        'collection_name',
-        'collection_names',
-        'content_type',
-        'file',
-        'file_hash',
-        'file_id',
-        'filename',
-        'hash',
-        'id',
-        'legacy',
-        'meta',
-        'metadata',
-        'mime_type',
-        'name',
-        'revision',
-        'sha256',
-        'type',
-        'version',
     }
 )
 
@@ -239,7 +212,14 @@ def _canonical_history_content(value: Any, *, required: bool) -> str | list[dict
             image_url = part.get('image_url')
             if set(part) != {'type', 'image_url'} or not (
                 isinstance(image_url, str)
-                or (isinstance(image_url, dict) and set(image_url) == {'url'} and isinstance(image_url.get('url'), str))
+                or (
+                    isinstance(image_url, dict)
+                    and set(image_url) <= {'url', 'detail'}
+                    and isinstance(image_url.get('url'), str)
+                    and (
+                        'detail' not in image_url or image_url['detail'] is None or isinstance(image_url['detail'], str)
+                    )
+                )
             ):
                 raise CanonicalHistoryError('unknown content shape')
             canonical.append({'type': 'omitted_media', 'media': 'image'})
@@ -337,15 +317,27 @@ def _canonical_output_messages(output: Any) -> list[dict[str, Any]]:
                 raise CanonicalHistoryError('unknown output shape')
             text = ''
             for part in parts:
-                if (
-                    not isinstance(part, dict)
-                    or not set(part) <= {'type', 'text', 'annotations'}
-                    or part.get('type') != 'output_text'
-                    or not isinstance(part.get('text'), str)
-                    or ('annotations' in part and not isinstance(part['annotations'], list))
-                ):
+                if not isinstance(part, dict):
                     raise CanonicalHistoryError('unknown content shape')
-                text += part['text']
+                if part.get('type') == 'output_text':
+                    if (
+                        not set(part) <= {'type', 'text', 'annotations', 'logprobs'}
+                        or not isinstance(part.get('text'), str)
+                        or ('annotations' in part and not isinstance(part['annotations'], list))
+                        or (
+                            'logprobs' in part
+                            and part['logprobs'] is not None
+                            and not isinstance(part['logprobs'], list)
+                        )
+                    ):
+                        raise CanonicalHistoryError('unknown content shape')
+                    text += part['text']
+                elif part.get('type') == 'refusal':
+                    if set(part) != {'type', 'refusal'} or not isinstance(part.get('refusal'), str):
+                        raise CanonicalHistoryError('unknown content shape')
+                    text += part['refusal']
+                else:
+                    raise CanonicalHistoryError('unknown content shape')
             if text:
                 content.append(text)
         elif item_type == 'function_call':
@@ -392,11 +384,11 @@ def _canonical_output_messages(output: Any) -> list[dict[str, Any]]:
                     raise CanonicalHistoryError('unknown output shape')
                 output_text = code_output.get('stdout') or code_output.get('result') or code_output.get('stderr') or ''
                 if not isinstance(output_text, str):
-                    raise CanonicalHistoryError('unknown output shape')
-            elif isinstance(code_output, str):
-                output_text = code_output
+                    output_text = str(output_text)
+            elif code_output is None:
+                output_text = ''
             else:
-                raise CanonicalHistoryError('unknown output shape')
+                output_text = str(code_output)
             if output_text:
                 content.append(f'<code_interpreter_output>\n{output_text}\n</code_interpreter_output>')
         elif item_type in {
@@ -414,9 +406,8 @@ def _canonical_output_messages(output: Any) -> list[dict[str, Any]]:
 
 def _canonical_messages(
     message: dict[str, Any],
-    patterns: tuple[re.Pattern[str], ...] = (),
 ) -> list[dict[str, Any]]:
-    if message.get('role') == 'system' or _is_transient_message(message, patterns):
+    if message.get('role') == 'system' or _is_transient_message(message):
         return []
     if message.get('role') == 'assistant' and message.get('output'):
         semantic_keys = set(message) - _HISTORY_IGNORED_KEYS
@@ -429,141 +420,16 @@ def _canonical_messages(
     return [_canonical_direct_history_message(direct)]
 
 
-def _canonical_history_source(
-    messages: list[dict[str, Any]],
-    patterns: tuple[re.Pattern[str], ...] = (),
-) -> tuple[str, str]:
-    entry = _canonical_history_entry(messages, patterns)
-    return entry.text, entry.ref.split(':', 1)[1]
-
-
-def _canonical_history_entry(
-    messages: list[dict[str, Any]],
-    patterns: tuple[re.Pattern[str], ...] = (),
-    expanded: list[tuple[dict[str, Any], list[dict[str, Any]]]] | None = None,
-) -> RefEntry:
-    expanded = expanded if expanded is not None else _expanded_history(messages, patterns)
+def _canonical_history_entry(messages: list[dict[str, Any]]) -> RefEntry:
     records = [
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-        for _, canonical in expanded
-        for item in canonical
+        for message in messages
+        for item in _canonical_messages(message)
     ]
     text = '\n'.join(records)
     entry = make_ref_entry(text, kind='history')
     if entry is None:
         raise CanonicalHistoryError('history source is not valid UTF-8')
-    return entry
-
-
-def _expanded_history(
-    messages: list[dict[str, Any]],
-    patterns: tuple[re.Pattern[str], ...],
-) -> list[tuple[dict[str, Any], list[dict[str, Any]]]]:
-    return [(message, _canonical_messages(message, patterns)) for message in messages]
-
-
-def _stable_file_identity(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: item
-            for key in sorted(value)
-            if key in _FILE_IDENTITY_KEYS and (item := _stable_file_identity(value[key])) not in (None, {}, [])
-        }
-    if isinstance(value, list):
-        return [item for raw in value if (item := _stable_file_identity(raw)) not in (None, {}, [])]
-    return value
-
-
-def _stable_general_value(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: item
-            for key in sorted(value)
-            if key != 'distances' and (item := _stable_general_value(value[key])) not in (None, {}, [])
-        }
-    if isinstance(value, list):
-        return [item for raw in value if (item := _stable_general_value(raw)) not in (None, {}, [])]
-    return value
-
-
-def _source_hash(
-    messages: list[dict[str, Any]],
-    patterns: tuple[re.Pattern[str], ...] = (),
-    expanded_history: list[tuple[dict[str, Any], list[dict[str, Any]]]] | None = None,
-) -> str:
-    expanded = []
-    history = expanded_history if expanded_history is not None else _expanded_history(messages, patterns)
-    for raw, canonical in history:
-        for index, message in enumerate(canonical):
-            stable = dict(message)
-            if index == 0:
-                for key in ('name', 'function_call', 'sources', 'reasoning_content'):
-                    if key in raw:
-                        stable[key] = _stable_general_value(raw[key])
-                files = _stable_file_identity(raw.get('files'))
-                if files not in (None, {}, []):
-                    stable['files'] = files
-            expanded.append(stable)
-    encoded = json.dumps(
-        {'family': 'canonical-json-v1', 'messages': expanded},
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(',', ':'),
-    ).encode('utf-8')
-    return f'sha256:{hashlib.sha256(encoded).hexdigest()}'
-
-
-def _build_history_checkpoint(
-    messages: list[dict[str, Any]],
-    branch_anchor: str,
-) -> tuple[dict[str, Any], RefEntry]:
-    if not messages or not isinstance(branch_anchor, str) or messages[-1].get('id') != branch_anchor:
-        raise CanonicalHistoryError('checkpoint branch anchor is invalid')
-    expanded = _expanded_history(messages, ())
-    entry = _canonical_history_entry(messages, (), expanded)
-    raw_source_hash = entry.ref.split(':', 1)[1]
-    return (
-        {
-            'version': _SUMMARY_META_VERSION,
-            'branch_anchor': branch_anchor,
-            'source_hash': _source_hash(messages, (), expanded),
-            'history_ref': {
-                'format': _HISTORY_FORMAT,
-                'raw_source_hash': raw_source_hash,
-            },
-        },
-        entry,
-    )
-
-
-def _resolve_history_checkpoint(
-    messages: list[dict[str, Any]],
-    carrier_index: int,
-) -> RefEntry:
-    carrier = messages[carrier_index]
-    meta = carrier.get('meta') if isinstance(carrier.get('meta'), dict) else {}
-    descriptor = meta.get(_SUMMARY_META_KEY) if isinstance(meta.get(_SUMMARY_META_KEY), dict) else None
-    history_ref = descriptor.get('history_ref') if isinstance(descriptor, dict) else None
-    if (
-        not isinstance(descriptor, dict)
-        or descriptor.get('version') != _SUMMARY_META_VERSION
-        or not isinstance(descriptor.get('branch_anchor'), str)
-        or re.fullmatch(r'sha256:[0-9a-f]{64}', str(descriptor.get('source_hash'))) is None
-        or not isinstance(history_ref, dict)
-        or set(history_ref) != {'format', 'raw_source_hash'}
-        or history_ref.get('format') != _HISTORY_FORMAT
-        or re.fullmatch(r'[0-9a-f]{64}', str(history_ref.get('raw_source_hash'))) is None
-    ):
-        raise CanonicalHistoryError('checkpoint metadata is invalid')
-    branch_anchor = descriptor['branch_anchor']
-    prefix = messages[:carrier_index]
-    if carrier.get('parentId') != branch_anchor or not prefix or prefix[-1].get('id') != branch_anchor:
-        raise CanonicalHistoryError('checkpoint branch anchor does not match the current branch')
-    rebuilt, entry = _build_history_checkpoint(prefix, branch_anchor)
-    if rebuilt['source_hash'] != descriptor['source_hash']:
-        raise CanonicalHistoryError('checkpoint source hash does not match the current branch')
-    if rebuilt['history_ref'] != history_ref:
-        raise CanonicalHistoryError('checkpoint raw source hash does not match the current branch')
     return entry
 
 
@@ -579,7 +445,7 @@ def _bind_history_loader(
                 if not (messages[index].get('contextSummary') or messages[index].get('context_summary')):
                     continue
                 try:
-                    ancestor = _resolve_history_checkpoint(messages, index)
+                    ancestor = _canonical_history_entry(messages[:index])
                 except CanonicalHistoryError:
                     break
                 entries.append(replace(ancestor, load_history=load_ancestors))
@@ -588,6 +454,27 @@ def _bind_history_loader(
         return await asyncio.to_thread(resolve)
 
     return replace(entry, load_history=load_ancestors)
+
+
+def _history_entry_at(messages: list[dict[str, Any]], carrier_index: int) -> RefEntry | None:
+    if not 0 < carrier_index < len(messages):
+        return None
+    return _bind_history_loader(
+        _canonical_history_entry(messages[:carrier_index]),
+        messages,
+        carrier_index,
+    )
+
+
+async def resolve_request_history(source: Any) -> RefEntry | None:
+    if isinstance(source, RefEntry):
+        return source
+    if not isinstance(source, tuple) or len(source) != 2:
+        return None
+    messages, carrier_index = source
+    if not isinstance(messages, list) or not isinstance(carrier_index, int):
+        return None
+    return await asyncio.to_thread(_history_entry_at, messages, carrier_index)
 
 
 def render_summary_message(summary: str, summary_meta: dict | None = None) -> dict:
@@ -668,15 +555,13 @@ def set_summary_history_ref(body: dict, ref: str | None) -> dict:
     return {**body, 'messages': updated} if updated is not None else body
 
 
-def _checkpoint_summary(messages: list[dict]) -> tuple[int | None, str | None, dict]:
-    selected: tuple[int, str, dict] | None = None
+def _checkpoint_summary(messages: list[dict]) -> tuple[int | None, str | None]:
+    selected: tuple[int, str] | None = None
     for index, message in enumerate(messages):
         summary = message.get('contextSummary') or message.get('context_summary')
         if isinstance(summary, str) and summary.strip():
-            meta = message.get('meta') if isinstance(message.get('meta'), dict) else {}
-            summary_meta = meta.get(_SUMMARY_META_KEY) if isinstance(meta.get(_SUMMARY_META_KEY), dict) else {}
-            selected = index, summary.strip(), summary_meta
-    return selected or (None, None, {})
+            selected = index, summary.strip()
+    return selected or (None, None)
 
 
 async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> tuple[list[dict], dict]:
@@ -686,24 +571,20 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
     if not config['enable'] or metadata.get('task') == 'context_compaction':
         return messages, state
 
-    system_messages, raw_messages = _split_leading_system_messages(messages)
-    raw_messages = await asyncio.to_thread(copy.deepcopy, raw_messages)
-    summary_index, previous_summary, summary_meta = _checkpoint_summary(raw_messages)
+    system_messages, checkpoint_messages = _split_leading_system_messages(messages)
+    raw_messages = await asyncio.to_thread(copy.deepcopy, checkpoint_messages)
+    summary_index, previous_summary = _checkpoint_summary(checkpoint_messages)
+    summary_meta: dict[str, Any] = {}
     if summary_index is not None:
-        state['selected_checkpoint_message_id'] = raw_messages[summary_index].get('id')
-        carrier_meta = raw_messages[summary_index].get('meta')
-        # Official v0.11 checkpoints predate history-ref metadata. Keep their
-        # summary behavior, but expose no unverifiable history ref.
-        if isinstance(carrier_meta, dict) and _SUMMARY_META_KEY in carrier_meta:
-            state['selected_history'] = _bind_history_loader(
-                await asyncio.to_thread(
-                    _resolve_history_checkpoint,
-                    raw_messages,
-                    summary_index,
-                ),
-                raw_messages,
-                summary_index,
-            )
+        state['selected_checkpoint_message_id'] = checkpoint_messages[summary_index].get('id')
+        state['selected_history'] = (checkpoint_messages, summary_index)
+        summary_meta['historical_user_messages'] = await asyncio.to_thread(
+            _historical_user_excerpts,
+            checkpoint_messages[:summary_index],
+            _DEFAULT_EXCERPT_BYTES,
+            _DEFAULT_EXCERPT_COUNT,
+            config['transient_patterns'],
+        )
     active_offset = summary_index if summary_index is not None else 0
     active_messages = raw_messages[active_offset:]
     for index in range(len(active_messages) - 1, -1, -1):
@@ -727,12 +608,12 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         marked[_BOUNDARY_KEY] = True
         active_messages = [*active_messages[:boundary], marked, *active_messages[boundary + 1 :]]
         raw_boundary = active_offset + boundary
-        checkpoint_message = raw_messages[raw_boundary]
+        checkpoint_message = checkpoint_messages[raw_boundary]
         state.update(
             {
                 'checkpoint_message_id': checkpoint_message.get('id'),
-                'checkpoint_message_meta': checkpoint_message.get('meta') or {},
-                'source_messages': raw_messages[:raw_boundary],
+                'source_messages': checkpoint_messages[:raw_boundary],
+                'checkpoint_history': (checkpoint_messages, raw_boundary),
             }
         )
 
@@ -769,31 +650,21 @@ async def _create_checkpoint(
     config: dict,
     compacted_messages: list[dict],
     recent_messages: list[dict],
-) -> tuple[str, dict[str, Any], RefEntry]:
+) -> tuple[str, dict[str, Any], Any]:
     source_messages = state.get('source_messages') or []
-    branch_anchor = source_messages[-1].get('id') if source_messages else None
     checkpoint_message_id = state.get('checkpoint_message_id')
     chat_id = metadata.get('chat_id')
     if not checkpoint_message_id or not is_saved_chat_id(chat_id):
         raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
-    try:
-        summary_meta, history_entry = await asyncio.to_thread(
-            _build_history_checkpoint,
+    summary_meta = {
+        'historical_user_messages': await asyncio.to_thread(
+            _historical_user_excerpts,
             source_messages,
-            branch_anchor,
+            _DEFAULT_EXCERPT_BYTES,
+            _DEFAULT_EXCERPT_COUNT,
+            config['transient_patterns'],
         )
-        previous_history = state.get('selected_history')
-        if isinstance(previous_history, RefEntry) and previous_history.load_history:
-            history_entry = replace(history_entry, load_history=previous_history.load_history)
-    except CanonicalHistoryError as exc:
-        raise RuntimeError(f'Context compaction checkpoint is invalid: {exc}; provider request was not sent') from exc
-    summary_meta['historical_user_messages'] = await asyncio.to_thread(
-        _historical_user_excerpts,
-        source_messages,
-        _DEFAULT_EXCERPT_BYTES,
-        _DEFAULT_EXCERPT_COUNT,
-        config['transient_patterns'],
-    )
+    }
     summary = await _generate_summary(
         request,
         user,
@@ -805,22 +676,15 @@ async def _create_checkpoint(
         config['prompt_template'],
         config['transient_patterns'],
     )
-    existing_meta = state.get('checkpoint_message_meta')
     saved = await Chats.upsert_message_to_chat_by_id_and_message_id(
         chat_id,
         checkpoint_message_id,
-        {
-            'contextSummary': summary,
-            'meta': {
-                **(existing_meta if isinstance(existing_meta, dict) else {}),
-                _SUMMARY_META_KEY: summary_meta,
-            },
-        },
+        {'contextSummary': summary},
         touch=False,
     )
     if saved is None:
         raise RuntimeError('Context compaction checkpoint could not be saved; provider request was not sent')
-    return summary, summary_meta, history_entry
+    return summary, summary_meta, state.get('checkpoint_history')
 
 
 def _prefetch_done(task: asyncio.Task) -> None:
@@ -1022,30 +886,11 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
     if not messages_map:
         messages_map = history.get('messages') or {}
 
-    branch = get_message_list(messages_map, current_id)
-    summary_index, previous_summary, _ = _checkpoint_summary(branch)
-    if summary_index is not None:
-        await asyncio.to_thread(_resolve_history_checkpoint, branch, summary_index)
-    messages = branch[summary_index if summary_index is not None else 0 :]
+    messages, previous_summary = _apply_latest_summary_checkpoint(get_message_list(messages_map, current_id))
     compacted_messages = messages[:-1]
     recent_messages = messages[-1:]
     if not compacted_messages or not recent_messages:
         return {'ok': True, 'compacted': False, 'reason': 'too_short'}
-
-    source_messages = branch[:-1]
-    branch_anchor = source_messages[-1].get('id') if source_messages else None
-    summary_meta, _ = await asyncio.to_thread(
-        _build_history_checkpoint,
-        source_messages,
-        branch_anchor,
-    )
-    summary_meta['historical_user_messages'] = await asyncio.to_thread(
-        _historical_user_excerpts,
-        source_messages,
-        _DEFAULT_EXCERPT_BYTES,
-        _DEFAULT_EXCERPT_COUNT,
-        config['transient_patterns'],
-    )
 
     summary = await _generate_summary(
         request,
@@ -1058,17 +903,10 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         config['prompt_template'],
         config['transient_patterns'],
     )
-    carrier_meta = recent_messages[0].get('meta')
     saved = await Chats.upsert_message_to_chat_by_id_and_message_id(
         chat.id,
         current_id,
-        {
-            'contextSummary': summary,
-            'meta': {
-                **(carrier_meta if isinstance(carrier_meta, dict) else {}),
-                _SUMMARY_META_KEY: summary_meta,
-            },
-        },
+        {'contextSummary': summary},
         touch=False,
     )
     if saved is None:
@@ -1094,17 +932,22 @@ async def _load_config() -> dict:
         'chat.context_compaction.transient_message_patterns',
     )
     token_threshold = _parse_positive_int(values.get('chat.context_compaction.token_threshold')) or 80000
+    enabled = bool(values.get('chat.context_compaction.enable', False))
     return {
-        'enable': bool(values.get('chat.context_compaction.enable', False)),
+        'enable': enabled,
         'token_threshold': token_threshold,
         'token_cap': _parse_positive_int(values.get('chat.context_compaction.token_cap')) or token_threshold,
         'retention_percentage': _clamp_retention_percentage(values.get('chat.context_compaction.retention_percentage')),
         'prompt_template': values.get('chat.context_compaction.prompt_template', '') or '',
         'soft_trigger_ratio': _soft_trigger_ratio(values.get('chat.context_compaction.soft_trigger_ratio')),
-        'transient_patterns': tuple(
-            re.compile(line.strip())
-            for line in str(values.get('chat.context_compaction.transient_message_patterns') or '').splitlines()
-            if line.strip()
+        'transient_patterns': (
+            tuple(
+                re.compile(line.strip())
+                for line in str(values.get('chat.context_compaction.transient_message_patterns') or '').splitlines()
+                if line.strip()
+            )
+            if enabled
+            else ()
         ),
     }
 

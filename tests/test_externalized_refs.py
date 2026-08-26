@@ -16,6 +16,9 @@ for name in ('data', 'static'):
 os.environ.setdefault('WEBUI_SECRET_KEY', 'local-test-only')
 
 refs = importlib.import_module('open_webui.utils.externalized_refs')
+compaction = importlib.import_module('open_webui.utils.context_compaction')
+
+TOKEN_THRESHOLD = 1000
 
 
 def _body(content: str, **overrides):
@@ -38,8 +41,8 @@ async def _project(content: str, *, registry=None, body=None):
         body,
         registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
     assert active is True
     reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
@@ -47,10 +50,47 @@ async def _project(content: str, *, registry=None, body=None):
     return body, registry, reader, ref
 
 
+async def _history_reader(content: str):
+    entry = refs.make_ref_entry(content, kind='history')
+    assert entry is not None
+
+    async def load_history():
+        return entry
+
+    body = {'model': 'test-model', 'stream': True, 'messages': [{'role': 'user', 'content': 'inspect'}]}
+    registry = {}
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
+        history_loader=load_history,
+    )
+    return registry[refs.REF_EXEC_TOOL_NAME]['callable'], entry.ref
+
+
+async def _read_pages(reader, command: str) -> tuple[str, list[str]]:
+    chunks: list[str] = []
+    pages: list[str] = []
+    for _ in range(100):
+        result = await reader(command)
+        pages.append(result)
+        marker_start = result.find('\n<auto_compact_ref_truncated>')
+        if marker_start < 0:
+            chunks.append(result)
+            return ''.join(chunks), pages
+        chunks.append(result[:marker_start])
+        encoded_marker = result[marker_start:].removeprefix('\n<auto_compact_ref_truncated>')
+        encoded_marker = encoded_marker.removesuffix('</auto_compact_ref_truncated>')
+        command = json.loads(encoded_marker)['next']
+    pytest.fail('paging did not terminate')
+
+
 @pytest.mark.asyncio
 async def test_exact_wc_and_all_reader_commands():
     source = 'zero\none two\nthree\n'
-    body, _, reader, ref = await _project(source)
+    reader, ref = await _history_reader(source)
 
     assert await reader(f'wc -c {ref}') == str(len(source.encode('utf-8')))
     assert await reader(f'wc -l {ref}') == '3'
@@ -62,17 +102,19 @@ async def test_exact_wc_and_all_reader_commands():
     assert await reader(f'grep -n one {ref}') == '2:one two'
     assert await reader(f"grep -E '^one' {ref}") == 'one two'
     assert await reader(f'grep o {ref} | head -2 | wc -l') == '2'
-    assert ref in await reader('ls tool')
+    assert ref in await reader('ls history')
     stat = await reader(f'stat {ref}')
     assert f'ref={ref}' in stat
     assert f'utf8_bytes={len(source.encode("utf-8"))}' in stat
-    assert body['tools'][0]['function']['name'] == refs.REF_EXEC_TOOL_NAME
+    assert f'sha256={ref.split(":", 1)[1]}' in stat
 
 
 @pytest.mark.asyncio
 async def test_catalog_unions_on_reentry_without_replacing_reader():
-    first_body, registry, reader, first_ref = await _project('first payload')
-    second_body = _body('second payload', tools=copy.deepcopy(first_body['tools']))
+    first_source = 'first payload ' * 1000
+    second_source = 'second payload ' * 1000
+    first_body, registry, reader, first_ref = await _project(first_source)
+    second_body = _body(second_source, tools=copy.deepcopy(first_body['tools']))
 
     assert await refs.externalize_refs(
         second_body,
@@ -84,64 +126,44 @@ async def test_catalog_unions_on_reentry_without_replacing_reader():
     assert registry[refs.REF_EXEC_TOOL_NAME]['callable'] is reader
     second_ref = second_body['messages'][1]['content']
     assert (await reader('ls tool')).splitlines() == [first_ref, second_ref]
-    assert await reader(f'wc -c {first_ref}') == str(len('first payload'))
-    assert await reader(f'wc -c {second_ref}') == str(len('second payload'))
+    assert await reader(f'wc -c {first_ref}') == str(len(first_source))
+    assert await reader(f'wc -c {second_ref}') == str(len(second_source))
 
 
 @pytest.mark.asyncio
-async def test_reader_output_is_never_reexternalized():
-    _, registry, reader, ref = await _project('reader page')
+async def test_reader_output_is_below_threshold_and_not_reexternalized():
+    _, registry, reader, ref = await _project('reader page ' * 5000)
     page = await reader(f'cat {ref}')
-    inferred = {
+    assert compaction.estimate_text_tokens(page) < TOKEN_THRESHOLD
+    assert '<auto_compact_ref_truncated>' in page
+
+    continuation = {
         'model': 'test',
         'stream': True,
         'messages': [
+            {'role': 'tool', 'tool_call_id': 'reader-call', 'content': page},
             {
-                'role': 'assistant',
-                'tool_calls': [
-                    {
-                        'id': 'reader-call',
-                        'type': 'function',
-                        'function': {'name': refs.REF_EXEC_TOOL_NAME, 'arguments': '{}'},
-                    }
-                ],
+                'role': 'tool',
+                'tool_call_id': 'ordinary-call',
+                'content': 'ordinary result ' * 2000,
             },
-            {'role': 'tool', 'tool_call_id': 'reader-call', 'content': page},
         ],
     }
 
-    assert not await refs.externalize_refs(
-        inferred,
-        registry,
-        native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
-    )
-    assert inferred['messages'][1]['content'] == page
-
-    current_only = {
-        'model': 'test',
-        'stream': True,
-        'messages': [
-            {'role': 'tool', 'tool_call_id': 'reader-call', 'content': page},
-            {'role': 'tool', 'tool_call_id': 'ordinary-call', 'content': 'ordinary result'},
-        ],
-    }
     assert await refs.externalize_refs(
-        current_only,
+        continuation,
         registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
-        excluded_tool_call_ids={'reader-call'},
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
-    assert current_only['messages'][0]['content'] == page
-    assert current_only['messages'][1]['content'].startswith('tool:')
+    assert continuation['messages'][0]['content'] == page
+    assert continuation['messages'][1]['content'].startswith('tool:')
 
 
 @pytest.mark.asyncio
 async def test_copy_on_write_and_sibling_catalog_isolation():
-    shared_messages = _body('shared payload')['messages']
+    shared_messages = _body('shared payload ' * 1000)['messages']
     original_messages = copy.deepcopy(shared_messages)
     first_body = {'model': 'a', 'stream': True, 'messages': shared_messages}
     second_body = {'model': 'b', 'stream': True, 'messages': shared_messages}
@@ -152,8 +174,8 @@ async def test_copy_on_write_and_sibling_catalog_isolation():
         first_body,
         first_registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
     assert shared_messages == original_messages
     assert second_body['messages'] is shared_messages
@@ -161,20 +183,20 @@ async def test_copy_on_write_and_sibling_catalog_isolation():
         second_body,
         second_registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
     first_reader = first_registry[refs.REF_EXEC_TOOL_NAME]['callable']
     second_reader = second_registry[refs.REF_EXEC_TOOL_NAME]['callable']
     assert first_reader is not second_reader
 
-    extra = _body('first sibling only', tools=copy.deepcopy(first_body['tools']))
+    extra = _body('first sibling only ' * 1000, tools=copy.deepcopy(first_body['tools']))
     assert await refs.externalize_refs(
         extra,
         first_registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
     extra_ref = extra['messages'][1]['content']
     assert extra_ref in await first_reader('ls tool')
@@ -214,12 +236,16 @@ async def test_inactive_or_unselectable_contexts_remain_raw(native, body_overrid
     before = copy.deepcopy(body)
     registry: dict = {}
 
+    async def unexpected_history():
+        raise AssertionError('history must remain lazy')
+
     assert not await refs.externalize_refs(
         body,
         registry,
         native=native,
         threshold_tokens=1,
         count_tokens=lambda _text: 1,
+        history_loader=unexpected_history,
     )
     assert body == before
     assert registry == {}
@@ -253,9 +279,9 @@ async def test_eligible_source_is_hashed_once_and_never_on_read(monkeypatch):
         return real_sha256()
 
     monkeypatch.setattr(refs.hashlib, 'sha256', tracked_hash)
-    _, _, reader, ref = await _project('hash me once')
-    assert await reader(f'cat {ref}') == 'hash me once'
-    assert await reader(f'wc -c {ref}') == str(len('hash me once'))
+    source = 'hash me once ' * 1000
+    _, _, reader, ref = await _project(source)
+    assert await reader(f'wc -c {ref}') == str(len(source))
     assert calls == 1
 
 
@@ -271,6 +297,10 @@ async def test_continuation_hashes_only_new_raw_tool_output(monkeypatch):
 
     def count_tokens(text):
         return 1 if re.fullmatch(r'tool:[0-9a-f]{64}', text) else 2
+
+    class RawText(str):
+        def __hash__(self):
+            raise AssertionError('raw tool output must not be hashed for catalog lookup')
 
     monkeypatch.setattr(refs.hashlib, 'sha256', tracked_hash)
     registry = {}
@@ -288,7 +318,7 @@ async def test_continuation_hashes_only_new_raw_tool_output(monkeypatch):
         'stream': True,
         'messages': [
             {'role': 'tool', 'tool_call_id': 'call-1', 'content': first_ref},
-            {'role': 'tool', 'tool_call_id': 'call-2', 'content': 'second raw output'},
+            {'role': 'tool', 'tool_call_id': 'call-2', 'content': RawText('second raw output')},
         ],
     }
     assert await refs.externalize_refs(
@@ -317,36 +347,53 @@ async def test_200kb_single_line_grep_finds_far_match_with_bounded_output():
     assert marker['match_byte_end'] == 150_006
     assert marker['omitted_prefix_bytes'] + len(visible.split('NEEDLE')[0]) == 150_000
     assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+    assert compaction.estimate_text_tokens(result) < TOKEN_THRESHOLD
+
+
+@pytest.mark.asyncio
+async def test_token_capped_single_line_grep_keeps_the_match():
+    source = '🙂' * 2000 + 'NEEDLE' + 'tail'
+    _, _, reader, ref = await _project(source)
+
+    result = await reader(f'grep NEEDLE {ref}')
+    visible, encoded_marker = result.rsplit('\n<auto_compact_ref_excerpt>', 1)
+    marker = json.loads(encoded_marker.removesuffix('</auto_compact_ref_excerpt>'))
+    assert 'NEEDLE' in visible
+    assert marker['match_byte_start'] == 8000
+    assert compaction.estimate_text_tokens(result) < TOKEN_THRESHOLD
 
 
 @pytest.mark.asyncio
 async def test_multibyte_cat_continuations_reconstruct_every_source_byte():
-    source = ('alpha-αβγ🙂-日本語-' * 12_000) + 'done'
+    source = ('alpha-αβγ🙂-日本語-' * 1200) + 'done'
     _, _, reader, ref = await _project(source)
-    command = f'cat {ref}'
-    chunks: list[str] = []
-
-    for _ in range(20):
-        result = await reader(command)
-        marker_start = result.find('\n<auto_compact_ref_truncated>')
-        if marker_start < 0:
-            chunks.append(result)
-            break
-        chunks.append(result[:marker_start])
-        encoded_marker = result[marker_start:].removeprefix('\n<auto_compact_ref_truncated>')
-        encoded_marker = encoded_marker.removesuffix('</auto_compact_ref_truncated>')
-        command = json.loads(encoded_marker)['next']
-        assert command.startswith('tail -c +')
+    reconstructed, pages = await _read_pages(reader, f'cat {ref}')
+    for result in pages:
         assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
-    else:
-        pytest.fail('paging did not terminate')
+        assert compaction.estimate_text_tokens(result) < TOKEN_THRESHOLD
 
-    assert ''.join(chunks) == source
+    assert reconstructed == source
+
+
+@pytest.mark.asyncio
+async def test_byte_page_commands_reconstruct_exact_requested_slice():
+    source = 'x' * 30_000
+    _, _, reader, ref = await _project(source)
+    cases = (
+        (f'cat {ref}', source),
+        (f'head -c 20000 {ref}', source[:20_000]),
+        (f'tail -c 20000 {ref}', source[-20_000:]),
+        (f'tail -c +10001 {ref}', source[10_000:]),
+    )
+    for command, expected in cases:
+        reconstructed, pages = await _read_pages(reader, command)
+        assert reconstructed == expected
+        assert all(compaction.estimate_text_tokens(page) < TOKEN_THRESHOLD for page in pages)
 
 
 @pytest.mark.asyncio
 async def test_pipeline_regex_stages_share_one_match_budget(monkeypatch):
-    _, _, reader, ref = await _project('x')
+    reader, ref = await _history_reader('x')
     observed_timeouts: list[float] = []
 
     class Compiled:
@@ -379,13 +426,16 @@ async def test_history_ancestors_load_only_on_demand_and_union_with_selected():
     body = {'model': 'test', 'stream': True, 'messages': [{'role': 'user', 'content': 'continue'}]}
     registry = {}
 
+    async def load_selected():
+        return selected
+
     assert await refs.externalize_refs(
         body,
         registry,
         native=True,
         threshold_tokens=1000,
         count_tokens=lambda _text: 1,
-        history_entry=selected,
+        history_loader=load_selected,
     )
     reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
     assert await reader(f'wc -c {selected.ref}') == str(len(selected.text))
@@ -401,7 +451,7 @@ async def test_history_ancestors_load_only_on_demand_and_union_with_selected():
 async def test_current_core_tool_wrapper_returns_exact_wc_bytes():
     from open_webui.utils.tools import get_updated_tool_function
 
-    source = 'core dispatch 日本語\n'
+    source = 'core dispatch 日本語\n' * 1000
     _, _, reader, ref = await _project(source)
     function = await get_updated_tool_function(
         function=reader,
@@ -409,3 +459,4 @@ async def test_current_core_tool_wrapper_returns_exact_wc_bytes():
     )
 
     assert await function(command=f'wc -c {ref}') == str(len(source.encode('utf-8')))
+    assert f'sha256={ref.split(":", 1)[1]}' in await function(command=f'stat {ref}')

@@ -92,12 +92,12 @@ from open_webui.utils.context_compaction import (
     estimate_text_tokens,
     forward_with_context_retry,
     get_last_persistent_user_message,
-    is_transient_message,
     prepare_compaction_messages,
     replay_cached_compaction_messages,
+    resolve_request_history,
     set_summary_history_ref,
 )
-from open_webui.utils.externalized_refs import REF_EXEC_TOOL_NAME, RefEntry, externalize_refs
+from open_webui.utils.externalized_refs import RefEntry, externalize_refs
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -1760,21 +1760,12 @@ async def add_file_context(messages: list) -> list:
 
 def restore_message_files(
     messages: list[dict],
-    captured: tuple[list[dict], ...],
-    transient_patterns=(),
+    captured: dict[str, list[dict]],
 ) -> list[dict]:
-    if not any(captured):
-        return messages
-    user_messages = [
-        message
-        for message in messages
-        if message.get('role') == 'user' and not is_transient_message(message, transient_patterns)
-    ]
-    if len(user_messages) != len(captured):
-        raise RuntimeError('A filter changed user history while attached file context was being prepared')
-    for message, files in zip(user_messages, captured):
-        if files:
-            message['files'] = copy.deepcopy(files)
+    for message in messages:
+        message_id = message.pop('id', None)
+        if message.get('role') == 'user' and (files := captured.get(message_id)):
+            message['files'] = files
     return messages
 
 
@@ -2227,7 +2218,7 @@ def strip_reasoning_details(output: list) -> list:
 def process_messages_with_output(
     messages: list[dict],
     reasoning_format: str | None = None,
-    preserve_user_files: bool = False,
+    preserve_user_ids: bool = False,
 ) -> list[dict]:
     """
     Process messages with OR-aligned output items for LLM consumption.
@@ -2256,7 +2247,7 @@ def process_messages_with_output(
 
         clean_message = dict(message)
         for key in ('id', 'files', 'output', 'model', 'contextSummary', 'context_summary', 'usage'):
-            if key == 'files' and preserve_user_files and message.get('role') == 'user':
+            if key == 'id' and preserve_user_ids and message.get('role') == 'user':
                 continue
             clean_message.pop(key, None)
         processed.append(clean_message)
@@ -2264,7 +2255,7 @@ def process_messages_with_output(
     return processed
 
 
-def strip_compaction_fields(messages: list[dict]) -> list[dict]:
+def strip_compaction_fields(messages: list[dict], *, preserve_user_ids: bool = False) -> list[dict]:
     stripped = []
     for message in messages:
         clean = dict(message)
@@ -2274,7 +2265,8 @@ def strip_compaction_fields(messages: list[dict]) -> list[dict]:
         clean.pop('contextSummary', None)
         clean.pop('context_summary', None)
         clean.pop('usage', None)
-        clean.pop('id', None)
+        if not preserve_user_ids or clean.get('role') != 'user':
+            clean.pop('id', None)
         clean.pop('parentId', None)
         clean.pop('meta', None)
         stripped.append(clean)
@@ -2301,20 +2293,26 @@ async def apply_externalized_refs(
     elif isinstance(body.get('messages'), list):
         state['projection_source_messages'] = body['messages']
     config = state.get('externalized_refs') or {}
-    history_entry = state.get('selected_history')
     if not config.get('enable'):
         return set_summary_history_ref(body, None)
+
+    async def load_history():
+        entry = await resolve_request_history(state.get('selected_history'))
+        if entry is not None:
+            state['selected_history'] = entry
+        return entry
+
     applied = await externalize_refs(
         body,
         config['registry'],
         native=config['native'],
         threshold_tokens=config['threshold'],
         count_tokens=estimate_text_tokens,
-        history_entry=history_entry if isinstance(history_entry, RefEntry) else None,
-        excluded_tool_call_ids=config.get('reader_call_ids', ()),
+        history_loader=load_history if config.get('native') else None,
     )
     if applied:
         config['metadata']['tools'] = config['registry']
+    history_entry = state.get('selected_history')
     return set_summary_history_ref(
         body,
         history_entry.ref if applied and isinstance(history_entry, RefEntry) else None,
@@ -2597,6 +2595,14 @@ async def process_chat_payload(
             form_data.get('messages', []), metadata
         )
     transient_patterns = (compaction_state.get('config') or {}).get('transient_patterns', ())
+    captured_message_files = {
+        message_id: files
+        for message in form_data.get('messages', [])
+        if message.get('role') == 'user'
+        and isinstance((message_id := message.get('id')), str)
+        and isinstance((files := message.get('files')), list)
+        and files
+    }
 
     # Inject image files into content as image_url parts (mirrors frontend logic)
     for message in form_data.get('messages', []):
@@ -2623,7 +2629,10 @@ async def process_chat_payload(
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
 
-    form_data['messages'] = strip_compaction_fields(form_data.get('messages', []))
+    form_data['messages'] = strip_compaction_fields(
+        form_data.get('messages', []),
+        preserve_user_ids=True,
+    )
 
     # Process messages with OR-aligned output items for clean LLM messages
     for message in form_data.get('messages', []):
@@ -2636,16 +2645,9 @@ async def process_chat_payload(
     form_data['messages'] = process_messages_with_output(
         form_data.get('messages', []),
         reasoning_format=get_reasoning_format(model),
-        preserve_user_files=True,
+        preserve_user_ids=True,
     )
     form_data['messages'] = sanitize_tool_pairs(form_data['messages'])
-    captured_message_files = tuple(
-        copy.deepcopy(message.get('files') or [])
-        for message in form_data['messages']
-        if message.get('role') == 'user' and not is_transient_message(message, transient_patterns)
-    )
-    for message in form_data['messages']:
-        message.pop('files', None)
 
     system_message = get_system_message(form_data.get('messages', []))
     if system_message:  # Chat Controls/User Settings
@@ -3124,16 +3126,16 @@ async def process_chat_payload(
         if mcp_clients:
             metadata['mcp_clients'] = mcp_clients
 
+        form_data['messages'] = restore_message_files(
+            form_data.get('messages', []),
+            captured_message_files if use_builtin_tools else {},
+        )
+
         # Inject builtin tools for native function calling based on enabled features and model capability.
         # Only inject when the request originates from the UI (identified by session_id).
         # API callers don't expect hidden tools; they can explicitly request tools via tool_ids.
         if use_builtin_tools:
             # Add file context to user messages
-            form_data['messages'] = restore_message_files(
-                form_data.get('messages', []),
-                captured_message_files,
-                transient_patterns,
-            )
             form_data['messages'] = await add_file_context(form_data.get('messages', []))
 
             if (model.get('info', {}).get('meta', {}).get('builtinTools') or {}).get('knowledge', True):
@@ -3211,6 +3213,7 @@ async def process_chat_payload(
     }
 
     for message in form_data.get('messages', []):
+        message.pop('id', None)
         message.pop('files', None)
 
     # Check if file context extraction is enabled for this model (default True)
@@ -5773,12 +5776,6 @@ async def streaming_chat_response_handler(response, ctx):
                     tool_call_iterations += 1
 
                     response_tool_calls = tool_calls.pop(0)
-                    ctx['compaction_state']['externalized_refs'].setdefault('reader_call_ids', set()).update(
-                        tool_call['id']
-                        for tool_call in response_tool_calls
-                        if isinstance(tool_call.get('id'), str)
-                        and tool_call.get('function', {}).get('name') == REF_EXEC_TOOL_NAME
-                    )
                     ask_user_stage = stage_ask_user_tool_call(response_tool_calls, output, output_id)
                     if ask_user_stage:
                         if ask_user_stage['error']:

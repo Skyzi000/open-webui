@@ -186,137 +186,80 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
     assert compaction.find_safe_compaction_boundary(working[:2] + working[4:], 50) == 0
 
 
-def test_history_checkpoint_is_strict_and_branch_bound():
-    prefix = [
+def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
+    history_hashes = 0
+    canonical_history_entry = compaction._canonical_history_entry
+
+    def count_history_hashes(*args, **kwargs):
+        nonlocal history_hashes
+        history_hashes += 1
+        return canonical_history_entry(*args, **kwargs)
+
+    root = {'id': 'u0', 'parentId': None, 'role': 'user', 'content': 'root'}
+    earlier = {
+        'id': 'u1',
+        'parentId': 'u0',
+        'role': 'user',
+        'content': 'earlier branch point',
+        'contextSummary': 'earlier summary',
+    }
+    messages = [
+        root,
+        earlier,
+        {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'main answer'},
+        {
+            'id': 'u2',
+            'parentId': 'a1',
+            'role': 'user',
+            'content': 'latest branch point',
+            'contextSummary': 'latest summary',
+        },
+        {'id': 'a2', 'parentId': 'u2', 'role': 'assistant', 'content': 'current'},
+        {'id': 'b1', 'parentId': 'u1', 'role': 'assistant', 'content': 'fork answer'},
+    ]
+    messages_map = {message['id']: message for message in messages}
+    main_branch = compaction.get_message_list(messages_map, 'a2')
+    fork = compaction.get_message_list(messages_map, 'b1')
+
+    async def load_config():
+        return {'enable': True, 'retention_percentage': 40, 'transient_patterns': ()}
+
+    async def prepare(messages):
+        prepared, state = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
+        return prepared, state
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_canonical_history_entry', count_history_hashes)
+    main_prepared, main_state = asyncio.run(prepare(main_branch))
+    fork_prepared, fork_state = asyncio.run(prepare(fork))
+    assert history_hashes == 0
+
+    main_history = asyncio.run(compaction.resolve_request_history(main_state['selected_history']))
+    fork_history = asyncio.run(compaction.resolve_request_history(fork_state['selected_history']))
+
+    assert history_hashes == 2
+    assert main_history is not None and fork_history is not None
+    assert main_state['selected_checkpoint_message_id'] == 'u2'
+    assert fork_state['selected_checkpoint_message_id'] == 'u1'
+    assert 'latest summary' in main_prepared[0]['content']
+    assert 'earlier summary' in fork_prepared[0]['content']
+    assert 'main answer' in main_history.text
+    assert fork_history.text == canonical_history_entry([root]).text
+
+
+def test_checkpoint_source_is_isolated_from_image_payload_mutation(monkeypatch):
+    messages = [
         {
             'id': 'u1',
             'parentId': None,
             'role': 'user',
-            'content': '',
-            'meta': {'ui': True},
-            'files': [{'id': 'file-1', 'name': 'notes.txt', 'signed_url': 'old'}],
+            'content': 'inspect',
+            'files': [{'type': 'image', 'url': 'https://example.test/image.png'}],
         },
-        {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer', 'usage': {'input_tokens': 9}},
-    ]
-    descriptor, source = compaction._build_history_checkpoint(prefix, 'a1')
-    carrier = {
-        'id': 'u2',
-        'parentId': 'a1',
-        'role': 'user',
-        'content': 'next',
-        'contextSummary': 'summary',
-        'meta': {'context_compaction': descriptor},
-    }
-
-    resolved = compaction._resolve_history_checkpoint([*prefix, carrier], 2)
-    assert resolved.text == source.text
-    assert resolved.ref == f'history:{descriptor["history_ref"]["raw_source_hash"]}'
-
-    transient_file_change = copy.deepcopy(prefix)
-    transient_file_change[0]['files'][0]['signed_url'] = 'new'
-    assert (
-        compaction._build_history_checkpoint(transient_file_change, 'a1')[0]['source_hash'] == descriptor['source_hash']
-    )
-
-    stable_file_change = copy.deepcopy(prefix)
-    stable_file_change[0]['files'][0]['id'] = 'file-2'
-    assert compaction._build_history_checkpoint(stable_file_change, 'a1')[0]['source_hash'] != descriptor['source_hash']
-
-    bad_anchor = copy.deepcopy(carrier)
-    bad_anchor['parentId'] = 'other'
-    with pytest.raises(compaction.CanonicalHistoryError, match='branch anchor'):
-        compaction._resolve_history_checkpoint([*prefix, bad_anchor], 2)
-
-
-def test_checkpoint_identity_ignores_mutable_transient_patterns(monkeypatch):
-    prefix = [
-        {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'configured transient'},
         {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
+        {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'continue'},
     ]
-    descriptor, source = compaction._build_history_checkpoint(prefix, 'a1')
-    messages = [
-        *prefix,
-        {
-            'id': 'u2',
-            'parentId': 'a1',
-            'role': 'user',
-            'content': 'continue',
-            'contextSummary': 'summary',
-            'meta': {'context_compaction': descriptor},
-        },
-    ]
-
-    async def prepare(patterns):
-        async def load_config():
-            return {
-                'enable': True,
-                'retention_percentage': 40,
-                'transient_patterns': patterns,
-            }
-
-        monkeypatch.setattr(compaction, '_load_config', load_config)
-        _, state = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
-        return state['selected_history']
-
-    matching = asyncio.run(prepare((re.compile(r'^configured transient$'),)))
-    changed = asyncio.run(prepare((re.compile(r'^something else$'),)))
-    assert matching.ref == changed.ref == source.ref
-    assert 'configured transient' in matching.text
-
-
-def test_invalid_history_checkpoint_fails_before_provider_and_preserves_input(monkeypatch):
-    prefix = [
-        {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'original'},
-        {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
-    ]
-    descriptor, _ = compaction._build_history_checkpoint(prefix, 'a1')
-    messages = [
-        {**prefix[0], 'content': 'tampered'},
-        prefix[1],
-        {
-            'id': 'u2',
-            'parentId': 'a1',
-            'role': 'user',
-            'content': 'continue',
-            'contextSummary': 'summary',
-            'meta': {'context_compaction': descriptor},
-        },
-    ]
-    original = copy.deepcopy(messages)
-    provider_calls = 0
-
-    async def load_config():
-        return {
-            'enable': True,
-            'retention_percentage': 40,
-            'transient_patterns': (),
-        }
-
-    async def prepare_then_send():
-        nonlocal provider_calls
-        prepared, _ = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
-        provider_calls += 1
-        return prepared
-
-    monkeypatch.setattr(compaction, '_load_config', load_config)
-    with pytest.raises(compaction.CanonicalHistoryError, match='source hash'):
-        asyncio.run(prepare_then_send())
-
-    assert provider_calls == 0
-    assert messages == original
-
-
-def test_official_v011_summary_without_ref_metadata_remains_usable(monkeypatch):
-    messages = [
-        {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'old'},
-        {
-            'id': 'u2',
-            'parentId': 'u1',
-            'role': 'user',
-            'content': 'continue',
-            'contextSummary': 'official summary',
-        },
-    ]
+    expected = compaction._canonical_history_entry(messages[:2]).text
 
     async def load_config():
         return {
@@ -326,11 +269,15 @@ def test_official_v011_summary_without_ref_metadata_remains_usable(monkeypatch):
         }
 
     monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, 'find_safe_compaction_boundary', lambda *_args: 2)
     prepared, state = asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
+    prepared[0]['content'] = [
+        {'type': 'text', 'text': 'inspect'},
+        {'type': 'image_url', 'image_url': {'url': 'https://example.test/image.png'}},
+    ]
 
-    assert prepared[0]['content'].startswith('<auto_compaction_context>')
-    assert prepared[1]['id'] == 'u2'
-    assert 'selected_history' not in state
+    history = asyncio.run(compaction.resolve_request_history(state['checkpoint_history']))
+    assert history.text == expected
 
 
 def test_background_replays_request_cached_checkpoint_without_resolving(monkeypatch):
@@ -347,8 +294,8 @@ def test_background_replays_request_cached_checkpoint_without_resolving(monkeypa
 
     monkeypatch.setattr(
         compaction,
-        '_resolve_history_checkpoint',
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('history must not resolve twice')),
+        '_canonical_history_entry',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('history must not resolve here')),
     )
     replayed = asyncio.run(compaction.replay_cached_compaction_messages(messages, state))
 
@@ -423,32 +370,32 @@ def test_model_params_are_not_consumed_across_sibling_requests():
     assert first == second == {'temperature': 0.5, 'top_p': 0.8}
 
 
-def test_file_context_sidecar_restores_exact_user_after_filter_normalization():
+def test_file_context_restores_by_message_id_after_filter_reordering():
     middleware = importlib.import_module('open_webui.utils.middleware')
-    marker = compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY
-    captured = ([], [{'id': 'file-2', 'url': 'https://example.test/two'}])
+    first = [{'id': 'file-1', 'url': 'https://example.test/one'}]
+    second = [{'id': 'file-2', 'url': 'https://example.test/two'}]
+    captured = {'u1': first, 'u2': second}
     filtered = [
-        {'role': 'user', 'content': 'one'},
-        {'role': 'user', 'content': 'internal', marker: True},
+        {'id': 'u2', 'role': 'user', 'content': 'two'},
+        {'role': 'user', 'content': 'inserted'},
         {'role': 'assistant', 'content': 'answer'},
-        {'role': 'user', 'content': 'two'},
+        {'id': 'u1', 'role': 'user', 'content': 'one'},
     ]
 
     restored = middleware.restore_message_files(filtered, captured)
-    assert 'files' not in restored[0]
+    assert restored[0]['files'] is second
     assert 'files' not in restored[1]
-    assert restored[3]['files'] == captured[1]
-
-    with pytest.raises(RuntimeError, match='filter changed user history'):
-        middleware.restore_message_files([{'role': 'user', 'content': 'one'}], captured)
+    assert restored[3]['files'] is first
+    assert all('id' not in message for message in restored)
 
 
-def test_file_sidecar_counts_synthetic_tool_image_users():
+def test_file_context_identity_survives_message_normalization():
     middleware = importlib.import_module('open_webui.utils.middleware')
     files = [{'id': 'file-1', 'url': 'https://example.test/file'}]
     messages = [
-        {'role': 'user', 'content': 'inspect', 'files': files},
+        {'id': 'u1', 'role': 'user', 'content': 'inspect', 'files': files},
         {
+            'id': 'a1',
             'role': 'assistant',
             'content': '',
             'output': [
@@ -468,17 +415,15 @@ def test_file_sidecar_counts_synthetic_tool_image_users():
         },
     ]
 
-    processed = middleware.process_messages_with_output(messages, preserve_user_files=True)
-    captured = tuple(
-        copy.deepcopy(message.get('files') or []) for message in processed if message.get('role') == 'user'
+    stripped = middleware.strip_compaction_fields(messages, preserve_user_ids=True)
+    processed = middleware.process_messages_with_output(
+        stripped,
+        preserve_user_ids=True,
     )
-    for message in processed:
-        message.pop('files', None)
-    restored = middleware.restore_message_files(processed, captured)
+    restored = middleware.restore_message_files(processed, {'u1': files})
 
     user_messages = [message for message in restored if message.get('role') == 'user']
-    assert captured == (files, [])
-    assert user_messages[0]['files'] == files
+    assert user_messages[0]['files'] is files
     assert 'files' not in user_messages[1]
 
 
@@ -538,6 +483,7 @@ def test_approved_tool_pair_appends_without_replacing_prepared_messages(monkeypa
 
 def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
     source = 'approved reader source'
     stored = {}
 
@@ -562,7 +508,7 @@ def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypat
         state = {
             'externalized_refs': {
                 'enable': True,
-                'threshold': 1,
+                'threshold': 2,
                 'native': True,
                 'registry': registry,
                 'metadata': metadata,
@@ -581,7 +527,7 @@ def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypat
             {
                 'type': 'function_call',
                 'call_id': 'reader-call',
-                'name': middleware.REF_EXEC_TOOL_NAME,
+                'name': refs.REF_EXEC_TOOL_NAME,
                 'arguments': middleware.JSONCodec.dumps({'command': f'wc -c {ref}'}),
                 'status': 'queued',
                 'approved': True,
@@ -696,18 +642,33 @@ def test_arena_uses_selected_target_model_params_before_system_bypass(monkeypatc
 def test_canonical_history_preserves_empty_shape_and_rejects_unknown_semantics():
     empty_string = [{'role': 'user', 'content': ''}]
     empty_parts = [{'role': 'user', 'content': []}]
-    assert compaction._canonical_history_source(empty_string)[1] != compaction._canonical_history_source(empty_parts)[1]
+    assert compaction._canonical_history_entry(empty_string).ref != compaction._canonical_history_entry(empty_parts).ref
 
     with pytest.raises(compaction.CanonicalHistoryError, match='unknown message shape'):
-        compaction._canonical_history_source([{'role': 'user', 'content': 'hello', 'untracked': True}])
+        compaction._canonical_history_entry([{'role': 'user', 'content': 'hello', 'untracked': True}])
 
     with pytest.raises(compaction.CanonicalHistoryError, match='unknown content shape'):
-        compaction._canonical_history_source(
+        compaction._canonical_history_entry(
             [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello', 'cache_control': {}}]}]
         )
 
+    image_history = compaction._canonical_history_entry(
+        [
+            {
+                'role': 'user',
+                'content': [
+                    {
+                        'type': 'image_url',
+                        'image_url': {'url': 'data:image/png;base64,AA==', 'detail': 'high'},
+                    }
+                ],
+            }
+        ]
+    )
+    assert 'omitted_media' in image_history.text
 
-def test_responses_output_accepts_builtin_calls_and_text_annotations():
+
+def test_responses_output_accepts_known_text_metadata_and_refusal():
     output = [
         {'type': 'web_search_call', 'id': 'search-1', 'status': 'completed'},
         {'type': 'file_search_call', 'id': 'search-2', 'status': 'completed'},
@@ -720,12 +681,125 @@ def test_responses_output_accepts_builtin_calls_and_text_annotations():
                     'type': 'output_text',
                     'text': 'answer',
                     'annotations': [{'type': 'url_citation', 'url': 'https://example.test'}],
-                }
+                    'logprobs': [],
+                },
+                {'type': 'output_text', 'text': ' continued', 'annotations': [], 'logprobs': None},
+                {'type': 'refusal', 'refusal': 'cannot comply'},
             ],
         },
     ]
 
-    assert compaction._canonical_output_messages(output) == [{'role': 'assistant', 'content': 'answer'}]
+    assert compaction._canonical_output_messages(output) == [
+        {'role': 'assistant', 'content': 'answer continuedcannot comply'}
+    ]
+
+    output[-1]['content'][0]['unknown'] = True
+    with pytest.raises(compaction.CanonicalHistoryError, match='unknown content shape'):
+        compaction._canonical_output_messages(output)
+
+
+def test_non_string_code_interpreter_result_round_trips_checkpoint():
+    prefix = [
+        {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'calculate'},
+        {
+            'id': 'a1',
+            'parentId': 'u1',
+            'role': 'assistant',
+            'content': '',
+            'output': [
+                {
+                    'type': 'open_webui:code_interpreter',
+                    'code': '2 + 2',
+                    'output': {'result': {'result': 4}},
+                }
+            ],
+        },
+    ]
+    carrier = {
+        'id': 'u2',
+        'parentId': 'a1',
+        'role': 'user',
+        'content': 'continue',
+        'contextSummary': 'summary',
+    }
+    source = compaction._history_entry_at([*prefix, carrier], 2)
+
+    assert source is not None
+    assert "{'result': 4}" in source.text
+    assert compaction._canonical_output_messages(
+        [
+            {'type': 'open_webui:code_interpreter', 'code': '', 'output': None},
+            {'type': 'open_webui:code_interpreter', 'code': '', 'output': [4]},
+        ]
+    ) == [{'role': 'assistant', 'content': '<code_interpreter_output>\n[4]\n</code_interpreter_output>'}]
+
+
+def test_disabled_compaction_does_not_compile_transient_patterns(monkeypatch):
+    values = {
+        'chat.context_compaction.enable': False,
+        'chat.context_compaction.transient_message_patterns': '[',
+    }
+
+    async def get_many(*_keys):
+        return values
+
+    monkeypatch.setattr(compaction.Config, 'get_many', get_many)
+    assert asyncio.run(compaction._load_config())['transient_patterns'] == ()
+
+    values['chat.context_compaction.enable'] = True
+    with pytest.raises(re.error):
+        asyncio.run(compaction._load_config())
+
+
+def test_manual_compaction_persists_only_core_checkpoint(monkeypatch):
+    messages = {
+        'u1': {
+            'id': 'u1',
+            'parentId': None,
+            'role': 'user',
+            'content': 'find evidence',
+            'sources': [{'source': {'id': 'search-result'}}],
+        },
+        'a1': {
+            'id': 'a1',
+            'parentId': 'u1',
+            'role': 'assistant',
+            'content': 'answer',
+            'sources': [{'source': {'id': 'citation'}}],
+        },
+        'u2': {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'continue'},
+    }
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': ()}
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'summary'
+
+    saved_update = None
+
+    async def save(_chat_id, message_id, update, **_kwargs):
+        nonlocal saved_update
+        saved_update = update
+        messages[message_id].update(update)
+        return messages[message_id]
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id='u2',
+        chat={'history': {'currentId': 'u2', 'messages': messages}},
+    )
+    result = asyncio.run(compaction.compact_chat_branch(None, None, chat, 'model', {}))
+
+    assert result['compacted'] is True
+    assert saved_update == {'contextSummary': 'summary'}
 
 
 def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
@@ -734,7 +808,6 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
         {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'old'},
         {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
     ]
-    descriptor, _ = compaction._build_history_checkpoint(prefix, 'a1')
     messages = [
         *prefix,
         {
@@ -743,7 +816,6 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
             'role': 'user',
             'content': 'continue',
             'contextSummary': 'summary',
-            'meta': {'context_compaction': descriptor},
         },
     ]
 
@@ -759,7 +831,8 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
         }
 
     async def run():
-        await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
+        _, state = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
+        await compaction.resolve_request_history(state['selected_history'])
         await compaction.compact_provider_payload(
             None,
             None,
@@ -783,8 +856,43 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
     asyncio.run(run())
 
     assert copy.deepcopy in calls
-    assert compaction._resolve_history_checkpoint in calls
+    assert compaction._history_entry_at in calls
     assert compaction.estimate_provider_tokens in calls
+
+
+def test_history_is_not_hashed_when_core_cannot_install_the_reader(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    state = {
+        'selected_history': (
+            [
+                {'role': 'user', 'content': 'old'},
+                {'role': 'user', 'content': 'current', 'contextSummary': 'summary'},
+            ],
+            1,
+        ),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    monkeypatch.setattr(
+        compaction,
+        '_canonical_history_entry',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('history must remain lazy')),
+    )
+
+    body = asyncio.run(
+        middleware.apply_externalized_refs(
+            {'stream': False, 'messages': [{'role': 'user', 'content': 'current'}]},
+            state,
+        )
+    )
+
+    assert body == {'stream': False, 'messages': [{'role': 'user', 'content': 'current'}]}
+    assert state['externalized_refs']['registry'] == {}
 
 
 def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
@@ -846,7 +954,7 @@ def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
         calls += 1
         return (
             'summary',
-            {'historical_user_messages': [], 'history_ref': {'raw_source_hash': history_entry.ref.split(':')[1]}},
+            {'historical_user_messages': []},
             history_entry,
         )
 
@@ -1077,6 +1185,7 @@ def test_compaction_summarizes_raw_tool_text_while_thresholding_projected_payloa
 
 def test_native_tool_continuations_accumulate_each_round_once(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
+    refs_module = importlib.import_module('open_webui.utils.externalized_refs')
     sent = []
 
     def response(delta):
@@ -1164,7 +1273,7 @@ def test_native_tool_continuations_accumulate_each_round_once(monkeypatch):
             'config': {'enable': False},
             'externalized_refs': {
                 'enable': True,
-                'threshold': 1,
+                'threshold': 2,
                 'registry': tools,
                 'native': True,
                 'metadata': metadata,
@@ -1189,7 +1298,7 @@ def test_native_tool_continuations_accumulate_each_round_once(monkeypatch):
     refs = {
         message['tool_call_id']: message['content'] for message in sent[1]['messages'] if message.get('role') == 'tool'
     }
-    reader = tools[middleware.REF_EXEC_TOOL_NAME]['callable']
+    reader = tools[refs_module.REF_EXEC_TOOL_NAME]['callable']
     assert first_roles == ['user', 'assistant', 'tool']
     assert second_ids == ['call-a', 'call-b']
     assert asyncio.run(reader(f'wc -c {refs["call-a"]}')) == str(len('result a'))
