@@ -97,7 +97,12 @@ from open_webui.utils.context_compaction import (
     resolve_request_history,
     set_summary_history_ref,
 )
-from open_webui.utils.externalized_refs import RefEntry, externalize_refs
+from open_webui.utils.externalized_refs import (
+    REF_EXEC_TOOL_NAME,
+    RefEntry,
+    externalize_refs,
+    is_owned_ref_reader,
+)
 from open_webui.utils.files import (
     convert_markdown_base64_images,
     get_file_url_from_base64,
@@ -259,6 +264,26 @@ def _start_tag_pattern(start_tag: str) -> str:
 def output_id(prefix: str) -> str:
     """Generate OR-style ID: prefix + 24-char hex UUID."""
     return f'{prefix}_{uuid4().hex[:24]}'
+
+
+def _function_call_output(result: dict) -> tuple[str, dict]:
+    status = 'failed' if _is_tool_result_error(result.get('content', '')) else 'completed'
+    parts = [{'type': 'input_text', 'text': result.get('content', '')}]
+    display_files = []
+    for file_item in result.get('files', []):
+        if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
+            parts.append({'type': 'input_image', 'image_url': file_item['url']})
+        else:
+            display_files.append(file_item)
+    return status, {
+        'type': 'function_call_output',
+        'id': output_id('fco'),
+        'call_id': result.get('tool_call_id', ''),
+        'output': parts,
+        'status': status,
+        **({'files': display_files} if display_files else {}),
+        **({'embeds': result.get('embeds')} if result.get('embeds') else {}),
+    }
 
 
 def build_terminal_file_tool_result(
@@ -1719,7 +1744,7 @@ async def get_image_urls(delta_images, request, metadata, user) -> list[str]:
     return image_urls
 
 
-async def add_file_context(messages: list) -> list:
+def add_file_context(messages: list) -> list:
     """
     Add file URLs to messages for native function calling.
     """
@@ -2162,7 +2187,6 @@ async def convert_url_images_to_base64(form_data, user=None):
 
 MESSAGE_REPLAY_KEYS = (
     'id',
-    'parentId',
     'role',
     'content',
     'output',
@@ -2218,7 +2242,7 @@ def strip_reasoning_details(output: list) -> list:
 def process_messages_with_output(
     messages: list[dict],
     reasoning_format: str | None = None,
-    preserve_user_ids: bool = False,
+    mark_transient: bool = False,
 ) -> list[dict]:
     """
     Process messages with OR-aligned output items for LLM consumption.
@@ -2246,8 +2270,26 @@ def process_messages_with_output(
                 continue
 
         clean_message = dict(message)
-        for key in ('id', 'files', 'output', 'model', 'contextSummary', 'context_summary', 'usage'):
-            if key == 'id' and preserve_user_ids and message.get('role') == 'user':
+        meta = clean_message.get('meta')
+        if (
+            mark_transient
+            and clean_message.get('role') == 'user'
+            and isinstance(meta, dict)
+            and meta.get('internal') is True
+        ):
+            clean_message[CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY] = True
+        for key in (
+            'id',
+            'parentId',
+            'meta',
+            'files',
+            'output',
+            'model',
+            'contextSummary',
+            'context_summary',
+            'usage',
+        ):
+            if key == 'id' and message.get('role') == 'user':
                 continue
             clean_message.pop(key, None)
         processed.append(clean_message)
@@ -2255,7 +2297,7 @@ def process_messages_with_output(
     return processed
 
 
-def strip_compaction_fields(messages: list[dict], *, preserve_user_ids: bool = False) -> list[dict]:
+def strip_compaction_fields(messages: list[dict]) -> list[dict]:
     stripped = []
     for message in messages:
         clean = dict(message)
@@ -2265,8 +2307,7 @@ def strip_compaction_fields(messages: list[dict], *, preserve_user_ids: bool = F
         clean.pop('contextSummary', None)
         clean.pop('context_summary', None)
         clean.pop('usage', None)
-        if not preserve_user_ids or clean.get('role') != 'user':
-            clean.pop('id', None)
+        clean.pop('id', None)
         clean.pop('parentId', None)
         clean.pop('meta', None)
         stripped.append(clean)
@@ -2282,19 +2323,35 @@ def compaction_models_for_request(request, models: dict) -> dict:
     }
 
 
+async def _prepare_compaction_or_default(messages: list[dict], metadata: dict) -> tuple[list[dict], dict]:
+    try:
+        return await prepare_compaction_messages(messages, metadata)
+    except Exception:
+        log.exception('Context compaction failed; continuing with full chat history')
+        return messages, {'config': {'enable': False}}
+
+
+def _can_install_externalized_ref_reader(metadata: dict, payload_tools: Any) -> bool:
+    return (
+        bool(metadata.get('chat_id') and metadata.get('message_id'))
+        and payload_tools is None
+        and metadata.get('params', {}).get('function_calling') != 'legacy'
+    )
+
+
 async def apply_externalized_refs(
     body: dict,
     state: dict,
     *,
     source_messages: list[dict] | None = None,
 ) -> dict:
+    config = state.get('externalized_refs') or {}
+    if not config.get('enable'):
+        return body
     if source_messages is not None:
         state['projection_source_messages'] = source_messages
     elif isinstance(body.get('messages'), list):
         state['projection_source_messages'] = body['messages']
-    config = state.get('externalized_refs') or {}
-    if not config.get('enable'):
-        return set_summary_history_ref(body, None)
 
     async def load_history():
         entry = await resolve_request_history(state.get('selected_history'))
@@ -2313,9 +2370,42 @@ async def apply_externalized_refs(
     if applied:
         config['metadata']['tools'] = config['registry']
     history_entry = state.get('selected_history')
+    if history_entry is None:
+        return body
     return set_summary_history_ref(
         body,
         history_entry.ref if applied and isinstance(history_entry, RefEntry) else None,
+    )
+
+
+def _projection_source_after_append(state: dict, messages: list[dict], appended: list[dict]) -> list[dict]:
+    source = state.get('projection_source_messages')
+    if not isinstance(source, list) or source is messages:
+        return messages
+    return [*source, *appended]
+
+
+async def _compact_final_provider_payload(
+    request,
+    user,
+    body: dict,
+    metadata: dict,
+    model_id: str,
+    models: dict,
+    state: dict,
+    *,
+    force: bool = False,
+) -> dict:
+    return await compact_provider_payload(
+        request,
+        user,
+        body,
+        metadata,
+        model_id,
+        models,
+        state,
+        force=force,
+        finalize_candidate=lambda value: apply_externalized_refs(value, state),
     )
 
 
@@ -2329,8 +2419,7 @@ async def prepare_context_overflow_retry(
 ) -> dict | None:
     if state.get('compacted') or not (state.get('config') or {}).get('enable'):
         return None
-    history_entry = state.get('selected_history')
-    candidate = await compact_provider_payload(
+    candidate = await _compact_final_provider_payload(
         request,
         user,
         body,
@@ -2342,8 +2431,6 @@ async def prepare_context_overflow_retry(
     )
     if not state.get('compacted'):
         return None
-    if state.get('selected_history') is not history_entry:
-        candidate = await apply_externalized_refs(candidate, state)
     return candidate
 
 
@@ -2591,7 +2678,7 @@ async def process_chat_payload(
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
 
     if is_saved_chat_id(chat_id) and user_message_id:
-        form_data['messages'], compaction_state = await prepare_compaction_messages(
+        form_data['messages'], compaction_state = await _prepare_compaction_or_default(
             form_data.get('messages', []), metadata
         )
     transient_patterns = (compaction_state.get('config') or {}).get('transient_patterns', ())
@@ -2629,11 +2716,6 @@ async def process_chat_payload(
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
 
-    form_data['messages'] = strip_compaction_fields(
-        form_data.get('messages', []),
-        preserve_user_ids=True,
-    )
-
     # Process messages with OR-aligned output items for clean LLM messages
     for message in form_data.get('messages', []):
         output = message.get('output')
@@ -2645,7 +2727,7 @@ async def process_chat_payload(
     form_data['messages'] = process_messages_with_output(
         form_data.get('messages', []),
         reasoning_format=get_reasoning_format(model),
-        preserve_user_ids=True,
+        mark_transient=(compaction_state.get('config') or {}).get('enable', False),
     )
     form_data['messages'] = sanitize_tool_pairs(form_data['messages'])
 
@@ -2682,7 +2764,11 @@ async def process_chat_payload(
         }
     else:
         models = request.app.state.MODELS
-    compaction_models = compaction_models_for_request(request, models)
+    compaction_models = (
+        compaction_models_for_request(request, models)
+        if (compaction_state.get('config') or {}).get('enable')
+        else models
+    )
     compaction_state['models'] = compaction_models
 
     task_model_id = get_task_model_id(
@@ -3136,7 +3222,7 @@ async def process_chat_payload(
         # API callers don't expect hidden tools; they can explicitly request tools via tool_ids.
         if use_builtin_tools:
             # Add file context to user messages
-            form_data['messages'] = await add_file_context(form_data.get('messages', []))
+            form_data['messages'] = add_file_context(form_data.get('messages', []))
 
             if (model.get('info', {}).get('meta', {}).get('builtinTools') or {}).get('knowledge', True):
                 from html import escape
@@ -3196,18 +3282,28 @@ async def process_chat_payload(
                 except Exception as e:
                     log.exception(e)
 
-    ref_config = await Config.get_many(
-        'chat.externalized_refs.enable',
-        'chat.externalized_refs.token_threshold',
-    )
-    try:
-        ref_threshold = max(1000, int(ref_config.get('chat.externalized_refs.token_threshold') or 10000))
-    except (TypeError, ValueError):
+    request_config = compaction_state.get('config') or {}
+    native_refs = _can_install_externalized_ref_reader(metadata, payload_tools)
+    if not native_refs:
+        ref_enabled = False
         ref_threshold = 10000
+    elif 'externalized_refs_enable' in request_config:
+        ref_enabled = request_config['externalized_refs_enable']
+        ref_threshold = request_config['externalized_refs_token_threshold']
+    else:
+        ref_config = await Config.get_many(
+            'chat.externalized_refs.enable',
+            'chat.externalized_refs.token_threshold',
+        )
+        ref_enabled = ref_config.get('chat.externalized_refs.enable') is True
+        try:
+            ref_threshold = max(1, int(ref_config.get('chat.externalized_refs.token_threshold') or 10000))
+        except (TypeError, ValueError):
+            ref_threshold = 10000
     compaction_state['externalized_refs'] = {
-        'enable': ref_config.get('chat.externalized_refs.enable') is True,
+        'enable': ref_enabled,
         'threshold': ref_threshold,
-        'native': payload_tools is None and metadata.get('params', {}).get('function_calling') != 'legacy',
+        'native': native_refs,
         'registry': tools_dict,
         'metadata': metadata,
     }
@@ -3296,16 +3392,16 @@ async def process_chat_payload(
         compaction_state['paused'] = True
         return form_data, metadata, events, compaction_state
     if approved_messages:
-        source_messages = compaction_state.get('projection_source_messages')
-        if not isinstance(source_messages, list):
-            source_messages = form_data['messages'][: -len(approved_messages)]
         form_data = await apply_externalized_refs(
             form_data,
             compaction_state,
-            source_messages=[*source_messages, *approved_messages],
+            source_messages=_projection_source_after_append(
+                compaction_state,
+                form_data['messages'],
+                approved_messages,
+            ),
         )
-    history_entry = compaction_state.get('selected_history')
-    form_data = await compact_provider_payload(
+    form_data = await _compact_final_provider_payload(
         request,
         user,
         form_data,
@@ -3313,11 +3409,6 @@ async def process_chat_payload(
         form_data.get('model'),
         compaction_models,
         compaction_state,
-    )
-    if compaction_state.get('selected_history') is not history_entry:
-        form_data = await apply_externalized_refs(form_data, compaction_state)
-    compaction_state['base_source_messages'] = compaction_state.get(
-        'projection_source_messages', form_data.get('messages', [])
     )
 
     return form_data, metadata, events, compaction_state
@@ -3442,6 +3533,42 @@ async def execute_tool_call_for_output(request, form_data, user, metadata, event
     }
 
 
+async def _execute_ref_calls_before_approval(
+    request,
+    form_data,
+    user,
+    metadata,
+    event_caller,
+    event_emitter,
+    tool_calls: list[dict],
+    output: list[dict],
+) -> list[dict]:
+    remaining = []
+    owned_reader = is_owned_ref_reader(metadata.get('tools'))
+    for tool_call in tool_calls:
+        if not owned_reader or tool_call.get('function', {}).get('name') != REF_EXEC_TOOL_NAME:
+            remaining.append(tool_call)
+            continue
+        result = await execute_tool_call_for_output(
+            request,
+            form_data,
+            user,
+            metadata,
+            event_caller,
+            event_emitter,
+            tool_call,
+        )
+        status, result_item = _function_call_output(result)
+        output.append(result_item)
+        call_id = tool_call.get('id', '')
+        for item in output:
+            if item.get('type') == 'function_call' and item.get('call_id') == call_id:
+                item['status'] = status
+                item['arguments'] = tool_call.get('function', {}).get('arguments', '{}')
+                break
+    return remaining
+
+
 async def drain_approved_tool_calls(request, form_data, user, model, metadata) -> tuple[bool, list[dict]]:
     chat_id = metadata.get('chat_id')
     message_id = metadata.get('message_id') or metadata.get('assistant_message_id')
@@ -3510,24 +3637,7 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
             tool_call,
         )
         item['arguments'] = tool_call.get('function', {}).get('arguments', '{}')
-        output_parts = [{'type': 'input_text', 'text': result.get('content', '')}]
-        item['status'] = 'failed' if _is_tool_result_error(result.get('content', '')) else 'completed'
-        display_files = []
-        for file_item in result.get('files', []):
-            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
-            else:
-                display_files.append(file_item)
-
-        result_item = {
-            'type': 'function_call_output',
-            'id': output_id('fco'),
-            'call_id': result.get('tool_call_id', ''),
-            'output': output_parts,
-            'status': item['status'],
-            **({'files': display_files} if display_files else {}),
-            **({'embeds': result.get('embeds')} if result.get('embeds') else {}),
-        }
+        item['status'], result_item = _function_call_output(result)
         output.append(result_item)
         completed_output.extend((item, result_item))
         changed = True
@@ -3870,8 +3980,13 @@ async def background_tasks_handler(ctx):
         if message:
             message['model'] = form_data.get('model')
 
-    if messages and is_saved_chat_id(metadata.get('chat_id')):
-        messages = await replay_cached_compaction_messages(messages, ctx.get('compaction_state') or {})
+    compaction_state = ctx.get('compaction_state') or {}
+    if (
+        messages
+        and is_saved_chat_id(metadata.get('chat_id'))
+        and (compaction_state.get('config') or {}).get('enable')
+    ):
+        messages = await replay_cached_compaction_messages(messages, compaction_state)
         messages = strip_compaction_fields(messages)
 
     if message and 'model' in message:
@@ -4438,7 +4553,14 @@ async def streaming_chat_response_handler(response, ctx):
                     ctx['compaction_state'],
                 )
 
-            return await forward_with_context_retry(send, candidate, retry)
+            retry_enabled = (ctx['compaction_state'].get('config') or {}).get('enable') and not ctx[
+                'compaction_state'
+            ].get('compacted')
+            return await forward_with_context_retry(
+                send,
+                candidate,
+                retry if retry_enabled else None,
+            )
 
         # Handle as a background task
         async def response_handler(response, events):
@@ -5817,22 +5939,33 @@ async def streaming_chat_response_handler(response, ctx):
                         and is_saved_chat_id(metadata.get('chat_id'))
                         and metadata.get('message_id')
                     ):
-                        await pause_for_tool_approval(
-                            metadata['chat_id'],
-                            metadata['message_id'],
-                            full_output(),
+                        response_tool_calls = await _execute_ref_calls_before_approval(
+                            request,
                             continuation_body,
+                            user,
                             metadata,
+                            event_caller,
+                            event_emitter,
+                            response_tool_calls,
+                            output,
                         )
-                        await event_emitter(
-                            {
-                                'type': 'chat:completion',
-                                'data': {
-                                    'output': full_output(),
-                                },
-                            }
-                        )
-                        return
+                        if response_tool_calls:
+                            await pause_for_tool_approval(
+                                metadata['chat_id'],
+                                metadata['message_id'],
+                                full_output(),
+                                continuation_body,
+                                metadata,
+                            )
+                            await event_emitter(
+                                {
+                                    'type': 'chat:completion',
+                                    'data': {
+                                        'output': full_output(),
+                                    },
+                                }
+                            )
+                            return
 
                     await event_emitter(
                         {
@@ -5997,34 +6130,9 @@ async def streaming_chat_response_handler(response, ctx):
 
                     result_status_by_call_id = {}
                     for result in results:
-                        output_parts = [{'type': 'input_text', 'text': result.get('content', '')}]
-                        local_output_status = (
-                            'failed' if _is_tool_result_error(result.get('content', '')) else 'completed'
-                        )
+                        local_output_status, result_item = _function_call_output(result)
                         result_status_by_call_id[result.get('tool_call_id', '')] = local_output_status
-
-                        # Separate image data URIs (for LLM via input_image) from
-                        # other files (for frontend display via files attribute).
-                        display_files = []
-                        for file_item in result.get('files', []):
-                            if file_item.get('type') == 'image' and file_item.get('url', '').startswith('data:'):
-                                # LLM-only: add as input_image part, not frontend display output.
-                                output_parts.append({'type': 'input_image', 'image_url': file_item['url']})
-                            else:
-                                # Frontend display (MCP images, audio, etc.)
-                                display_files.append(file_item)
-
-                        output.append(
-                            {
-                                'type': 'function_call_output',
-                                'id': output_id('fco'),
-                                'call_id': result.get('tool_call_id', ''),
-                                'output': output_parts,
-                                'status': local_output_status,
-                                **({'files': display_files} if display_files else {}),
-                                **({'embeds': result.get('embeds')} if result.get('embeds') else {}),
-                            }
-                        )
+                        output.append(result_item)
 
                     # Update function_call statuses and parsed/sanitized arguments.
                     for tc in response_tool_calls:
@@ -6146,8 +6254,6 @@ async def streaming_chat_response_handler(response, ctx):
                         standalone_body.pop('previous_response_id', None)
                         source_base = ctx['compaction_state'].get('projection_source_messages')
                         if not isinstance(source_base, list):
-                            source_base = ctx['compaction_state'].get('base_source_messages')
-                        if not isinstance(source_base, list):
                             source_base = continuation_body['messages']
 
                         standalone_body = await apply_externalized_refs(
@@ -6155,19 +6261,14 @@ async def streaming_chat_response_handler(response, ctx):
                             ctx['compaction_state'],
                             source_messages=[*source_base, *continuation_messages],
                         )
-                        history_entry = ctx['compaction_state'].get('selected_history')
-                        standalone_body = await compact_provider_payload(
-                            request,
-                            user,
-                            standalone_body,
-                            metadata,
-                            model_id,
-                            ctx['compaction_state'].get('models') or {model_id: model},
-                            ctx['compaction_state'],
-                        )
-                        if ctx['compaction_state'].get('selected_history') is not history_entry:
-                            standalone_body = await apply_externalized_refs(
+                        if not stateful:
+                            standalone_body = await _compact_final_provider_payload(
+                                request,
+                                user,
                                 standalone_body,
+                                metadata,
+                                model_id,
+                                ctx['compaction_state'].get('models') or {model_id: model},
                                 ctx['compaction_state'],
                             )
 
@@ -6377,8 +6478,6 @@ async def streaming_chat_response_handler(response, ctx):
                             }
                             source_base = ctx['compaction_state'].get('projection_source_messages')
                             if not isinstance(source_base, list):
-                                source_base = ctx['compaction_state'].get('base_source_messages')
-                            if not isinstance(source_base, list):
                                 source_base = continuation_body['messages']
 
                             new_form_data = await apply_externalized_refs(
@@ -6386,8 +6485,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 ctx['compaction_state'],
                                 source_messages=[*source_base, *continuation_messages],
                             )
-                            history_entry = ctx['compaction_state'].get('selected_history')
-                            new_form_data = await compact_provider_payload(
+                            new_form_data = await _compact_final_provider_payload(
                                 request,
                                 user,
                                 new_form_data,
@@ -6396,8 +6494,6 @@ async def streaming_chat_response_handler(response, ctx):
                                 ctx['compaction_state'].get('models') or {model_id: model},
                                 ctx['compaction_state'],
                             )
-                            if ctx['compaction_state'].get('selected_history') is not history_entry:
-                                new_form_data = await apply_externalized_refs(new_form_data, ctx['compaction_state'])
 
                             res, new_form_data = await forward_continuation(new_form_data)
 

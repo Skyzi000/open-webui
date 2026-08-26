@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
-import inspect
 import json
 import re
 import shlex
@@ -11,7 +10,8 @@ import time
 from bisect import bisect_right
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from itertools import chain, islice
 from typing import Any
 
 import regex
@@ -21,6 +21,7 @@ from open_webui.tools.knowledge_fs import (
     MatchBudgetExceeded,
     is_regex_pattern,
     normalize_regex,
+    validate_regex_quantifiers,
 )
 
 _monotonic = time.monotonic
@@ -172,21 +173,6 @@ def _is_externalization_eligible(
     return True
 
 
-def _eligible_entry(
-    text: str,
-    *,
-    threshold_tokens: int,
-    count_tokens: Callable[[str], int | None] | None,
-) -> RefEntry | None:
-    if not _is_externalization_eligible(
-        text,
-        threshold_tokens=threshold_tokens,
-        count_tokens=count_tokens,
-    ):
-        return None
-    return make_ref_entry(text, kind='tool')
-
-
 def make_ref_entry(
     text: str,
     *,
@@ -245,6 +231,10 @@ def _owned_reader(registry: dict[str, Any]) -> Callable[..., Any] | None:
     return reader
 
 
+def is_owned_ref_reader(registry: Any) -> bool:
+    return isinstance(registry, dict) and _owned_reader(registry) is not None
+
+
 def _has_collision(body: dict[str, Any], registry: dict[str, Any]) -> bool:
     owned = _owned_reader(registry)
     if REF_EXEC_TOOL_NAME in registry and owned is None:
@@ -280,11 +270,13 @@ async def _capture_projections(
     def classify() -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
         projected: list[tuple[int, dict[str, Any], RefEntry]] = []
         for index, message, source in candidates:
-            entry = _eligible_entry(
+            if not _is_externalization_eligible(
                 source,
                 threshold_tokens=threshold_tokens,
                 count_tokens=count_tokens,
-            )
+            ):
+                continue
+            entry = make_ref_entry(source, kind='tool')
             if entry is not None:
                 projected.append((index, message, entry))
         return tuple(projected)
@@ -550,7 +542,10 @@ def _parse_command(command: str) -> tuple[_Stage, ...]:
         raise RefExecError(REF_EXEC_USAGE_ERROR) from exc
     if len(encoded) > REF_EXEC_COMMAND_MAX_BYTES:
         raise RefExecError('Error: command exceeds the 1,024 UTF-8 byte parser limit')
-    return tuple(_parse_stage(stage, source=index == 0) for index, stage in enumerate(_split_pipeline(command.strip())))
+    return tuple(
+        _parse_stage(stage, source=index == 0)
+        for index, stage in enumerate(_split_pipeline(command.strip()))
+    )
 
 
 def _iter_text_lines(text: str, *, source_offsets: bool = False) -> Iterator[_Line]:
@@ -574,10 +569,7 @@ def _iter_source_lines(entry: RefEntry) -> Iterator[_Line]:
 
 
 def _head(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
-    for index, line in enumerate(lines):
-        if index >= count:
-            return
-        yield line
+    yield from islice(lines, max(0, count))
 
 
 def _tail(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
@@ -603,15 +595,17 @@ def _literal_spans(
     *,
     ignore_case: bool,
     all_matches: bool,
-) -> tuple[tuple[int, int], ...]:
+) -> Iterator[tuple[int, int]]:
     if pattern == '':
-        return () if all_matches else ((0, 0),)
+        if not all_matches:
+            yield 0, 0
+        return
     flags = re.IGNORECASE if ignore_case else 0
     matches = re.finditer(re.escape(pattern), text, flags)
-    if all_matches:
-        return tuple(match.span() for match in matches)
-    first = next(matches, None)
-    return () if first is None else (first.span(),)
+    for match in matches:
+        yield match.span()
+        if not all_matches:
+            return
 
 
 def _regex_spans(
@@ -620,30 +614,41 @@ def _regex_spans(
     budget: MatchBudget,
     *,
     all_matches: bool,
-) -> tuple[tuple[int, int], ...]:
-    started = _monotonic()
-    try:
+) -> Iterator[tuple[int, int]]:
+    position = 0
+    while position <= len(text):
         if budget.remaining <= 0:
-            raise TimeoutError
-        matches = compiled.finditer(text, timeout=budget.remaining)
-        spans = (match.span() for match in matches if not all_matches or match.end() > match.start())
-        if all_matches:
-            return tuple(spans)
-        first = next(spans, None)
-        return () if first is None else (first,)
-    except TimeoutError:
-        raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern') from None
-    finally:
-        budget.remaining -= _monotonic() - started
+            raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern')
+        started = _monotonic()
+        try:
+            matches = compiled.finditer(text, position, timeout=budget.remaining)
+            match = next(
+                (candidate for candidate in matches if not all_matches or candidate.end() > candidate.start()),
+                None,
+            )
+        except TimeoutError:
+            raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern') from None
+        finally:
+            budget.remaining -= _monotonic() - started
+        if match is None:
+            return
+        yield match.span()
+        if not all_matches:
+            return
+        position = match.end()
 
 
 def _compile_grep(stage: _Stage) -> Any | None:
     pattern = stage.pattern or ''
     if 'E' not in stage.flags and not is_regex_pattern(pattern):
         return None
+    normalized = normalize_regex(pattern)
+    quantifier_error = validate_regex_quantifiers(normalized)
+    if quantifier_error:
+        raise RefExecError(quantifier_error)
     try:
         return regex.compile(
-            normalize_regex(pattern),
+            normalized,
             regex.IGNORECASE if 'i' in stage.flags else 0,
         )
     except regex.error as exc:
@@ -655,10 +660,10 @@ def _grep_spans(
     stage: _Stage,
     compiled: Any | None,
     budget: MatchBudget,
-) -> tuple[tuple[int, int], ...]:
+) -> Iterator[tuple[int, int]]:
     pattern = stage.pattern or ''
     if pattern == '':
-        return () if 'o' in stage.flags else ((0, 0),)
+        return iter(()) if 'o' in stage.flags else iter(((0, 0),))
     if compiled is not None:
         return _regex_spans(
             compiled,
@@ -674,7 +679,7 @@ def _grep_spans(
     )
 
 
-def _grep_matches(line: _Line, spans: tuple[tuple[int, int], ...], ordinal: int, stage: _Stage) -> Iterator[_Line]:
+def _grep_matches(line: _Line, spans: Iterable[tuple[int, int]], ordinal: int, stage: _Stage) -> Iterator[_Line]:
     value = line.presented
     prefix = f'{ordinal}:' if 'n' in stage.flags else ''
     if 'o' not in stage.flags:
@@ -688,10 +693,12 @@ def _grep_matches(line: _Line, spans: tuple[tuple[int, int], ...], ordinal: int,
             match_end=end,
         )
         return
+    previous_start = 0
+    source_byte_start = line.source_byte_start if not line.display_prefix else None
     for start, end in spans:
-        source_byte_start = None
-        if line.source_byte_start is not None and not line.display_prefix:
-            source_byte_start = line.source_byte_start + len(value[:start].encode('utf-8'))
+        if source_byte_start is not None:
+            source_byte_start += len(value[previous_start:start].encode('utf-8'))
+            previous_start = start
         yield _Line(
             text=value[start:end],
             has_newline=True,
@@ -710,12 +717,23 @@ def _grep(
     compiled = _compile_grep(stage)
     count = 0
     for ordinal, line in enumerate(lines, 1):
-        spans = _grep_spans(line.presented, stage, compiled, budget)
-        if not spans:
+        spans = iter(_grep_spans(line.presented, stage, compiled, budget))
+        first = next(spans, None)
+        if first is None:
             continue
         count += 1
-        if 'c' not in stage.flags:
-            yield from _grep_matches(line, spans, ordinal, stage)
+        if 'c' in stage.flags:
+            close = getattr(spans, 'close', None)
+            if close is not None:
+                close()
+            continue
+        if 'o' in stage.flags:
+            yield from _grep_matches(line, chain((first,), spans), ordinal, stage)
+        else:
+            close = getattr(spans, 'close', None)
+            if close is not None:
+                close()
+            yield from _grep_matches(line, (first,), ordinal, stage)
     if 'c' in stage.flags:
         yield _Line(str(count), False)
 
@@ -1082,7 +1100,6 @@ def _execute_reader(
 
     lines = _initial_lines(first, catalog)
     budget = MatchBudget()
-    budget.remaining = MATCH_BUDGET_SECONDS
     start = 0 if first.command in {'grep', 'head', 'tail', 'sed', 'wc'} else 1
     for stage in stages[start:]:
         lines = _apply_stage(lines, stage, budget)
@@ -1113,15 +1130,10 @@ async def _load_history_refs(
     )
     if loader is None:
         return
-    loaded = loader(requested)
-    if inspect.isawaitable(loaded):
-        loaded = await loaded
+    loaded = await loader(requested)
     for entry in loaded or ():
         if isinstance(entry, RefEntry) and entry.ref.startswith('history:') and _valid_ref(entry.ref):
-            catalog.setdefault(entry.ref, replace(entry, load_history=None))
-    for ref, entry in tuple(catalog.items()):
-        if entry.ref.startswith('history:') and entry.load_history is loader:
-            catalog[ref] = replace(entry, load_history=None)
+            catalog.setdefault(entry.ref, entry)
 
 
 def _new_reader(
@@ -1144,7 +1156,7 @@ def _new_reader(
             return await asyncio.to_thread(
                 _execute_reader,
                 stages,
-                dict(catalog),
+                catalog,
                 threshold_tokens,
                 count_tokens,
             )

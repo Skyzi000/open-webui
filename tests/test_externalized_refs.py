@@ -101,12 +101,29 @@ async def test_exact_wc_and_all_reader_commands():
     assert await reader(f"sed -n '2,3p' {ref}") == 'one two\nthree'
     assert await reader(f'grep -n one {ref}') == '2:one two'
     assert await reader(f"grep -E '^one' {ref}") == 'one two'
+    assert await reader(f"grep -E 'zero|three' {ref} | wc -l") == '2'
     assert await reader(f'grep o {ref} | head -2 | wc -l') == '2'
+    assert await reader(f"grep 'unterminated {ref}") == 'Error: malformed quote or escape in command'
     assert ref in await reader('ls history')
     stat = await reader(f'stat {ref}')
     assert f'ref={ref}' in stat
     assert f'utf8_bytes={len(source.encode("utf-8"))}' in stat
     assert f'sha256={ref.split(":", 1)[1]}' in stat
+
+
+@pytest.mark.parametrize(
+    ('command', 'expected'),
+    [
+        ("grep '|' {ref}", 'left | right\nplain'),
+        (r'grep \| {ref}', 'left | right\nplain'),
+        ('\u00a0grep left {ref}', 'left | right'),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reader_parser_preserves_literal_pipe_and_trim(command, expected):
+    reader, ref = await _history_reader('left | right\nplain\n')
+
+    assert await reader(command.format(ref=ref)) == expected
 
 
 @pytest.mark.asyncio
@@ -159,6 +176,23 @@ async def test_reader_output_is_below_threshold_and_not_reexternalized():
     )
     assert continuation['messages'][0]['content'] == page
     assert continuation['messages'][1]['content'].startswith('tool:')
+
+
+@pytest.mark.asyncio
+async def test_tiktoken_failure_preserves_tool_and_reader_token_caps(monkeypatch):
+    def unavailable(_name):
+        raise OSError('offline')
+
+    compaction._token_encoder.cache_clear()
+    try:
+        monkeypatch.setattr(compaction.tiktoken, 'get_encoding', unavailable)
+        _, _, reader, ref = await _project('x' * 5000)
+        page = await reader(f'cat {ref}')
+
+        assert '<auto_compact_ref_truncated>' in page
+        assert compaction.estimate_text_tokens(page) < TOKEN_THRESHOLD
+    finally:
+        compaction._token_encoder.cache_clear()
 
 
 @pytest.mark.asyncio
@@ -364,6 +398,29 @@ async def test_token_capped_single_line_grep_keeps_the_match():
 
 
 @pytest.mark.asyncio
+async def test_grep_only_matching_stops_scanning_when_the_response_is_full(monkeypatch):
+    source = 'a' * 1_000_000
+    _, _, reader, ref = await _project(source)
+    original_finditer = refs.re.finditer
+    matches = 0
+
+    def bounded_finditer(*args, **kwargs):
+        nonlocal matches
+        for match in original_finditer(*args, **kwargs):
+            matches += 1
+            if matches > 100_000:
+                raise AssertionError('grep materialized matches past the response budget')
+            yield match
+
+    monkeypatch.setattr(refs.re, 'finditer', bounded_finditer)
+    result = await reader(f'grep -o a {ref}')
+
+    assert 0 < matches < 100_000
+    assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+    assert '<auto_compact_ref_truncated>' in result
+
+
+@pytest.mark.asyncio
 async def test_multibyte_cat_continuations_reconstruct_every_source_byte():
     source = ('alpha-αβγ🙂-日本語-' * 1200) + 'done'
     _, _, reader, ref = await _project(source)
@@ -397,18 +454,32 @@ async def test_pipeline_regex_stages_share_one_match_budget(monkeypatch):
     observed_timeouts: list[float] = []
 
     class Compiled:
-        def finditer(self, text, *, timeout):
+        def finditer(self, text, pos=0, *, timeout):
             observed_timeouts.append(timeout)
-            match = re.search('x', text)
+            match = re.search('x', text[pos:])
             return iter([match] if match is not None else [])
+
+    class Budget:
+        def __init__(self):
+            self.remaining = 1.0
 
     monotonic_values = iter([0.0, 0.75, 0.75, 1.0])
     monkeypatch.setattr(refs, 'MATCH_BUDGET_SECONDS', 1.0)
+    monkeypatch.setattr(refs, 'MatchBudget', Budget)
     monkeypatch.setattr(refs.regex, 'compile', lambda *_args, **_kwargs: Compiled())
     monkeypatch.setattr(refs, '_monotonic', lambda: next(monotonic_values))
 
-    assert await reader(f'grep -E x {ref} | grep -E x') == 'x'
+    assert await reader(f'grep -Eo x {ref} | head -1 | grep -E x') == 'x'
     assert observed_timeouts == pytest.approx([1.0, 0.25])
+
+
+@pytest.mark.asyncio
+async def test_grep_uses_the_core_regex_quantifier_limit():
+    _, _, reader, ref = await _project('a' * 20_000)
+
+    result = await reader(f'grep -E "a{{999999999}}" {ref}')
+
+    assert result.startswith('Error: Regex quantifier counts over ')
 
 
 @pytest.mark.asyncio
@@ -444,7 +515,7 @@ async def test_history_ancestors_load_only_on_demand_and_union_with_selected():
     assert await reader(f'cat {ancestor.ref}') == ancestor.text
     assert loads == [ancestor.ref]
     assert (await reader('ls history')).splitlines() == [selected.ref, ancestor.ref]
-    assert loads == [ancestor.ref]
+    assert loads == [ancestor.ref, None]
 
 
 @pytest.mark.asyncio

@@ -175,7 +175,7 @@ class ChatConfigForm(BaseModel):
     )
     CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS: str = ''
     ENABLE_EXTERNALIZED_REFS: bool = False
-    EXTERNALIZED_REFS_TOKEN_THRESHOLD: int = Field(default=10000, ge=1000)
+    EXTERNALIZED_REFS_TOKEN_THRESHOLD: int = Field(default=10000, gt=0)
 
     @field_validator('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS')
     @classmethod

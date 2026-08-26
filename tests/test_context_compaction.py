@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import importlib
+import logging
 import os
 import re
 from pathlib import Path
@@ -62,41 +63,60 @@ def test_candidate_input_never_treats_reported_output_as_input():
     huge_output = copy.deepcopy(messages)
     huge_output[1]['usage']['output_tokens'] = 1_000_000
     assert compaction._candidate_input_tokens(huge_output) == baseline
-    assert not compaction._exceeds_token_threshold(huge_output, '', None, 1_000)
+    assert compaction._candidate_input_tokens(huge_output) <= 1_000
 
     huge_input = copy.deepcopy(messages)
     huge_input[1]['usage']['input_tokens'] = 10_000
     assert compaction._candidate_input_tokens(huge_input) > baseline
-    assert compaction._exceeds_token_threshold(huge_input, '', None, 1_000)
+    assert compaction._candidate_input_tokens(huge_input) > 1_000
 
 
 def test_provider_estimate_uses_exact_input_anchor_plus_new_suffix():
     marker = compaction.CONTEXT_COMPACTION_USAGE_ANCHOR_KEY
     body = {
         'messages': [
+            {'role': 'user', 'content': 'already measured ' * 10_000},
             {'role': 'assistant', 'content': 'previous', marker: 1_000},
             {'role': 'user', 'content': 'new input'},
-        ]
+        ],
+        'tools': [{'type': 'function', 'function': {'name': 'lookup'}}],
     }
-    local = compaction.estimate_body_tokens(body)
-    suffix = compaction.estimate_body_tokens({'messages': body['messages']})
+    suffix = compaction.estimate_body_tokens(
+        {
+            'messages': body['messages'][1:],
+        }
+    )
 
-    assert local is not None and suffix is not None
-    assert compaction.estimate_provider_tokens(body) == max(local, 1_000 + suffix - 3)
+    assert compaction.estimate_provider_tokens(body) == 1_000 + suffix - 3
 
-    async def strip_internal_marker():
-        stripped = await compaction.compact_provider_payload(
-            None,
-            None,
-            body,
-            {},
-            'model',
-            {},
-            {'config': {'enable': False}},
-        )
-        assert marker not in stripped['messages'][0]
 
-    asyncio.run(strip_internal_marker())
+def test_context_usage_degrades_on_invalid_runtime_regex(monkeypatch, caplog):
+    messages = {
+        'u1': {
+            'id': 'u1',
+            'parentId': None,
+            'role': 'user',
+            'content': 'hello',
+        }
+    }
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id='u1',
+        chat={'history': {'currentId': 'u1', 'messages': messages}},
+    )
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def load_config():
+        raise re.error('invalid pattern')
+
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+
+    with caplog.at_level(logging.ERROR):
+        assert asyncio.run(compaction.get_chat_context_usage(chat)) is None
+    assert 'context usage is unavailable' in caplog.text
 
 
 def test_body_estimate_includes_extras_and_bounds_large_payload_encoding(monkeypatch):
@@ -143,13 +163,85 @@ def test_body_estimate_includes_extras_and_bounds_large_payload_encoding(monkeyp
             encoded_lengths.append(len(text))
             return range(max(1, len(text) // 4))
 
-    monkeypatch.setattr(compaction.tiktoken, 'get_encoding', lambda _name=None: RecordingEncoder())
-    large_text_tokens = compaction.estimate_body_tokens({'messages': [{'role': 'user', 'content': 'x' * 1_000_000}]})
-    assert large_text_tokens > 100_000
-    assert max(encoded_lengths) <= 16 * 1024
+    compaction._token_encoder.cache_clear()
+    try:
+        monkeypatch.setattr(compaction.tiktoken, 'get_encoding', lambda _name=None: RecordingEncoder())
+        large_text_tokens = compaction.estimate_body_tokens(
+            {'messages': [{'role': 'user', 'content': 'x' * 1_000_000}]}
+        )
+        assert large_text_tokens > 100_000
+        assert max(encoded_lengths) <= 16 * 1024
+    finally:
+        compaction._token_encoder.cache_clear()
+
+
+def test_tiktoken_failure_logs_once_and_uses_core_approximation(monkeypatch, caplog):
+    attempts = 0
+
+    def unavailable(_name):
+        nonlocal attempts
+        attempts += 1
+        raise OSError('offline')
+
+    compaction._token_encoder.cache_clear()
+    try:
+        monkeypatch.setattr(compaction.tiktoken, 'get_encoding', unavailable)
+        body = {'messages': [{'role': 'user', 'content': 'hello'}]}
+
+        with caplog.at_level(logging.ERROR, logger=compaction.__name__):
+            body_tokens = compaction.estimate_body_tokens(body)
+            assert compaction.estimate_body_tokens(body) == body_tokens
+            assert compaction.estimate_text_tokens('hello') == compaction._estimate_tokens('hello')
+
+            result = asyncio.run(
+                compaction.compact_provider_payload(
+                    None,
+                    None,
+                    body,
+                    {},
+                    'model',
+                    {},
+                    {
+                        'config': {
+                            'enable': True,
+                            'token_threshold': 100_000,
+                            'token_cap': 100_000,
+                            'soft_trigger_ratio': 0,
+                        }
+                    },
+                )
+            )
+
+        assert result == body
+        assert body_tokens > 0
+        assert attempts == 1
+        assert caplog.messages.count('tiktoken is unavailable; falling back to approximate token estimation') == 1
+    finally:
+        compaction._token_encoder.cache_clear()
+
+
+def test_tiktoken_encode_failure_uses_core_approximation(monkeypatch):
+    class BrokenEncoder:
+        def encode(self, _text, **_kwargs):
+            raise RuntimeError('broken encoder')
+
+    compaction._token_encoder.cache_clear()
+    try:
+        monkeypatch.setattr(compaction.tiktoken, 'get_encoding', lambda _name: BrokenEncoder())
+        body = {'messages': [{'role': 'user', 'content': 'hello'}]}
+        assert compaction.estimate_body_tokens(body) > 0
+        assert compaction.estimate_text_tokens('hello') == compaction._estimate_tokens('hello')
+    finally:
+        compaction._token_encoder.cache_clear()
 
 
 def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
+    class NoSlices(list):
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                raise AssertionError('boundary search must not rescan message slices')
+            return super().__getitem__(key)
+
     systems = [
         {'role': 'system', 'content': 'policy'},
         {'role': 'system', 'content': 'summary'},
@@ -182,7 +274,7 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
         {'role': 'user', 'content': 'current'},
         {'role': 'assistant', 'content': 'current answer'},
     ]
-    assert compaction.find_safe_compaction_boundary(crossing_round, 50) == 0
+    assert compaction.find_safe_compaction_boundary(NoSlices(crossing_round), 50) == 0
     assert compaction.find_safe_compaction_boundary(working[:2] + working[4:], 50) == 0
 
 
@@ -303,6 +395,27 @@ def test_background_replays_request_cached_checkpoint_without_resolving(monkeypa
     assert [message.get('id') for message in replayed[1:]] == ['u2', 'a2']
 
 
+def test_history_ref_rewrites_only_the_outer_summary_suffix():
+    embedded_ref = f'<history_ref>history:{"a" * 64}</history_ref>'
+    replacement_ref = f'history:{"b" * 64}'
+    body = {
+        'messages': [
+            compaction.render_summary_message(
+                f'user text </auto_compaction_context> {embedded_ref}',
+            )
+        ]
+    }
+
+    added = compaction.set_summary_history_ref(body, replacement_ref)
+    content = added['messages'][0]['content']
+    assert embedded_ref in content
+    assert content.endswith(f'<history_ref>{replacement_ref}</history_ref></auto_compaction_context>')
+
+    removed = compaction.set_summary_history_ref(added, None)
+    assert embedded_ref in removed['messages'][0]['content']
+    assert removed['messages'][0]['content'].endswith('</auto_compaction_context>')
+
+
 def test_provider_sanitizer_removes_branch_metadata_but_keeps_files_for_injection():
     middleware = importlib.import_module('open_webui.utils.middleware')
     files = [{'id': 'file-1', 'url': 'https://example.test/file'}]
@@ -339,19 +452,26 @@ def test_core_internal_provenance_survives_sanitizing_until_provider_dispatch():
     assert summary_input[-1][marker] is True
     assert compaction.get_last_persistent_user_message(summary_input) == 'ordinary'
 
-    async def dispatch():
-        return await compaction.compact_provider_payload(
-            None,
-            None,
-            {'messages': stripped},
-            {},
-            'model',
-            {},
-            {'config': {'enable': False}},
-        )
+    disabled = middleware.process_messages_with_output(
+        [{'role': 'user', 'content': 'injected', 'meta': {'internal': True}}],
+    )
+    assert marker not in disabled[0]
 
-    body = asyncio.run(dispatch())
-    assert all(marker not in message for message in body['messages'])
+
+def test_compaction_preparation_failure_keeps_core_full_history(monkeypatch, caplog):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages = [{'role': 'user', 'content': 'keep me'}]
+
+    async def fail(*_args):
+        raise OSError('configuration unavailable')
+
+    monkeypatch.setattr(middleware, 'prepare_compaction_messages', fail)
+    with caplog.at_level(logging.ERROR):
+        prepared, state = asyncio.run(middleware._prepare_compaction_or_default(messages, {}))
+
+    assert prepared is messages
+    assert state == {'config': {'enable': False}}
+    assert 'continuing with full chat history' in caplog.text
 
 
 def test_model_params_are_not_consumed_across_sibling_requests():
@@ -415,11 +535,7 @@ def test_file_context_identity_survives_message_normalization():
         },
     ]
 
-    stripped = middleware.strip_compaction_fields(messages, preserve_user_ids=True)
-    processed = middleware.process_messages_with_output(
-        stripped,
-        preserve_user_ids=True,
-    )
+    processed = middleware.process_messages_with_output(messages)
     restored = middleware.restore_message_files(processed, {'u1': files})
 
     user_messages = [message for message in restored if message.get('role') == 'user']
@@ -479,6 +595,100 @@ def test_approved_tool_pair_appends_without_replacing_prepared_messages(monkeypa
     assert form_data['messages'][2:] == appended
     assert [message['role'] for message in appended] == ['assistant', 'tool']
     assert appended[1]['content'] == 'result'
+
+
+def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    reader_call = {
+        'id': 'reader-call',
+        'function': {'name': refs.REF_EXEC_TOOL_NAME, 'arguments': '{"command":"ls"}'},
+    }
+    write_call = {'id': 'write-call', 'function': {'name': 'write', 'arguments': '{}'}}
+    output = [
+        {
+            'type': 'function_call',
+            'call_id': call['id'],
+            'name': call['function']['name'],
+            'arguments': call['function']['arguments'],
+            'status': 'in_progress',
+        }
+        for call in (reader_call, write_call)
+    ]
+
+    executed = []
+
+    async def execute(*args):
+        executed.append(args[-1]['id'])
+        return {'tool_call_id': 'reader-call', 'content': 'catalog'}
+
+    monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+    async def run():
+        registry = {}
+        await refs.externalize_refs(
+            {
+                'stream': True,
+                'messages': [{'role': 'tool', 'tool_call_id': 'call', 'content': 'large result'}],
+            },
+            registry,
+            native=True,
+            threshold_tokens=1,
+            count_tokens=lambda _text: 2,
+        )
+        remaining = await middleware._execute_ref_calls_before_approval(
+            None,
+            {'messages': []},
+            None,
+            {'tools': registry},
+            None,
+            None,
+            [reader_call, write_call],
+            output,
+        )
+        custom = {
+            refs.REF_EXEC_TOOL_NAME: {
+                'spec': refs.REF_EXEC_FUNCTION_SPEC,
+                'callable': lambda: None,
+            }
+        }
+        custom_remaining = await middleware._execute_ref_calls_before_approval(
+            None,
+            {'messages': []},
+            None,
+            {'tools': custom},
+            None,
+            None,
+            [reader_call],
+            [],
+        )
+        return remaining, custom_remaining
+
+    remaining, custom_remaining = asyncio.run(run())
+
+    assert remaining == [write_call]
+    assert custom_remaining == [reader_call]
+    assert executed == ['reader-call']
+    assert output[0]['status'] == 'completed'
+    assert output[1]['status'] == 'in_progress'
+    assert output[-1]['call_id'] == 'reader-call'
+    assert output[-1]['output'][0]['text'] == 'catalog'
+
+
+def test_projection_source_does_not_duplicate_approved_messages():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    appended = [{'role': 'tool', 'content': 'result'}]
+    messages = [{'role': 'user', 'content': 'prompt'}, *appended]
+
+    assert middleware._projection_source_after_append(
+        {'projection_source_messages': messages},
+        messages,
+        appended,
+    ) is messages
+    assert middleware._projection_source_after_append(
+        {'projection_source_messages': messages[:1]},
+        messages,
+        appended,
+    ) == messages
 
 
 def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypatch):
@@ -571,6 +781,53 @@ def test_direct_compaction_can_use_configured_server_summary_model():
     }
 
 
+def test_reader_installation_requires_the_core_native_dispatch_context():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    native = {'chat_id': 'chat', 'message_id': 'message', 'params': {}}
+
+    assert middleware._can_install_externalized_ref_reader(native, None) is True
+    assert middleware._can_install_externalized_ref_reader({**native, 'chat_id': ''}, None) is False
+    assert middleware._can_install_externalized_ref_reader({**native, 'message_id': ''}, None) is False
+    assert middleware._can_install_externalized_ref_reader(native, []) is False
+    assert (
+        middleware._can_install_externalized_ref_reader(
+            {**native, 'params': {'function_calling': 'legacy'}},
+            None,
+        )
+        is False
+    )
+
+
+def test_middleware_compaction_always_finalizes_externalized_refs(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    state = {}
+
+    async def externalize(candidate, actual_state):
+        assert actual_state is state
+        return {**candidate, 'finalized': True}
+
+    async def compact(*args, finalize_candidate=None, **_kwargs):
+        assert args[-1] is state
+        assert finalize_candidate is not None
+        return await finalize_candidate(args[2])
+
+    monkeypatch.setattr(middleware, 'apply_externalized_refs', externalize)
+    monkeypatch.setattr(middleware, 'compact_provider_payload', compact)
+    result = asyncio.run(
+        middleware._compact_final_provider_payload(
+            None,
+            None,
+            {'messages': []},
+            {},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert result['finalized'] is True
+
+
 def test_arena_uses_selected_target_model_params_before_system_bypass(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     target = {'id': 'target', 'owned_by': 'openai'}
@@ -639,18 +896,42 @@ def test_arena_uses_selected_target_model_params_before_system_bypass(monkeypatc
     }
 
 
-def test_canonical_history_preserves_empty_shape_and_rejects_unknown_semantics():
+def test_canonical_history_projects_core_fields_and_ignores_metadata():
     empty_string = [{'role': 'user', 'content': ''}]
     empty_parts = [{'role': 'user', 'content': []}]
     assert compaction._canonical_history_entry(empty_string).ref != compaction._canonical_history_entry(empty_parts).ref
 
-    with pytest.raises(compaction.CanonicalHistoryError, match='unknown message shape'):
-        compaction._canonical_history_entry([{'role': 'user', 'content': 'hello', 'untracked': True}])
+    plain = compaction._canonical_history_entry([{'role': 'user', 'content': 'hello'}])
+    with_metadata = compaction._canonical_history_entry(
+        [
+            {
+                'id': 'message',
+                'parentId': 'parent',
+                'role': 'user',
+                'content': 'hello',
+                'files': [{'id': 'file'}],
+                'usage': {'input_tokens': 10},
+                'model': 'model',
+                'meta': {'internal': False},
+            }
+        ]
+    )
+    assert with_metadata.ref == plain.ref
 
-    with pytest.raises(compaction.CanonicalHistoryError, match='unknown content shape'):
-        compaction._canonical_history_entry(
-            [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello', 'cache_control': {}}]}]
-        )
+    provider_extension = compaction._canonical_history_entry(
+        [{'role': 'user', 'content': 'hello', 'provider_extension': {'value': 42}}]
+    )
+    assert provider_extension.ref != plain.ref
+    assert 'provider_extension' in provider_extension.text
+
+    plain_part = compaction._canonical_history_entry(
+        [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]}]
+    )
+    part_with_metadata = compaction._canonical_history_entry(
+        [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello', 'cache_control': {}}]}]
+    )
+    assert part_with_metadata.ref != plain_part.ref
+    assert 'cache_control' in part_with_metadata.text
 
     image_history = compaction._canonical_history_entry(
         [
@@ -665,14 +946,34 @@ def test_canonical_history_preserves_empty_shape_and_rejects_unknown_semantics()
             }
         ]
     )
-    assert 'omitted_media' in image_history.text
+    assert '<media omitted>' in image_history.text
+
+    extension_part = compaction._canonical_history_entry(
+        [{'role': 'user', 'content': [{'type': 'provider_extension', 'value': {'answer': 42}}]}]
+    )
+    assert 'provider_extension' in extension_part.text
+    assert '42' in extension_part.text
+
+    tool_only = compaction._canonical_history_entry(
+        [
+            {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{'id': 'call', 'function': {'name': 'lookup', 'arguments': '{}'}}],
+            }
+        ]
+    )
+    assert 'lookup' in tool_only.text
 
 
-def test_responses_output_accepts_known_text_metadata_and_refusal():
+def test_responses_history_uses_core_projection_for_unknown_shapes():
     output = [
         {'type': 'web_search_call', 'id': 'search-1', 'status': 'completed'},
         {'type': 'file_search_call', 'id': 'search-2', 'status': 'completed'},
         {'type': 'computer_call', 'id': 'computer-1', 'status': 'completed'},
+        {'type': 'mcp_call', 'id': 'mcp-1', 'status': 'completed'},
+        {'type': 'image_generation_call', 'id': 'image-1', 'status': 'completed'},
+        {'type': 'message', 'role': 'assistant', 'content': [{'type': 'text', 'text': ''}]},
         {
             'type': 'message',
             'role': 'assistant',
@@ -682,6 +983,7 @@ def test_responses_output_accepts_known_text_metadata_and_refusal():
                     'text': 'answer',
                     'annotations': [{'type': 'url_citation', 'url': 'https://example.test'}],
                     'logprobs': [],
+                    'parsed': {'answer': True},
                 },
                 {'type': 'output_text', 'text': ' continued', 'annotations': [], 'logprobs': None},
                 {'type': 'refusal', 'refusal': 'cannot comply'},
@@ -690,12 +992,47 @@ def test_responses_output_accepts_known_text_metadata_and_refusal():
     ]
 
     assert compaction._canonical_output_messages(output) == [
-        {'role': 'assistant', 'content': 'answer continuedcannot comply'}
+        {'role': 'assistant', 'content': 'answer continued'}
     ]
 
-    output[-1]['content'][0]['unknown'] = True
-    with pytest.raises(compaction.CanonicalHistoryError, match='unknown content shape'):
-        compaction._canonical_output_messages(output)
+
+def test_history_ancestor_resolution_is_incremental_and_cached(monkeypatch):
+    messages = [
+        {'role': 'user', 'content': 'root'},
+        {'role': 'user', 'content': 'checkpoint one', 'contextSummary': 'one'},
+        {'role': 'assistant', 'content': 'middle'},
+        {'role': 'user', 'content': 'checkpoint two', 'contextSummary': 'two'},
+        {'role': 'assistant', 'content': 'recent'},
+        {'role': 'user', 'content': 'checkpoint three', 'contextSummary': 'three'},
+    ]
+    selected = compaction._history_entry_at(messages, 5)
+    near = compaction._canonical_history_entry(messages[:3])
+    far = compaction._canonical_history_entry(messages[:1])
+    assert selected is not None and selected.load_history is not None
+
+    calls = []
+    make_entry = compaction.make_ref_entry
+
+    def counted(text, **kwargs):
+        calls.append(text)
+        return make_entry(text, **kwargs)
+
+    monkeypatch.setattr(compaction, 'make_ref_entry', counted)
+    assert asyncio.run(selected.load_history(f'history:{"f" * 64}')) == ()
+    assert calls == []
+
+    assert asyncio.run(selected.load_history(near.ref)) == (
+        compaction.replace(near, load_history=selected.load_history),
+    )
+    assert calls == [near.text]
+
+    loaded_far = asyncio.run(selected.load_history(far.ref))
+    assert [entry.ref for entry in loaded_far] == [far.ref]
+    assert calls == [near.text, far.text]
+
+    listed = asyncio.run(selected.load_history(None))
+    assert [entry.ref for entry in listed] == [near.ref, far.ref]
+    assert calls == [near.text, far.text]
 
 
 def test_non_string_code_interpreter_result_round_trips_checkpoint():
@@ -856,8 +1193,52 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
     asyncio.run(run())
 
     assert copy.deepcopy in calls
+    assert compaction.find_safe_compaction_boundary in calls
     assert compaction._history_entry_at in calls
     assert compaction.estimate_provider_tokens in calls
+
+
+def test_checkpoint_preparation_copies_only_the_active_suffix(monkeypatch):
+    messages = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'old answer'},
+        {'id': 'u2', 'role': 'user', 'content': 'checkpoint', 'contextSummary': 'summary'},
+        {'id': 'a2', 'role': 'assistant', 'content': 'recent answer'},
+        {'id': 'u3', 'role': 'user', 'content': 'current'},
+    ]
+    copied = []
+    real_deepcopy = copy.deepcopy
+
+    async def load_config():
+        return {'enable': True, 'retention_percentage': 40, 'transient_patterns': ()}
+
+    def deepcopy(value, memo=None):
+        copied.append(value)
+        return real_deepcopy(value, memo)
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.copy, 'deepcopy', deepcopy)
+    asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
+
+    assert copied == [messages[2:]]
+
+
+def test_historical_excerpts_stop_after_the_requested_recent_messages():
+    class Poison(dict):
+        def get(self, *_args, **_kwargs):
+            raise AssertionError('older messages must not be scanned')
+
+    messages = [Poison(), *({'role': 'user', 'content': str(index)} for index in range(32))]
+    assert compaction._historical_user_excerpts(messages, 512, 32) == [str(index) for index in range(32)]
+
+
+def test_excerpt_truncation_does_not_encode_the_full_source():
+    class HugeText(str):
+        def encode(self, *_args, **_kwargs):
+            raise AssertionError('the full source must not be encoded')
+
+    excerpt = compaction._middle_truncate_utf8(HugeText('界' * 1_000_000), 512)
+    assert len(excerpt.encode('utf-8')) <= 512
 
 
 def test_history_is_not_hashed_when_core_cannot_install_the_reader(monkeypatch):
@@ -893,6 +1274,45 @@ def test_history_is_not_hashed_when_core_cannot_install_the_reader(monkeypatch):
 
     assert body == {'stream': False, 'messages': [{'role': 'user', 'content': 'current'}]}
     assert state['externalized_refs']['registry'] == {}
+
+
+def test_disabled_refs_never_rewrite_user_content():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    content = '<auto_compaction_context><history_ref>history:' + 'a' * 64 + '</history_ref></auto_compaction_context>'
+    body = {'messages': [{'role': 'user', 'content': content}]}
+    state = {'externalized_refs': {'enable': False}}
+
+    result = asyncio.run(middleware.apply_externalized_refs(body, state))
+
+    assert result is body
+    assert result['messages'][0]['content'] == content
+    assert 'projection_source_messages' not in state
+
+
+def test_tool_only_refs_do_not_rewrite_user_content():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    content = '<auto_compaction_context><history_ref>history:' + 'a' * 64 + '</history_ref></auto_compaction_context>'
+    body = {
+        'stream': True,
+        'messages': [
+            {'role': 'user', 'content': content},
+            {'role': 'tool', 'tool_call_id': 'call', 'content': 'large result ' * 1000},
+        ],
+    }
+    state = {
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        }
+    }
+
+    result = asyncio.run(middleware.apply_externalized_refs(body, state))
+
+    assert result['messages'][0]['content'] == content
+    assert result['messages'][1]['content'].startswith('tool:')
 
 
 def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
@@ -936,11 +1356,31 @@ def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
                 'tasks': {},
                 'event_emitter': emit,
                 'model': {'id': 'model'},
+                'compaction_state': {'config': {'enable': True}},
             }
         )
     )
 
     assert captured == [{'id': 'a1', 'role': 'assistant', 'content': 'answer', 'model': 'model'}]
+
+    async def unexpected_replay(*_args):
+        raise AssertionError('disabled compaction must not replay background messages')
+
+    monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', unexpected_replay)
+    asyncio.run(
+        middleware.background_tasks_handler(
+            {
+                'request': SimpleNamespace(),
+                'form_data': {},
+                'user': SimpleNamespace(),
+                'metadata': {'chat_id': 'chat', 'message_id': 'a1'},
+                'tasks': {},
+                'event_emitter': emit,
+                'model': {'id': 'model'},
+                'compaction_state': {'config': {'enable': False}},
+            }
+        )
+    )
 
 
 def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
@@ -1066,6 +1506,65 @@ def test_provider_overflow_can_force_one_smaller_compaction_below_threshold(monk
         'Compacting context',
         'Context compacted',
     ]
+
+
+def test_compaction_validates_the_final_provider_payload(monkeypatch):
+    history_entry = compaction.make_ref_entry('history', kind='history')
+    assert history_entry is not None
+
+    async def create_checkpoint(*_args, **_kwargs):
+        return 'summary', {'historical_user_messages': []}, history_entry
+
+    def estimate(body):
+        has_summary = any(
+            isinstance(message.get('content'), str)
+            and message['content'].startswith('<auto_compaction_context>')
+            for message in body['messages']
+        )
+        return 120 if not has_summary or body.get('tools') else 20
+
+    async def add_reader(candidate):
+        return {
+            **candidate,
+            'tools': [{'type': 'function', 'function': {'name': 'auto_compact_ref_exec'}}],
+        }
+
+    monkeypatch.setattr(compaction, '_create_checkpoint', create_checkpoint)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    body = {
+        'messages': [
+            {'role': 'user', 'content': 'old'},
+            {'role': 'assistant', 'content': 'answer'},
+            {'role': 'user', 'content': 'new', compaction._BOUNDARY_KEY: True},
+        ]
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        }
+    }
+
+    with pytest.raises(RuntimeError, match='remains exceeded'):
+        asyncio.run(
+            compaction.compact_provider_payload(
+                None,
+                None,
+                body,
+                {},
+                'model',
+                {},
+                state,
+                finalize_candidate=add_reader,
+            )
+        )
+
+    assert state.get('compacted') is not True
 
 
 def test_stateful_continuation_sends_current_output_and_retries_full_history(monkeypatch):

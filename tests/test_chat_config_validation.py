@@ -50,13 +50,13 @@ def test_chat_config_accepts_valid_additional_fields():
             'CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO': 0,
             'CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS': '\n^foo\\s+bar$\n',
             'ENABLE_EXTERNALIZED_REFS': True,
-            'EXTERNALIZED_REFS_TOKEN_THRESHOLD': 1000,
+            'EXTERNALIZED_REFS_TOKEN_THRESHOLD': 1,
         },
     )
 
     assert response.status_code == 200
     assert response.json()['CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO'] == 0
-    assert response.json()['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] == 1000
+    assert response.json()['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] == 1
 
 
 @pytest.mark.parametrize(
@@ -66,8 +66,8 @@ def test_chat_config_accepts_valid_additional_fields():
         ('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO', 1),
         ('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO', 'nan'),
         ('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO', 'inf'),
-        ('EXTERNALIZED_REFS_TOKEN_THRESHOLD', 999),
         ('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS', '('),
+        ('EXTERNALIZED_REFS_TOKEN_THRESHOLD', 0),
     ],
 )
 def test_chat_config_rejects_invalid_additional_fields(field, value):

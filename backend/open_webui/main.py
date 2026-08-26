@@ -1657,7 +1657,14 @@ async def chat_completion(
                     compaction_state,
                 )
 
-            response, form_data = await forward_with_context_retry(send, form_data, retry)
+            retry_enabled = (compaction_state.get('config') or {}).get('enable') and not compaction_state.get(
+                'compacted'
+            )
+            response, form_data = await forward_with_context_retry(
+                send,
+                form_data,
+                retry if retry_enabled else None,
+            )
 
             # When the upstream provider returns an error (e.g. HTTP 400
             # content-filter, quota exceeded), generate_chat_completion

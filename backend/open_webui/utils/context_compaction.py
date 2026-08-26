@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import codecs
 import copy
+import hashlib
 import json
 import logging
 import math
 import re
+from collections import Counter
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from functools import cache
 from typing import Any
 
 import tiktoken
@@ -19,7 +23,7 @@ from open_webui.models.config import Config
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.externalized_refs import RefEntry, make_ref_entry
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import get_content_from_message, get_message_list
+from open_webui.utils.misc import convert_output_to_messages, get_content_from_message, get_message_list
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     prompt_template,
@@ -58,39 +62,20 @@ CONTEXT_COMPACTION_USAGE_ANCHOR_KEY = '_open_webui_context_compaction_usage_anch
 CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY = '_open_webui_context_compaction_transient'
 _DEFAULT_EXCERPT_BYTES = 512
 _DEFAULT_EXCERPT_COUNT = 32
-_HISTORY_REF_XML_RE = re.compile(r'<history_ref>history:[0-9a-f]{64}</history_ref>')
-_HISTORY_IGNORED_KEYS = frozenset(
-    {
-        'id',
-        'parentId',
-        'childrenIds',
-        'timestamp',
-        'created_at',
-        'updated_at',
-        'models',
-        'model',
-        'done',
-        'usage',
-        'info',
-        'sources',
-        'files',
-        'embeds',
-        'annotation',
-        'annotations',
-        'reasoning',
-        'reasoning_content',
-        'reasoning_details',
-        'status',
-        'statusHistory',
-        'status_history',
-        'contextSummary',
-        'context_summary',
-        'error',
-        'feedback',
-        'metadata',
-        'meta',
-    }
+_HISTORY_REF_XML_SUFFIX_RE = re.compile(
+    r'<history_ref>history:[0-9a-f]{64}</history_ref>(?=</auto_compaction_context>\Z)'
 )
+_HISTORY_DB_KEYS = {
+    'id',
+    'parentId',
+    'files',
+    'output',
+    'contextSummary',
+    'context_summary',
+    'usage',
+    'model',
+    'meta',
+}
 
 
 class CanonicalHistoryError(ValueError):
@@ -122,13 +107,16 @@ def _xml_cdata(value: str) -> str:
 
 
 def _middle_truncate_utf8(value: str, limit: int) -> str:
-    encoded = value.encode('utf-8')
-    if len(encoded) <= limit:
-        return value
+    if len(value) <= limit:
+        encoded = value.encode('utf-8')
+        if len(encoded) <= limit:
+            return value
     marker = '…'
     budget = max(0, limit - len(marker.encode('utf-8')))
-    head = encoded[: budget // 2].decode('utf-8', 'ignore')
-    tail = encoded[-(budget - budget // 2) :].decode('utf-8', 'ignore') if budget else ''
+    head_budget = budget // 2
+    tail_budget = budget - head_budget
+    head = value[:head_budget].encode('utf-8')[:head_budget].decode('utf-8', 'ignore')
+    tail = value[-tail_budget:].encode('utf-8')[-tail_budget:].decode('utf-8', 'ignore') if tail_budget else ''
     return f'{head}{marker}{tail}'
 
 
@@ -156,10 +144,6 @@ def _is_transient_message(message: Any, patterns: tuple[re.Pattern[str], ...] = 
     return text is not None and any(pattern.match(text.lstrip()) for pattern in patterns)
 
 
-def is_transient_message(message: Any, patterns: tuple[re.Pattern[str], ...] = ()) -> bool:
-    return _is_transient_message(message, patterns)
-
-
 def get_last_persistent_user_message(
     messages: list[dict],
     patterns: tuple[re.Pattern[str], ...] = (),
@@ -178,230 +162,44 @@ def _historical_user_excerpts(
 ) -> list[str]:
     if count <= 0:
         return []
-    excerpts = [
-        _middle_truncate_utf8(content, byte_limit)
-        for message in messages
-        if message.get('role') == 'user'
-        and not _is_transient_message(message, patterns)
-        and (content := get_content_from_message(message))
-    ]
-    return excerpts[-count:]
-
-
-def _canonical_history_content(value: Any, *, required: bool) -> str | list[dict[str, str]]:
-    if value is None and not required:
-        return ''
-    if isinstance(value, str):
-        return value
-    if not isinstance(value, list):
-        raise CanonicalHistoryError('unknown content shape')
-    canonical = []
-    for part in value:
-        if not isinstance(part, dict):
-            raise CanonicalHistoryError('unknown content shape')
-        part_type = part.get('type')
-        if part_type in {'text', 'input_text', 'output_text'}:
-            if set(part) != {'type', 'text'} or not isinstance(part.get('text'), str):
-                raise CanonicalHistoryError('unknown content shape')
-            canonical.append({'type': 'text', 'text': part['text']})
-        elif part_type == 'input_image':
-            if set(part) != {'type', 'image_url'} or not isinstance(part.get('image_url'), str):
-                raise CanonicalHistoryError('unknown content shape')
-            canonical.append({'type': 'omitted_media', 'media': 'image'})
-        elif part_type == 'image_url':
-            image_url = part.get('image_url')
-            if set(part) != {'type', 'image_url'} or not (
-                isinstance(image_url, str)
-                or (
-                    isinstance(image_url, dict)
-                    and set(image_url) <= {'url', 'detail'}
-                    and isinstance(image_url.get('url'), str)
-                    and (
-                        'detail' not in image_url or image_url['detail'] is None or isinstance(image_url['detail'], str)
-                    )
-                )
-            ):
-                raise CanonicalHistoryError('unknown content shape')
-            canonical.append({'type': 'omitted_media', 'media': 'image'})
-        else:
-            raise CanonicalHistoryError('unknown content shape')
-    return canonical
-
-
-def _canonical_history_tool_calls(value: Any) -> list[dict[str, str]]:
-    if not isinstance(value, list):
-        raise CanonicalHistoryError('unknown tool call shape')
-    calls = []
-    for call in value:
-        function = call.get('function') if isinstance(call, dict) else None
+    excerpts = []
+    for message in reversed(messages):
         if (
-            not isinstance(call, dict)
-            or set(call) != {'id', 'type', 'function'}
-            or call.get('type') != 'function'
-            or not isinstance(call.get('id'), str)
-            or not isinstance(function, dict)
-            or set(function) != {'name', 'arguments'}
-            or not isinstance(function.get('name'), str)
-            or not isinstance(function.get('arguments'), str)
+            message.get('role') == 'user'
+            and not _is_transient_message(message, patterns)
+            and (content := get_content_from_message(message))
         ):
-            raise CanonicalHistoryError('unknown tool call shape')
-        calls.append({'id': call['id'], 'name': function['name'], 'arguments': function['arguments']})
-    return calls
+            excerpts.append(_middle_truncate_utf8(content, byte_limit))
+            if len(excerpts) == count:
+                break
+    excerpts.reverse()
+    return excerpts
 
 
-def _canonical_direct_history_message(message: dict[str, Any]) -> dict[str, Any]:
+def _canonical_history_content(value: Any) -> Any:
+    return _sanitize_token_value(value)[0]
+
+
+def _canonical_direct_history_message(message: Any) -> dict[str, Any] | None:
+    if not isinstance(message, dict):
+        return None
     role = message.get('role')
-    semantic_keys = set(message) - _HISTORY_IGNORED_KEYS
-    if role == 'user':
-        if semantic_keys != {'role', 'content'}:
-            raise CanonicalHistoryError('unknown message shape')
-        return {'role': role, 'content': _canonical_history_content(message.get('content'), required=True)}
-    if role == 'assistant':
-        if not semantic_keys <= {'role', 'content', 'tool_calls'} or 'role' not in semantic_keys:
-            raise CanonicalHistoryError('unknown message shape')
-        canonical = {
-            'role': role,
-            'content': _canonical_history_content(message.get('content'), required=False),
-        }
-        if 'tool_calls' in message:
-            calls = _canonical_history_tool_calls(message['tool_calls'])
-            if calls:
-                canonical['tool_calls'] = calls
-        return canonical
-    if role == 'tool':
-        if semantic_keys != {'role', 'content', 'tool_call_id'} or not isinstance(message.get('tool_call_id'), str):
-            raise CanonicalHistoryError('unknown message shape')
-        return {
-            'role': role,
-            'tool_call_id': message['tool_call_id'],
-            'content': _canonical_history_content(message.get('content'), required=True),
-        }
-    raise CanonicalHistoryError('unknown message shape')
+    if not isinstance(role, str):
+        return None
+    return {
+        key: _canonical_history_content(value)
+        for key, value in message.items()
+        if key not in _HISTORY_DB_KEYS
+    }
 
 
 def _canonical_output_messages(output: Any) -> list[dict[str, Any]]:
     if not isinstance(output, list):
-        raise CanonicalHistoryError('unknown output shape')
-    requested = {
-        item.get('call_id')
-        for item in output
-        if isinstance(item, dict) and item.get('type') == 'function_call' and isinstance(item.get('call_id'), str)
-    }
-    completed = {
-        item.get('call_id')
-        for item in output
-        if isinstance(item, dict)
-        and item.get('type') == 'function_call_output'
-        and isinstance(item.get('call_id'), str)
-    }
-    messages: list[dict[str, Any]] = []
-    content: list[str] = []
-    calls: list[dict[str, str]] = []
-
-    def flush() -> None:
-        if content or calls:
-            message: dict[str, Any] = {'role': 'assistant', 'content': '\n'.join(content) if content else ''}
-            if calls:
-                message['tool_calls'] = list(calls)
-            messages.append(message)
-            content.clear()
-            calls.clear()
-
-    for item in output:
-        if not isinstance(item, dict) or not isinstance(item.get('type'), str):
-            raise CanonicalHistoryError('unknown output shape')
-        item_type = item['type']
-        if item_type == 'message':
-            parts = item.get('content')
-            if not isinstance(parts, list):
-                raise CanonicalHistoryError('unknown output shape')
-            text = ''
-            for part in parts:
-                if not isinstance(part, dict):
-                    raise CanonicalHistoryError('unknown content shape')
-                if part.get('type') == 'output_text':
-                    if (
-                        not set(part) <= {'type', 'text', 'annotations', 'logprobs'}
-                        or not isinstance(part.get('text'), str)
-                        or ('annotations' in part and not isinstance(part['annotations'], list))
-                        or (
-                            'logprobs' in part
-                            and part['logprobs'] is not None
-                            and not isinstance(part['logprobs'], list)
-                        )
-                    ):
-                        raise CanonicalHistoryError('unknown content shape')
-                    text += part['text']
-                elif part.get('type') == 'refusal':
-                    if set(part) != {'type', 'refusal'} or not isinstance(part.get('refusal'), str):
-                        raise CanonicalHistoryError('unknown content shape')
-                    text += part['refusal']
-                else:
-                    raise CanonicalHistoryError('unknown content shape')
-            if text:
-                content.append(text)
-        elif item_type == 'function_call':
-            call_id = item.get('call_id')
-            if not all(isinstance(item.get(key), str) for key in ('call_id', 'name', 'arguments')):
-                raise CanonicalHistoryError('unknown output shape')
-            if call_id in completed:
-                calls.append({'id': call_id, 'name': item['name'], 'arguments': item['arguments']})
-        elif item_type == 'function_call_output':
-            call_id = item.get('call_id')
-            parts = item.get('output')
-            if not isinstance(call_id, str) or not isinstance(parts, list):
-                raise CanonicalHistoryError('unknown output shape')
-            flush()
-            text = ''
-            images = []
-            for part in parts:
-                if not isinstance(part, dict):
-                    raise CanonicalHistoryError('unknown content shape')
-                if part.get('type') == 'input_text':
-                    if set(part) != {'type', 'text'} or not isinstance(part.get('text'), str):
-                        raise CanonicalHistoryError('unknown content shape')
-                    text += part['text']
-                elif part.get('type') == 'input_image':
-                    if set(part) != {'type', 'image_url'} or not isinstance(part.get('image_url'), str):
-                        raise CanonicalHistoryError('unknown content shape')
-                    images.append({'type': 'omitted_media', 'media': 'image'})
-                else:
-                    raise CanonicalHistoryError('unknown content shape')
-            if call_id in requested:
-                tool_content: str | list[dict[str, str]] = text
-                if images:
-                    tool_content = [{'type': 'text', 'text': text}, *images]
-                messages.append({'role': 'tool', 'tool_call_id': call_id, 'content': tool_content})
-        elif item_type == 'open_webui:code_interpreter':
-            code = item.get('code', '')
-            code_output = item.get('output', '')
-            if not isinstance(code, str):
-                raise CanonicalHistoryError('unknown output shape')
-            if code:
-                content.append(f'<code_interpreter>\n{code}\n</code_interpreter>')
-            if isinstance(code_output, dict):
-                if not set(code_output) <= {'stdout', 'result', 'stderr'}:
-                    raise CanonicalHistoryError('unknown output shape')
-                output_text = code_output.get('stdout') or code_output.get('result') or code_output.get('stderr') or ''
-                if not isinstance(output_text, str):
-                    output_text = str(output_text)
-            elif code_output is None:
-                output_text = ''
-            else:
-                output_text = str(code_output)
-            if output_text:
-                content.append(f'<code_interpreter_output>\n{output_text}\n</code_interpreter_output>')
-        elif item_type in {
-            'reasoning',
-            'web_search_call',
-            'file_search_call',
-            'computer_call',
-        } or item_type.startswith('open_webui:'):
-            continue
-        else:
-            raise CanonicalHistoryError('unknown output shape')
-    flush()
-    return messages
+        return []
+    return [
+        _canonical_direct_history_message(message)
+        for message in convert_output_to_messages(output, flatten_tool_images=False)
+    ]
 
 
 def _canonical_messages(
@@ -410,14 +208,11 @@ def _canonical_messages(
     if message.get('role') == 'system' or _is_transient_message(message):
         return []
     if message.get('role') == 'assistant' and message.get('output'):
-        semantic_keys = set(message) - _HISTORY_IGNORED_KEYS
-        if not semantic_keys <= {'role', 'content', 'tool_calls', 'output'}:
-            raise CanonicalHistoryError('unknown message shape')
         converted = _canonical_output_messages(message['output'])
         if converted:
             return converted
-    direct = {key: value for key, value in message.items() if key != 'output'}
-    return [_canonical_direct_history_message(direct)]
+    direct = _canonical_direct_history_message(message)
+    return [direct] if direct is not None else []
 
 
 def _canonical_history_entry(messages: list[dict[str, Any]]) -> RefEntry:
@@ -438,17 +233,49 @@ def _bind_history_loader(
     messages: list[dict[str, Any]],
     selected_index: int,
 ) -> RefEntry:
-    async def load_ancestors(_requested: str | None) -> tuple[RefEntry, ...]:
+    @cache
+    def checkpoint_refs() -> tuple[tuple[str, int], ...]:
+        digest = hashlib.sha256()
+        offset = 0
+        first = True
+        checkpoints = []
+        for message in messages[:selected_index]:
+            if message.get('contextSummary') or message.get('context_summary'):
+                checkpoints.append((f'history:{digest.hexdigest()}', offset))
+            for item in _canonical_messages(message):
+                record = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+                piece = record if first else f'\n{record}'
+                if not entry.text.startswith(piece, offset):
+                    return ()
+                digest.update(piece.encode('utf-8'))
+                offset += len(piece)
+                first = False
+        return tuple(checkpoints) if offset == len(entry.text) else ()
+
+    resolved: dict[str, RefEntry] = {}
+
+    def materialize(ref: str, end: int) -> RefEntry:
+        ancestor = resolved.get(ref)
+        if ancestor is None:
+            ancestor = make_ref_entry(entry.text[:end], kind='history', load_history=load_ancestors)
+            if ancestor is None or ancestor.ref != ref:
+                raise CanonicalHistoryError('history source is not valid UTF-8')
+            resolved[ref] = ancestor
+        return ancestor
+
+    async def load_ancestors(requested: str | None) -> tuple[RefEntry, ...]:
         def resolve() -> tuple[RefEntry, ...]:
             entries = []
-            for index in range(selected_index - 1, -1, -1):
-                if not (messages[index].get('contextSummary') or messages[index].get('context_summary')):
+            for ref, end in reversed(checkpoint_refs()):
+                if requested is not None and ref != requested:
                     continue
                 try:
-                    ancestor = _canonical_history_entry(messages[:index])
+                    ancestor = materialize(ref, end)
                 except CanonicalHistoryError:
                     break
-                entries.append(replace(ancestor, load_history=load_ancestors))
+                if requested is not None:
+                    return (ancestor,)
+                entries.append(ancestor)
             return tuple(entries)
 
         return await asyncio.to_thread(resolve)
@@ -466,15 +293,25 @@ def _history_entry_at(messages: list[dict[str, Any]], carrier_index: int) -> Ref
     )
 
 
+def _history_source(source: Any) -> tuple[list[dict[str, Any]], int] | None:
+    if (
+        isinstance(source, tuple)
+        and len(source) == 2
+        and isinstance(source[0], list)
+        and isinstance(source[1], int)
+        and 0 <= source[1] < len(source[0])
+    ):
+        return source
+    return None
+
+
 async def resolve_request_history(source: Any) -> RefEntry | None:
     if isinstance(source, RefEntry):
         return source
-    if not isinstance(source, tuple) or len(source) != 2:
+    checkpoint = _history_source(source)
+    if checkpoint is None:
         return None
-    messages, carrier_index = source
-    if not isinstance(messages, list) or not isinstance(carrier_index, int):
-        return None
-    return await asyncio.to_thread(_history_entry_at, messages, carrier_index)
+    return await asyncio.to_thread(_history_entry_at, *checkpoint)
 
 
 def render_summary_message(summary: str, summary_meta: dict | None = None) -> dict:
@@ -500,7 +337,8 @@ async def replay_cached_compaction_messages(messages: list[dict], state: dict) -
     """Replay the request-local checkpoint without resolving or hashing history again."""
     summary = state.get('summary')
     summary_meta = state.get('summary_meta')
-    carrier_id = state.get('checkpoint_message_id')
+    checkpoint_history = _history_source(state.get('checkpoint_history'))
+    carrier_id = checkpoint_history[0][checkpoint_history[1]].get('id') if checkpoint_history else None
     prefetch = state.get('prefetch_task')
     if not summary and isinstance(prefetch, asyncio.Task):
         try:
@@ -543,11 +381,16 @@ def set_summary_history_ref(body: dict, ref: str | None) -> dict:
     updated = None
     for index, message in enumerate(messages):
         content = message.get('content') if isinstance(message, dict) else None
-        if not isinstance(content, str) or not content.startswith('<auto_compaction_context>'):
+        closing = '</auto_compaction_context>'
+        if (
+            not isinstance(content, str)
+            or not content.startswith('<auto_compaction_context>')
+            or not content.endswith(closing)
+        ):
             continue
-        clean = _HISTORY_REF_XML_RE.sub('', content)
+        clean = _HISTORY_REF_XML_SUFFIX_RE.sub('', content)
         if replacement:
-            clean = clean.replace('</auto_compaction_context>', f'{replacement}</auto_compaction_context>', 1)
+            clean = f'{clean[: -len(closing)]}{replacement}{closing}'
         if clean != content:
             updated = list(messages)
             updated[index] = {**message, 'content': clean}
@@ -572,8 +415,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         return messages, state
 
     system_messages, checkpoint_messages = _split_leading_system_messages(messages)
-    raw_messages = await asyncio.to_thread(copy.deepcopy, checkpoint_messages)
     summary_index, previous_summary = _checkpoint_summary(checkpoint_messages)
+    active_offset = summary_index if summary_index is not None else 0
+    active_messages = await asyncio.to_thread(copy.deepcopy, checkpoint_messages[active_offset:])
     summary_meta: dict[str, Any] = {}
     if summary_index is not None:
         state['selected_checkpoint_message_id'] = checkpoint_messages[summary_index].get('id')
@@ -585,8 +429,6 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
             _DEFAULT_EXCERPT_COUNT,
             config['transient_patterns'],
         )
-    active_offset = summary_index if summary_index is not None else 0
-    active_messages = raw_messages[active_offset:]
     for index in range(len(active_messages) - 1, -1, -1):
         message = active_messages[index]
         if message.get('role') != 'assistant':
@@ -595,27 +437,19 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         usage = message.get('usage') or (info.get('usage') if isinstance(info, dict) else None)
         input_tokens = _strict_usage_input_tokens(usage)
         if input_tokens is not None:
-            active_messages[index] = {**message, CONTEXT_COMPACTION_USAGE_ANCHOR_KEY: input_tokens}
+            message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY] = input_tokens
             break
-    boundary = find_safe_compaction_boundary(
+    boundary = await asyncio.to_thread(
+        find_safe_compaction_boundary,
         active_messages,
         config['retention_percentage'],
         config['transient_patterns'],
     )
 
     if boundary:
-        marked = dict(active_messages[boundary])
-        marked[_BOUNDARY_KEY] = True
-        active_messages = [*active_messages[:boundary], marked, *active_messages[boundary + 1 :]]
+        active_messages[boundary][_BOUNDARY_KEY] = True
         raw_boundary = active_offset + boundary
-        checkpoint_message = checkpoint_messages[raw_boundary]
-        state.update(
-            {
-                'checkpoint_message_id': checkpoint_message.get('id'),
-                'source_messages': checkpoint_messages[:raw_boundary],
-                'checkpoint_history': (checkpoint_messages, raw_boundary),
-            }
-        )
+        state['checkpoint_history'] = (checkpoint_messages, raw_boundary)
 
     if previous_summary:
         active_messages = [render_summary_message(previous_summary, summary_meta), *active_messages]
@@ -651,8 +485,13 @@ async def _create_checkpoint(
     compacted_messages: list[dict],
     recent_messages: list[dict],
 ) -> tuple[str, dict[str, Any], Any]:
-    source_messages = state.get('source_messages') or []
-    checkpoint_message_id = state.get('checkpoint_message_id')
+    checkpoint_history = _history_source(state.get('checkpoint_history'))
+    if checkpoint_history and checkpoint_history[1] > 0:
+        source_messages = checkpoint_history[0][: checkpoint_history[1]]
+        checkpoint_message_id = checkpoint_history[0][checkpoint_history[1]].get('id')
+    else:
+        source_messages = []
+        checkpoint_message_id = None
     chat_id = metadata.get('chat_id')
     if not checkpoint_message_id or not is_saved_chat_id(chat_id):
         raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
@@ -684,7 +523,7 @@ async def _create_checkpoint(
     )
     if saved is None:
         raise RuntimeError('Context compaction checkpoint could not be saved; provider request was not sent')
-    return summary, summary_meta, state.get('checkpoint_history')
+    return summary, summary_meta, checkpoint_history
 
 
 def _prefetch_done(task: asyncio.Task) -> None:
@@ -719,13 +558,16 @@ async def compact_provider_payload(
     state: dict,
     *,
     force: bool = False,
+    finalize_candidate: Callable[[dict], Awaitable[dict]] | None = None,
 ) -> dict:
     """Compact the final provider candidate or fail before provider dispatch."""
     messages = body.get('messages')
     if not isinstance(messages, list):
         return body
     config = state.get('config') or await _load_config()
-    if not config['enable'] or metadata.get('task') == 'context_compaction' or body.get('previous_response_id'):
+    if not config['enable']:
+        return body
+    if metadata.get('task') == 'context_compaction' or body.get('previous_response_id'):
         return {**body, 'messages': _without_boundary_marker(messages)}
 
     system_messages, working = _split_leading_system_messages(messages)
@@ -777,9 +619,6 @@ async def compact_provider_payload(
         state['provider_usage_anchor'] = usage_anchor
 
     before = await asyncio.to_thread(estimate_provider_tokens, body)
-    if before is None:
-        raise RuntimeError('Context compaction could not estimate the provider input; request was not sent')
-    state['tokens_before'] = before
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
     if before <= threshold and not force:
         soft_ratio = config['soft_trigger_ratio']
@@ -845,21 +684,22 @@ async def compact_provider_payload(
                 *_without_boundary_marker(recent_messages),
             ],
         }
-        after = await asyncio.to_thread(estimate_provider_tokens, compacted_body)
-        if after is None or after > threshold or (force and after >= before):
-            raise RuntimeError(
-                'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
-            )
-
         state.update(
             {
-                'compacted': True,
-                'tokens_after': after,
                 'summary': summary,
                 'summary_meta': summary_meta,
                 'selected_history': history_entry,
             }
         )
+        if finalize_candidate is not None:
+            compacted_body = await finalize_candidate(compacted_body)
+        after = await asyncio.to_thread(estimate_provider_tokens, compacted_body)
+        if after > threshold or (force and after >= before):
+            raise RuntimeError(
+                'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
+            )
+
+        state['compacted'] = True
     except Exception:
         await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
         raise
@@ -930,6 +770,8 @@ async def _load_config() -> dict:
         'chat.context_compaction.prompt_template',
         'chat.context_compaction.soft_trigger_ratio',
         'chat.context_compaction.transient_message_patterns',
+        'chat.externalized_refs.enable',
+        'chat.externalized_refs.token_threshold',
     )
     token_threshold = _parse_positive_int(values.get('chat.context_compaction.token_threshold')) or 80000
     enabled = bool(values.get('chat.context_compaction.enable', False))
@@ -940,6 +782,10 @@ async def _load_config() -> dict:
         'retention_percentage': _clamp_retention_percentage(values.get('chat.context_compaction.retention_percentage')),
         'prompt_template': values.get('chat.context_compaction.prompt_template', '') or '',
         'soft_trigger_ratio': _soft_trigger_ratio(values.get('chat.context_compaction.soft_trigger_ratio')),
+        'externalized_refs_enable': values.get('chat.externalized_refs.enable') is True,
+        'externalized_refs_token_threshold': (
+            _parse_positive_int(values.get('chat.externalized_refs.token_threshold')) or 10000
+        ),
         'transient_patterns': (
             tuple(
                 re.compile(line.strip())
@@ -997,7 +843,11 @@ async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict
     if not messages:
         return None
 
-    config = await _load_config()
+    try:
+        config = await _load_config()
+    except re.error:
+        log.exception('Context compaction configuration is invalid; context usage is unavailable')
+        return None
     if not config['enable']:
         return None
 
@@ -1095,10 +945,7 @@ def _token_count(encoder: Any, text: str) -> int | None:
         return 0
 
     def encode(sample: str) -> int:
-        try:
-            return len(encoder.encode(sample, disallowed_special=()))
-        except TypeError:
-            return len(encoder.encode(sample))
+        return len(encoder.encode(sample, disallowed_special=()))
 
     try:
         total_bytes = len(text.encode('utf-8'))
@@ -1114,64 +961,62 @@ def _token_count(encoder: Any, text: str) -> int | None:
     return math.ceil(sum(counts) * total_bytes / sample_bytes)
 
 
-def estimate_body_tokens(body: dict, *, encoding_name: str | None = None) -> int | None:
-    """Estimate tokens in provider-visible messages and request extras."""
-    if not isinstance(body, dict) or not isinstance(body.get('messages'), list):
-        return None
+@cache
+def _token_encoder() -> Any | None:
     try:
-        encoder = tiktoken.get_encoding(encoding_name or TIKTOKEN_ENCODING_NAME)
+        encoder = tiktoken.get_encoding(TIKTOKEN_ENCODING_NAME)
+        encoder.encode('', disallowed_special=())
+        return encoder
     except Exception:
+        log.exception('tiktoken is unavailable; falling back to approximate token estimation')
         return None
 
+
+def _serialized_token_count(encoder: Any | None, value: Any) -> int:
+    try:
+        text = json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    except (TypeError, ValueError):
+        return _estimate_tokens(value)
+    count = _token_count(encoder, text) if encoder is not None else None
+    return count if count is not None else _estimate_tokens(text)
+
+
+def estimate_body_tokens(body: dict) -> int:
+    """Estimate tokens in provider-visible messages and request extras."""
+    if not isinstance(body, dict) or not isinstance(body.get('messages'), list):
+        return 0
+    encoder = _token_encoder()
+
     total = 3
-    payloads = [
-        {key: message[key] for key in _TOKEN_MESSAGE_KEYS if key in message}
-        for message in body['messages']
-        if isinstance(message, dict)
-    ]
     extras = {key: body[key] for key in _BODY_TOKEN_EXTRA_KEYS if key in body and body[key] not in (None, {}, [])}
-    for payload in payloads:
+    for message in body['messages']:
+        if not isinstance(message, dict):
+            continue
+        payload = {key: message[key] for key in _TOKEN_MESSAGE_KEYS if key in message}
         sanitized, media_count = _sanitize_token_value(payload)
-        text = json.dumps(sanitized, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-        count = _token_count(encoder, text)
-        if count is None:
-            return None
-        total += 4 + count + media_count * 1000
+        total += 4 + _serialized_token_count(encoder, sanitized) + media_count * 1000
     if extras:
-        try:
-            text = json.dumps(extras, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-        except (TypeError, ValueError):
-            return None
-        count = _token_count(encoder, text)
-        if count is None:
-            return None
-        total += 4 + count
+        total += 4 + _serialized_token_count(encoder, extras)
     return total
 
 
-def estimate_text_tokens(text: str, *, encoding_name: str | None = None) -> int | None:
-    try:
-        encoder = tiktoken.get_encoding(encoding_name or TIKTOKEN_ENCODING_NAME)
-    except Exception:
-        return None
-    return _token_count(encoder, text)
+def estimate_text_tokens(text: str) -> int:
+    encoder = _token_encoder()
+    count = _token_count(encoder, text) if encoder is not None else None
+    return count if count is not None else _estimate_tokens(text)
 
 
-def estimate_provider_tokens(body: dict) -> int | None:
-    estimated = estimate_body_tokens(body)
-    if estimated is None:
-        return None
+def estimate_provider_tokens(body: dict) -> int:
     messages = body.get('messages')
     if not isinstance(messages, list):
-        return estimated
+        return 0
     for index in range(len(messages) - 1, -1, -1):
         input_tokens = messages[index].get(CONTEXT_COMPACTION_USAGE_ANCHOR_KEY)
         if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens <= 0:
             continue
         suffix = estimate_body_tokens({'messages': messages[index:]})
-        if suffix is not None:
-            return max(estimated, input_tokens + max(0, suffix - 3))
-    return estimated
+        return input_tokens + max(0, suffix - 3)
+    return estimate_body_tokens(body)
 
 
 def _candidate_input_tokens(messages: list[dict], system_prompt: str = '', summary: str | None = None) -> int:
@@ -1185,38 +1030,14 @@ def _candidate_input_tokens(messages: list[dict], system_prompt: str = '', summa
         if input_tokens is None:
             continue
         suffix_tokens = estimate_body_tokens({'messages': messages[index:]})
-        if suffix_tokens is not None:
-            return input_tokens + max(0, suffix_tokens - 3)
+        return input_tokens + max(0, suffix_tokens - 3)
 
     fallback_messages = list(messages)
     if summary:
         fallback_messages.insert(0, {'role': 'system', 'content': f'[CONVERSATION SUMMARY]\n{summary}'})
     if system_prompt:
         fallback_messages.insert(0, {'role': 'system', 'content': system_prompt})
-    return estimate_body_tokens({'messages': fallback_messages}) or (
-        _estimate_tokens(system_prompt) + _estimate_tokens(summary or '') + _estimate_messages_tokens(messages)
-    )
-
-
-def _exceeds_token_threshold(messages: list[dict], system_prompt: str, summary: str | None, threshold: int) -> bool:
-    if threshold <= 0:
-        return False
-    return _candidate_input_tokens(messages, system_prompt, summary) > threshold
-
-
-def _tool_call_ids(messages: list[dict]) -> tuple[set[str], set[str]]:
-    requested = {
-        call['id']
-        for message in messages
-        for call in message.get('tool_calls') or []
-        if isinstance(call, dict) and isinstance(call.get('id'), str)
-    }
-    completed = {
-        message['tool_call_id']
-        for message in messages
-        if message.get('role') == 'tool' and isinstance(message.get('tool_call_id'), str)
-    }
-    return requested, completed
+    return estimate_body_tokens({'messages': fallback_messages})
 
 
 def find_safe_compaction_boundary(
@@ -1228,29 +1049,74 @@ def find_safe_compaction_boundary(
     retention_percentage = _clamp_retention_percentage(retention_percentage)
     keep_count = max(2, len(messages) * retention_percentage // 100)
     target = max(1, len(messages) - keep_count)
-    boundaries = [
-        idx
-        for idx, message in enumerate(messages)
-        if message.get('role') == 'user' and not _is_transient_message(message, transient_patterns)
-    ][1:]
-    for boundary in reversed(boundaries):
-        if boundary > target or any(message.get('role') == 'system' for message in messages[:boundary]):
-            continue
-        left_requested, left_completed = _tool_call_ids(messages[:boundary])
-        right_requested, right_completed = _tool_call_ids(messages[boundary:])
+    events = []
+    right_requested: Counter[str] = Counter()
+    right_completed: Counter[str] = Counter()
+    for message in messages:
+        requested = Counter(
+            call['id']
+            for call in message.get('tool_calls') or []
+            if isinstance(call, dict) and isinstance(call.get('id'), str)
+        )
+        completed = Counter(
+            [message['tool_call_id']]
+            if message.get('role') == 'tool' and isinstance(message.get('tool_call_id'), str)
+            else []
+        )
+        persistent_user = message.get('role') == 'user' and not _is_transient_message(message, transient_patterns)
+        events.append((requested, completed, persistent_user))
+        right_requested.update(requested)
+        right_completed.update(completed)
+
+    left_requested: Counter[str] = Counter()
+    left_completed: Counter[str] = Counter()
+
+    def invalid(tool_id: str) -> bool:
+        left_request = left_requested[tool_id] > 0
+        left_result = left_completed[tool_id] > 0
+        right_request = right_requested[tool_id] > 0
+        right_result = right_completed[tool_id] > 0
+        return (
+            left_request != left_result
+            or (right_result and not right_request)
+            or (left_request and right_result)
+            or (right_request and left_result)
+        )
+
+    invalid_ids = {
+        tool_id
+        for tool_id in right_requested.keys() | right_completed.keys()
+        if invalid(tool_id)
+    }
+    persistent_users = 0
+    system_messages = 0
+    selected = 0
+    for boundary, message in enumerate(messages):
+        if boundary > target:
+            break
         if (
-            left_requested != left_completed
-            or not right_completed <= right_requested
-            or left_requested & right_completed
-            or right_requested & left_completed
+            persistent_users > 0
+            and events[boundary][2]
+            and system_messages == 0
+            and not invalid_ids
         ):
-            continue
-        return boundary
-    return 0
+            selected = boundary
 
-
-def _find_compaction_boundary(messages: list[dict], retention_percentage: int = 40) -> int:
-    return find_safe_compaction_boundary(messages, retention_percentage)
+        requested, completed, persistent_user = events[boundary]
+        for tool_id in requested.keys() | completed.keys():
+            left_requested[tool_id] += requested[tool_id]
+            left_completed[tool_id] += completed[tool_id]
+            right_requested[tool_id] -= requested[tool_id]
+            right_completed[tool_id] -= completed[tool_id]
+            if invalid(tool_id):
+                invalid_ids.add(tool_id)
+            else:
+                invalid_ids.discard(tool_id)
+        if message.get('role') == 'system':
+            system_messages += 1
+        if persistent_user:
+            persistent_users += 1
+    return selected
 
 
 async def _generate_summary(
@@ -1365,28 +1231,6 @@ def _response_text(response: Any) -> str:
     return summary
 
 
-def _estimate_messages_tokens(messages: list[dict]) -> int:
-    total = 0
-    for message in messages:
-        total += 4
-        content = message.get('content')
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    total += _estimate_tokens(item)
-                elif item.get('type') in {'image', 'image_url'}:
-                    total += 1000
-                else:
-                    total += _estimate_tokens(item.get('text') or item.get('content') or item)
-        else:
-            total += _estimate_tokens(content)
-
-        total += _estimate_tokens(message.get('output'))
-        total += _estimate_tokens(message.get('tool_calls'))
-        total += _estimate_tokens(message.get('files'))
-    return total
-
-
 def _estimate_tokens(value: Any) -> int:
     if value is None:
         return 0
@@ -1448,6 +1292,8 @@ _OUTPUT_TOKEN_MARKERS = (
     'max_output_tokens',
 )
 _SSE_FIELDS = ('data', 'event', 'id', 'retry')
+_SSE_PREFLIGHT_MAX_BYTES = 64 * 1024
+_SSE_PREFLIGHT_MAX_CHUNKS = 256
 
 
 def _structured_error_strings(value: Any) -> tuple[list[str], list[str]]:
@@ -1613,6 +1459,12 @@ def _stream_value_present(value: Any) -> bool:
     )
 
 
+def _responses_output_item_present(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return _stream_value_present(value)
+    return value.get('type') != 'message' or _stream_value_present(value)
+
+
 def _stream_error_source(payload: dict, event_name: str) -> Any | None:
     if payload.get('error'):
         return payload['error']
@@ -1627,14 +1479,28 @@ def _stream_error_source(payload: dict, event_name: str) -> Any | None:
 def _responses_stream_event_state(payload: dict, event_type: str) -> str:
     if event_type in {'response.created', 'response.in_progress'}:
         response = payload.get('response')
-        return 'output' if isinstance(response, dict) and _stream_value_present(response.get('output')) else 'control'
+        output = response.get('output') if isinstance(response, dict) else None
+        return (
+            'output'
+            if output is not None
+            and (
+                not isinstance(output, list)
+                or any(_responses_output_item_present(item) for item in output)
+            )
+            else 'control'
+        )
     if event_type in {
         'response.output_item.added',
         'response.content_part.added',
         'response.reasoning_summary_part.added',
     }:
         value = payload.get('item') if event_type == 'response.output_item.added' else payload.get('part')
-        return 'output' if _stream_value_present(value) else 'control'
+        present = (
+            _responses_output_item_present(value)
+            if event_type == 'response.output_item.added'
+            else _stream_value_present(value)
+        )
+        return 'output' if present else 'control'
     if event_type.startswith('response.'):
         if event_type.endswith('.delta'):
             return 'output' if _stream_value_present(payload.get('delta')) else 'control'
@@ -1731,9 +1597,14 @@ async def _close_stream_response(response: StreamingResponse, iterator) -> None:
 
 
 async def _snapshot_retry_body(body: dict) -> dict:
-    metadata = body.get('metadata')
-    tools = metadata.get('tools') if isinstance(metadata, dict) else None
-    return await asyncio.to_thread(copy.deepcopy, body, {id(tools): tools} if isinstance(tools, dict) else None)
+    def snapshot() -> dict:
+        copied = copy.deepcopy({key: value for key, value in body.items() if key != 'metadata'})
+        if 'metadata' in body:
+            metadata = body['metadata']
+            copied['metadata'] = dict(metadata) if isinstance(metadata, dict) else metadata
+        return copied
+
+    return await asyncio.to_thread(snapshot)
 
 
 async def _preflight_stream_context_overflow(response: StreamingResponse) -> bool:
@@ -1742,11 +1613,22 @@ async def _preflight_stream_context_overflow(response: StreamingResponse) -> boo
 
     iterator = response.body_iterator.__aiter__()
     buffered: list[Any] = []
+    buffered_bytes = 0
     parser = _SSEProbeParser()
     try:
         while True:
             chunk = await iterator.__anext__()
             buffered.append(chunk)
+            if isinstance(chunk, bytes):
+                buffered_bytes += len(chunk)
+            elif isinstance(chunk, str):
+                buffered_bytes += len(chunk.encode('utf-8'))
+            else:
+                response.body_iterator = _replay_stream(buffered, iterator, response)
+                return False
+            if buffered_bytes > _SSE_PREFLIGHT_MAX_BYTES or len(buffered) > _SSE_PREFLIGHT_MAX_CHUNKS:
+                response.body_iterator = _replay_stream(buffered, iterator, response)
+                return False
             state = _stream_tokens_state(parser.feed(chunk))
             if state == 'output':
                 response.body_iterator = _replay_stream(buffered, iterator, response)
@@ -1778,7 +1660,7 @@ async def _retry_candidate(retry, body: dict) -> dict | None:
     if not callable(retry):
         return None
     try:
-        candidate = await retry(await _snapshot_retry_body(body))
+        candidate = await retry(body)
         if not isinstance(candidate, dict) or candidate == body:
             return None
         return candidate
@@ -1787,8 +1669,10 @@ async def _retry_candidate(retry, body: dict) -> dict | None:
         return None
 
 
-async def forward_with_context_retry(send, body: dict, retry):
+async def forward_with_context_retry(send, body: dict, retry=None):
     """Send once and return the response with the exact candidate used."""
+    if not callable(retry):
+        return await send(body), body
     initial_body = await _snapshot_retry_body(body)
     try:
         response = await send(body)

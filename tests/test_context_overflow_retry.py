@@ -70,6 +70,27 @@ async def consume(response):
     return [chunk async for chunk in response.body_iterator]
 
 
+@pytest.mark.asyncio
+async def test_disabled_retry_uses_the_core_forwarding_path(monkeypatch):
+    body = {'messages': ['unchanged']}
+    response, stream = streaming_response([sse({'error': ERROR['error']})])
+
+    async def unexpected(*_args, **_kwargs):
+        raise AssertionError('disabled retry must not copy or inspect the response')
+
+    async def send(candidate):
+        assert candidate is body
+        return response
+
+    monkeypatch.setattr(compaction, '_snapshot_retry_body', unexpected)
+    monkeypatch.setattr(compaction, '_preflight_stream_context_overflow', unexpected)
+    actual_response, actual_body = await compaction.forward_with_context_retry(send, body)
+
+    assert actual_response is response
+    assert actual_body is body
+    assert stream.index == 0
+
+
 @pytest.mark.parametrize(
     ('value', 'expected'),
     [
@@ -187,6 +208,19 @@ async def test_stream_controls_and_split_events_retry_once(chunks):
                 'response': {'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'visible'}]}]},
             }
         ),
+        sse({'type': 'response.output_item.added', 'item': {'type': 'mcp_call', 'id': 'mcp-1'}}),
+        sse(
+            {
+                'type': 'response.output_item.added',
+                'item': {'type': 'image_generation_call', 'id': 'image-1'},
+            }
+        ),
+        sse(
+            {
+                'type': 'response.output_item.added',
+                'item': {'type': 'code_interpreter_call', 'id': 'code-1'},
+            }
+        ),
         sse({'error': {'code': 'context_length_exceeded', 'message': 'quota exceeded'}}),
         sse({'error': {'message': 'max_tokens must be at least 1'}}),
         sse({'unknown': 'event'}),
@@ -255,8 +289,15 @@ async def test_http_exception_retry_and_original_error_fallback():
             raise TypeError('opaque client cannot be copied')
 
     tools = {'reader': {'client': OpaqueToolClient()}}
-    body = {'messages': ['large'], 'metadata': {'chat_id': 'chat-1', 'tools': tools}}
-    smaller = {'messages': ['small'], 'metadata': {'retry': True, 'tools': tools}}
+    mcp_clients = {'server': OpaqueToolClient()}
+    body = {
+        'messages': ['large'],
+        'metadata': {'chat_id': 'chat-1', 'tools': tools, 'mcp_clients': mcp_clients},
+    }
+    smaller = {
+        'messages': ['small'],
+        'metadata': {'retry': True, 'tools': tools, 'mcp_clients': mcp_clients},
+    }
     overflow = HTTPException(400, detail={'error': {'code': 'context_length_exceeded'}})
     sends = []
     retry_inputs = []
@@ -275,12 +316,22 @@ async def test_http_exception_retry_and_original_error_fallback():
 
     response, actual_body = await compaction.forward_with_context_retry(send, body, retry)
     assert response == {'ok': True}
-    assert actual_body == {'messages': ['small'], 'metadata': {'retry': True, 'tools': tools}}
+    assert actual_body == {
+        'messages': ['small'],
+        'metadata': {'retry': True, 'tools': tools, 'mcp_clients': mcp_clients},
+    }
     assert actual_body['metadata']['tools'] is tools
+    assert actual_body['metadata']['mcp_clients'] is mcp_clients
     assert len(sends) == 2
     assert sends[1] == {'messages': ['small']}
-    assert retry_inputs == [{'messages': ['large'], 'metadata': {'chat_id': 'chat-1', 'tools': tools}}]
+    assert retry_inputs == [
+        {
+            'messages': ['large'],
+            'metadata': {'chat_id': 'chat-1', 'tools': tools, 'mcp_clients': mcp_clients},
+        }
+    ]
     assert retry_inputs[0]['metadata']['tools'] is tools
+    assert retry_inputs[0]['metadata']['mcp_clients'] is mcp_clients
 
     async def fail_send(_candidate):
         raise overflow
@@ -367,6 +418,33 @@ async def test_nonretry_streams_are_replayed_without_rechunking():
     assert actual_body == {'messages': ['large']}
     assert raw_stream.index == 0
     assert await consume(raw) == [ERROR_SSE]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'chunks',
+    [
+        [ROLE] * (compaction._SSE_PREFLIGHT_MAX_CHUNKS + 1) + [ERROR_SSE],
+        [b'data: ' + b'x' * (compaction._SSE_PREFLIGHT_MAX_BYTES + 1), ERROR_SSE],
+    ],
+)
+async def test_stream_preflight_bounds_control_buffering(chunks):
+    response, _ = streaming_response(chunks)
+    retries = []
+
+    async def send(_candidate):
+        return response
+
+    async def retry(candidate):
+        retries.append(candidate)
+        return {'messages': ['small']}
+
+    result, actual_body = await compaction.forward_with_context_retry(send, {'messages': ['large']}, retry)
+
+    assert result is response
+    assert actual_body == {'messages': ['large']}
+    assert retries == []
+    assert await consume(result) == chunks
 
 
 @pytest.mark.asyncio
