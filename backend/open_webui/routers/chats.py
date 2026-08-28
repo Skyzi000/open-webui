@@ -7,8 +7,9 @@ from uuid import uuid4
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response, status
 from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
-from open_webui.config import ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
+from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL, ENABLE_ADMIN_CHAT_ACCESS, ENABLE_ADMIN_EXPORT
 from open_webui.constants import ERROR_MESSAGES
+from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
@@ -41,7 +42,7 @@ from open_webui.utils.auth import bearer_security, get_admin_user, get_current_u
 from open_webui.utils.chat_fork import build_fork_history
 from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
 from open_webui.utils.misc import get_message_list
-from open_webui.utils.models import get_all_models
+from open_webui.utils.models import check_model_access, get_all_models
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -195,6 +196,7 @@ class ChatConfigForm(BaseModel):
 
 class CompactChatForm(BaseModel):
     model: str | None = None
+    model_item: dict | None = None
 
 
 def chat_search_content_text(text: str) -> str:
@@ -1337,7 +1339,32 @@ async def compact_chat_by_id(
     if not model_id:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='No model found for context compaction.')
 
-    result = await compact_chat_branch(request, user, chat, model_id, request.app.state.MODELS)
+    models = request.app.state.MODELS
+    model_item = form_data.model_item if form_data else None
+    if isinstance(model_item, dict) and model_item.get('direct') is True:
+        if model_item.get('id') != model_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Direct model does not match model ID.')
+        request.state.direct = True
+        request.state.model = model_item
+        from open_webui.utils.middleware import compaction_models_for_request
+
+        models = compaction_models_for_request(request, {model_id: model_item})
+    else:
+        if model_id not in models:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
+            )
+        if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
+            try:
+                await check_model_access(user, models[model_id])
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
+                ) from exc
+
+    result = await compact_chat_branch(request, user, chat, model_id, models)
     result['context_usage'] = await get_chat_context_usage(chat, model_id)
     if result.get('compacted'):
         await publish_event(

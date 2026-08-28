@@ -224,6 +224,11 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
     response = openai_chat_completion_message_template(
         model, message_content, reasoning_content, openai_tool_calls, usage
     )
+    done_reason = data.get('done_reason')
+    if not openai_tool_calls and (data.get('done') is False or done_reason not in (None, 'stop')):
+        response['choices'][0]['finish_reason'] = (
+            done_reason if done_reason in {'length', 'content_filter'} else 'length'
+        )
     return response
 
 

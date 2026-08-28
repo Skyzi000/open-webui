@@ -3,25 +3,24 @@ from __future__ import annotations
 import asyncio
 import codecs
 import copy
-import hashlib
 import json
 import logging
 import math
 import re
 from collections import Counter
-from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from functools import cache
 from typing import Any
 
 import tiktoken
-from fastapi import HTTPException
+from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from open_webui.config import TIKTOKEN_ENCODING_NAME
+from open_webui.models.chat_messages import ChatMessages
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
 from open_webui.utils.chat_id import is_saved_chat_id
-from open_webui.utils.externalized_refs import RefEntry, make_ref_entry
+from open_webui.utils.externalized_refs import RefEntry, can_externalize_refs, make_ref_entry, project_tool_refs
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_output_to_messages, get_content_from_message, get_message_list
 from open_webui.utils.payload import apply_params_to_form_data
@@ -65,6 +64,26 @@ _DEFAULT_EXCERPT_COUNT = 32
 _HISTORY_REF_XML_SUFFIX_RE = re.compile(
     r'<history_ref>history:[0-9a-f]{64}</history_ref>(?=</auto_compaction_context>\Z)'
 )
+_SUMMARY_TRANSCRIPT_VARIABLE_RE = re.compile(
+    r'\{\{(?:MESSAGES|COMPACTED_MESSAGES|RECENT_MESSAGES)'
+    r'(?::(?:START|END|MIDDLETRUNCATE):\d+)?(?:\|\w+:\d+)?\}\}'
+)
+_SUMMARY_PROMPT_VARIABLE_RE = re.compile(
+    r'\{\{prompt(?::(?:start|end|middletruncate):\d+)?\}\}',
+    re.IGNORECASE,
+)
+_SUMMARY_MESSAGE_KEYS = (
+    'role',
+    'content',
+    'name',
+    'tool_call_id',
+    'tool_calls',
+    'function_call',
+    'reasoning_content',
+    'reasoning_details',
+    'thinking',
+    'refusal',
+)
 _HISTORY_DB_KEYS = {
     'id',
     'parentId',
@@ -92,14 +111,28 @@ Summarize the conversation history that will be compacted out of the active chat
 - Be factual and specific. Do not invent details.
 - Keep the summary concise, but complete enough for the assistant to continue without the removed messages.
 
-### Previous Summary:
-{{PREVIOUS_SUMMARY}}
+The preceding messages are the exact checkpoint source. If they include an
+existing <auto_compaction_context>, merge it with the newer messages. Output
+only the reusable continuity summary. Do not continue the conversation or call tools."""
 
-### Messages Being Compacted:
-{{COMPACTED_MESSAGES}}
 
-### Recent Messages Kept In Context:
-{{RECENT_MESSAGES}}"""
+def _non_image_files(messages: list[dict]) -> list[dict]:
+    files: dict[str, dict] = {}
+    for message in messages:
+        for item in message.get('files') or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get('type') == 'image' or str(item.get('content_type') or '').startswith('image/'):
+                continue
+            file_id = item.get('id')
+            if isinstance(file_id, str) and file_id:
+                files.setdefault(file_id, item)
+    return list(files.values())
+
+
+def _absorbed_files(prefix: list[dict], recent: list[dict]) -> list[dict]:
+    retained_ids = {item['id'] for item in _non_image_files(recent)}
+    return [item for item in _non_image_files(prefix) if item['id'] not in retained_ids]
 
 
 def _xml_cdata(value: str) -> str:
@@ -215,64 +248,143 @@ def _canonical_messages(
     return [direct] if direct is not None else []
 
 
-def _canonical_history_entry(messages: list[dict[str, Any]]) -> RefEntry:
+def _canonical_history_text(messages: list[dict[str, Any]]) -> str:
     records = [
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         for message in messages
         for item in _canonical_messages(message)
     ]
-    text = '\n'.join(records)
+    return '\n'.join(records)
+
+
+def _canonical_history_entry(messages: list[dict[str, Any]]) -> RefEntry:
+    text = _canonical_history_text(messages)
     entry = make_ref_entry(text, kind='history')
     if entry is None:
         raise CanonicalHistoryError('history source is not valid UTF-8')
     return entry
 
 
+def _history_position_key(position: tuple[int, int | None]) -> tuple[int, int]:
+    message_index, output_index = position
+    return message_index, -1 if output_index is None else output_index
+
+
+def _history_prefix_messages(
+    messages: list[dict[str, Any]],
+    carrier_index: int,
+    output_index: int | None = None,
+) -> list[dict[str, Any]]:
+    prefix = list(messages[:carrier_index])
+    if output_index is None:
+        return prefix
+    carrier = messages[carrier_index]
+    output = carrier.get('output')
+    if output_index <= 0 or not isinstance(output, list):
+        return prefix
+    partial = dict(carrier)
+    partial['content'] = ''
+    partial['output'] = output[:output_index]
+    prefix.append(partial)
+    return prefix
+
+
+def _checkpoint_positions(
+    messages: list[dict[str, Any]],
+) -> list[tuple[int, int | None, str]]:
+    positions = []
+    for message_index, message in enumerate(messages):
+        summary = message.get('contextSummary') or message.get('context_summary')
+        if isinstance(summary, str) and summary.strip():
+            positions.append((message_index, None, summary.strip()))
+        output = message.get('output')
+        if not isinstance(output, list):
+            continue
+        for output_index, item in enumerate(output):
+            if not isinstance(item, dict):
+                continue
+            summary = item.get('contextSummary') or item.get('context_summary')
+            if isinstance(summary, str) and summary.strip():
+                positions.append((message_index, output_index, summary.strip()))
+    return positions
+
+
 def _bind_history_loader(
     entry: RefEntry,
     messages: list[dict[str, Any]],
     selected_index: int,
+    selected_output_index: int | None = None,
 ) -> RefEntry:
-    @cache
-    def checkpoint_refs() -> tuple[tuple[str, int], ...]:
-        digest = hashlib.sha256()
-        offset = 0
-        first = True
-        checkpoints = []
-        for message in messages[:selected_index]:
-            if message.get('contextSummary') or message.get('context_summary'):
-                checkpoints.append((f'history:{digest.hexdigest()}', offset))
-            for item in _canonical_messages(message):
-                record = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-                piece = record if first else f'\n{record}'
-                if not entry.text.startswith(piece, offset):
-                    return ()
-                digest.update(piece.encode('utf-8'))
-                offset += len(piece)
-                first = False
-        return tuple(checkpoints) if offset == len(entry.text) else ()
+    selected = _history_position_key((selected_index, selected_output_index))
+    checkpoint_positions = tuple(
+        (message_index, output_index)
+        for message_index, output_index, _ in _checkpoint_positions(messages)
+        if _history_position_key((message_index, output_index)) < selected
+    )
+    resolved: dict[tuple[int, int | None], RefEntry | None] = {}
+    canonical_tool_sources: dict[int, tuple[str, ...]] = {}
+    measured_tools: dict[tuple[int, int], RefEntry | None] = {}
+    source_messages = _history_prefix_messages(
+        messages,
+        selected_index,
+        selected_output_index,
+    )
 
-    resolved: dict[str, RefEntry] = {}
+    def ancestor_at(position: tuple[int, int | None]) -> RefEntry | None:
+        if position not in resolved:
+            ancestor = _canonical_history_entry(
+                _history_prefix_messages(messages, position[0], position[1])
+            )
+            resolved[position] = (
+                replace(ancestor, load_history=load_ancestors)
+                if ancestor.text and entry.text.startswith(ancestor.text)
+                else None
+            )
+        return resolved[position]
 
-    def materialize(ref: str, end: int) -> RefEntry:
-        ancestor = resolved.get(ref)
-        if ancestor is None:
-            ancestor = make_ref_entry(entry.text[:end], kind='history', load_history=load_ancestors)
-            if ancestor is None or ancestor.ref != ref:
-                raise CanonicalHistoryError('history source is not valid UTF-8')
-            resolved[ref] = ancestor
-        return ancestor
+    def tool_entries(requested: str | None) -> tuple[RefEntry, ...]:
+        entries = []
+        for message_index, message in enumerate(source_messages):
+            if message_index not in canonical_tool_sources:
+                if message.get('role') == 'tool':
+                    candidates = (_canonical_direct_history_message(message),)
+                elif message.get('role') == 'assistant' and message.get('output'):
+                    candidates = _canonical_output_messages(message['output'])
+                else:
+                    candidates = ()
+                canonical_tool_sources[message_index] = tuple(
+                    content
+                    for item in candidates
+                    if item is not None
+                    and item.get('role') == 'tool'
+                    and isinstance((content := item.get('content')), str)
+                )
+            sources = canonical_tool_sources[message_index]
+            for source_index in range(len(sources)):
+                key = message_index, source_index
+                if key not in measured_tools:
+                    measured_tools[key] = make_ref_entry(sources[source_index], kind='tool')
+                candidate = measured_tools[key]
+                if candidate is None:
+                    continue
+                if requested is not None and candidate.ref != requested:
+                    continue
+                entries.append(candidate)
+                if requested is not None:
+                    return tuple(entries)
+        return tuple(entries)
 
     async def load_ancestors(requested: str | None) -> tuple[RefEntry, ...]:
         def resolve() -> tuple[RefEntry, ...]:
+            if isinstance(requested, str) and requested.startswith('tool:'):
+                return tool_entries(None if requested == 'tool:' else requested)
             entries = []
-            for ref, end in reversed(checkpoint_refs()):
-                if requested is not None and ref != requested:
-                    continue
-                try:
-                    ancestor = materialize(ref, end)
-                except CanonicalHistoryError:
+            for position in reversed(checkpoint_positions):
+                ancestor = ancestor_at(position)
+                if ancestor is None:
                     break
+                if requested is not None and ancestor.ref != requested:
+                    continue
                 if requested is not None:
                     return (ancestor,)
                 entries.append(ancestor)
@@ -284,23 +396,47 @@ def _bind_history_loader(
 
 
 def _history_entry_at(messages: list[dict[str, Any]], carrier_index: int) -> RefEntry | None:
-    if not 0 < carrier_index < len(messages):
+    return _history_entry_at_position(messages, carrier_index, None)
+
+
+def _history_entry_at_position(
+    messages: list[dict[str, Any]],
+    carrier_index: int,
+    output_index: int | None,
+) -> RefEntry | None:
+    if not 0 <= carrier_index < len(messages):
+        return None
+    if output_index is None and carrier_index == 0:
+        return None
+    if output_index is not None:
+        output = messages[carrier_index].get('output')
+        if not isinstance(output, list) or not 0 <= output_index < len(output):
+            return None
+    source_messages = _history_prefix_messages(messages, carrier_index, output_index)
+    if not source_messages:
         return None
     return _bind_history_loader(
-        _canonical_history_entry(messages[:carrier_index]),
+        _canonical_history_entry(source_messages),
         messages,
         carrier_index,
+        output_index,
     )
 
 
-def _history_source(source: Any) -> tuple[list[dict[str, Any]], int] | None:
+def _history_source(
+    source: Any,
+) -> tuple[list[dict[str, Any]], int] | tuple[list[dict[str, Any]], int, int] | None:
     if (
         isinstance(source, tuple)
-        and len(source) == 2
+        and len(source) in {2, 3}
         and isinstance(source[0], list)
         and isinstance(source[1], int)
         and 0 <= source[1] < len(source[0])
     ):
+        if len(source) == 3:
+            output = source[0][source[1]].get('output')
+            if not isinstance(source[2], int) or not isinstance(output, list) or not 0 <= source[2] < len(output):
+                return None
         return source
     return None
 
@@ -311,7 +447,14 @@ async def resolve_request_history(source: Any) -> RefEntry | None:
     checkpoint = _history_source(source)
     if checkpoint is None:
         return None
-    return await asyncio.to_thread(_history_entry_at, *checkpoint)
+    if len(checkpoint) == 2:
+        return await asyncio.to_thread(_history_entry_at, checkpoint[0], checkpoint[1])
+    return await asyncio.to_thread(
+        _history_entry_at_position,
+        checkpoint[0],
+        checkpoint[1],
+        checkpoint[2],
+    )
 
 
 def render_summary_message(summary: str, summary_meta: dict | None = None) -> dict:
@@ -333,29 +476,57 @@ def render_summary_message(summary: str, summary_meta: dict | None = None) -> di
     }
 
 
+def _drop_rendered_summary_once(
+    messages: list[dict],
+    summary: str | None,
+    summary_meta: dict | None,
+) -> list[dict]:
+    if not summary:
+        return messages
+    expected = render_summary_message(summary, summary_meta).get('content')
+    for index, message in enumerate(messages):
+        content = message.get('content')
+        if isinstance(content, str) and _HISTORY_REF_XML_SUFFIX_RE.sub('', content) == expected:
+            return [*messages[:index], *messages[index + 1 :]]
+    return messages
+
+
+def _summary_provider_messages(messages: list[dict]) -> list[dict]:
+    return [{key: message[key] for key in _SUMMARY_MESSAGE_KEYS if key in message} for message in messages]
+
+
 async def replay_cached_compaction_messages(messages: list[dict], state: dict) -> list[dict]:
     """Replay the request-local checkpoint without resolving or hashing history again."""
     summary = state.get('summary')
     summary_meta = state.get('summary_meta')
     checkpoint_history = _history_source(state.get('checkpoint_history'))
     carrier_id = checkpoint_history[0][checkpoint_history[1]].get('id') if checkpoint_history else None
+    carrier_output_index = checkpoint_history[2] if checkpoint_history and len(checkpoint_history) == 3 else None
     prefetch = state.get('prefetch_task')
     if not summary and isinstance(prefetch, asyncio.Task):
         try:
-            summary, summary_meta, history_entry = await prefetch
+            result = await prefetch
         except Exception:
             return messages
+        if result is None:
+            return messages
+        summary, summary_meta, history_entry = result[:3]
+        checkpoint_history = _history_source(history_entry)
+        carrier_id = checkpoint_history[0][checkpoint_history[1]].get('id') if checkpoint_history else None
+        carrier_output_index = checkpoint_history[2] if checkpoint_history and len(checkpoint_history) == 3 else None
         state.update(
             {
                 'summary': summary,
                 'summary_meta': summary_meta,
                 'selected_history': history_entry,
+                'checkpoint_history': history_entry,
             }
         )
     if not summary:
         summary = state.get('previous_summary')
         summary_meta = state.get('previous_summary_meta')
         carrier_id = state.get('selected_checkpoint_message_id')
+        carrier_output_index = state.get('selected_checkpoint_output_index')
     if not isinstance(summary, str) or not summary.strip() or not isinstance(carrier_id, str):
         return messages
 
@@ -366,18 +537,38 @@ async def replay_cached_compaction_messages(messages: list[dict], state: dict) -
     )
     if carrier_index is None:
         return messages
+    if carrier_output_index is not None:
+        output = raw_messages[carrier_index].get('output')
+        if (
+            isinstance(carrier_output_index, bool)
+            or not isinstance(carrier_output_index, int)
+            or not isinstance(output, list)
+            or not 0 <= carrier_output_index < len(output)
+        ):
+            return messages
+        carrier = output[carrier_output_index]
+        carrier_summary = (
+            carrier.get('contextSummary') or carrier.get('context_summary')
+            if isinstance(carrier, dict)
+            else None
+        )
+        if not isinstance(carrier_summary, str) or carrier_summary.strip() != summary.strip():
+            return messages
+    active_messages = _messages_from_checkpoint(raw_messages, carrier_index, carrier_output_index)
     return [
         *system_messages,
         render_summary_message(summary, summary_meta if isinstance(summary_meta, dict) else {}),
-        *raw_messages[carrier_index:],
+        *active_messages,
     ]
 
 
 def set_summary_history_ref(body: dict, ref: str | None) -> dict:
+    if not isinstance(ref, str) or re.fullmatch(r'history:[0-9a-f]{64}', ref) is None:
+        return body
     messages = body.get('messages')
     if not isinstance(messages, list):
         return body
-    replacement = f'<history_ref>{ref}</history_ref>' if ref and re.fullmatch(r'history:[0-9a-f]{64}', ref) else ''
+    replacement = f'<history_ref>{ref}</history_ref>'
     updated = None
     for index, message in enumerate(messages):
         content = message.get('content') if isinstance(message, dict) else None
@@ -389,8 +580,7 @@ def set_summary_history_ref(body: dict, ref: str | None) -> dict:
         ):
             continue
         clean = _HISTORY_REF_XML_SUFFIX_RE.sub('', content)
-        if replacement:
-            clean = f'{clean[: -len(closing)]}{replacement}{closing}'
+        clean = f'{clean[: -len(closing)]}{replacement}{closing}'
         if clean != content:
             updated = list(messages)
             updated[index] = {**message, 'content': clean}
@@ -398,43 +588,120 @@ def set_summary_history_ref(body: dict, ref: str | None) -> dict:
     return {**body, 'messages': updated} if updated is not None else body
 
 
-def _checkpoint_summary(messages: list[dict]) -> tuple[int | None, str | None]:
-    selected: tuple[int, str] | None = None
-    for index, message in enumerate(messages):
-        summary = message.get('contextSummary') or message.get('context_summary')
-        if isinstance(summary, str) and summary.strip():
-            selected = index, summary.strip()
-    return selected or (None, None)
+def _checkpoint_summary(messages: list[dict]) -> tuple[int | None, int | None, str | None]:
+    selected: tuple[int, int | None, str] | None = None
+    for message_index, output_index, summary in _checkpoint_positions(messages):
+        selected = message_index, output_index, summary
+    return selected or (None, None, None)
+
+
+def _messages_from_checkpoint(
+    messages: list[dict],
+    message_index: int,
+    output_index: int | None,
+) -> list[dict]:
+    if not 0 <= message_index < len(messages):
+        return list(messages)
+    active = list(messages[message_index:])
+    if output_index is None or not active:
+        return active
+    carrier = dict(active[0])
+    output = carrier.get('output')
+    if (
+        isinstance(output_index, bool)
+        or not isinstance(output_index, int)
+        or not isinstance(output, list)
+        or not 0 <= output_index < len(output)
+    ):
+        return list(messages)
+    carrier['content'] = ''
+    carrier['output'] = output[output_index:]
+    carrier.pop('usage', None)
+    info = carrier.get('info')
+    if isinstance(info, dict) and 'usage' in info:
+        carrier['info'] = {key: value for key, value in info.items() if key != 'usage'}
+    active[0] = carrier
+    return active
+
+
+def _stored_checkpoint_view(
+    messages: list[dict],
+) -> tuple[list[dict], list[dict], list[dict], int | None, int | None, str | None]:
+    system_messages, checkpoint_messages = _split_leading_system_messages(messages)
+    message_index, output_index, summary = _checkpoint_summary(checkpoint_messages)
+    active_messages = (
+        _messages_from_checkpoint(checkpoint_messages, message_index, output_index)
+        if message_index is not None
+        else list(checkpoint_messages)
+    )
+    return system_messages, checkpoint_messages, active_messages, message_index, output_index, summary
+
+
+def replay_stored_compaction_checkpoint(messages: list[dict]) -> tuple[list[dict], dict]:
+    """Replay a persisted checkpoint without consulting mutable admin configuration."""
+    system, history, active, message_index, output_index, summary = _stored_checkpoint_view(messages)
+    if message_index is None or not isinstance(summary, str):
+        return messages, {}
+    position = (
+        (history, message_index, output_index)
+        if output_index is not None
+        else (history, message_index)
+    )
+    state = {
+        'active_offset': message_index,
+        'checkpoint_messages': history,
+        'selected_checkpoint_message_id': history[message_index].get('id'),
+        'selected_checkpoint_output_index': output_index,
+        'selected_history': position,
+        'previous_summary': summary,
+        'previous_summary_meta': {},
+    }
+    return [*system, render_summary_message(summary), *active], state
 
 
 async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> tuple[list[dict], dict]:
     """Apply one stored checkpoint and mark one safe future cut without DB state."""
+    system_messages, checkpoint_messages, active_messages, summary_index, summary_output_index, previous_summary = (
+        _stored_checkpoint_view(messages)
+    )
     config = await _load_config()
     state: dict[str, Any] = {'config': config}
-    if not config['enable'] or metadata.get('task') == 'context_compaction':
-        return messages, state
-
-    system_messages, checkpoint_messages = _split_leading_system_messages(messages)
-    summary_index, previous_summary = _checkpoint_summary(checkpoint_messages)
     active_offset = summary_index if summary_index is not None else 0
-    active_messages = await asyncio.to_thread(copy.deepcopy, checkpoint_messages[active_offset:])
+    state['active_offset'] = active_offset
+    state['checkpoint_messages'] = checkpoint_messages
+    if summary_index is None and (not config['enable'] or metadata.get('task') == 'context_compaction'):
+        return messages, state
+    active_messages = await asyncio.to_thread(copy.deepcopy, active_messages)
     summary_meta: dict[str, Any] = {}
     if summary_index is not None:
         state['selected_checkpoint_message_id'] = checkpoint_messages[summary_index].get('id')
-        state['selected_history'] = (checkpoint_messages, summary_index)
+        state['selected_checkpoint_output_index'] = summary_output_index
+        state['selected_history'] = (
+            (checkpoint_messages, summary_index, summary_output_index)
+            if summary_output_index is not None
+            else (checkpoint_messages, summary_index)
+        )
         summary_meta['historical_user_messages'] = await asyncio.to_thread(
             _historical_user_excerpts,
-            checkpoint_messages[:summary_index],
+            _history_prefix_messages(checkpoint_messages, summary_index, summary_output_index),
             _DEFAULT_EXCERPT_BYTES,
             _DEFAULT_EXCERPT_COUNT,
             config['transient_patterns'],
         )
+    if not config['enable'] or metadata.get('task') == 'context_compaction':
+        if previous_summary:
+            state['previous_summary'] = previous_summary
+            state['previous_summary_meta'] = summary_meta
+            active_messages = [render_summary_message(previous_summary, summary_meta), *active_messages]
+        return [*system_messages, *active_messages], state
     for index in range(len(active_messages) - 1, -1, -1):
         message = active_messages[index]
         if message.get('role') != 'assistant':
             continue
         info = message.get('info')
         usage = message.get('usage') or (info.get('usage') if isinstance(info, dict) else None)
+        if _is_merged_cache_usage(usage):
+            break
         input_tokens = _strict_usage_input_tokens(usage)
         if input_tokens is not None:
             message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY] = input_tokens
@@ -450,6 +717,10 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         active_messages[boundary][_BOUNDARY_KEY] = True
         raw_boundary = active_offset + boundary
         state['checkpoint_history'] = (checkpoint_messages, raw_boundary)
+        state['absorbed_files'] = _absorbed_files(
+            active_messages[:boundary],
+            active_messages[boundary:],
+        )
 
     if previous_summary:
         active_messages = [render_summary_message(previous_summary, summary_meta), *active_messages]
@@ -474,7 +745,7 @@ def _without_boundary_marker(
     ]
 
 
-async def _create_checkpoint(
+async def _generate_checkpoint(
     request,
     user,
     model_id: str,
@@ -484,8 +755,11 @@ async def _create_checkpoint(
     config: dict,
     compacted_messages: list[dict],
     recent_messages: list[dict],
-) -> tuple[str, dict[str, Any], Any]:
-    checkpoint_history = _history_source(state.get('checkpoint_history'))
+    *,
+    checkpoint_history: tuple[list[dict[str, Any]], int] | None = None,
+    absorbed_files: list[dict] | None = None,
+) -> tuple[str, dict[str, Any], tuple[list[dict[str, Any]], int], str]:
+    checkpoint_history = _history_source(checkpoint_history or state.get('checkpoint_history'))
     if checkpoint_history and checkpoint_history[1] > 0:
         source_messages = checkpoint_history[0][: checkpoint_history[1]]
         checkpoint_message_id = checkpoint_history[0][checkpoint_history[1]].get('id')
@@ -511,19 +785,29 @@ async def _create_checkpoint(
         models,
         compacted_messages,
         recent_messages,
-        None,
+        state.get('previous_summary'),
         config['prompt_template'],
         config['transient_patterns'],
+        state.get('absorbed_files') if absorbed_files is None else absorbed_files,
+        previous_summary_meta=state.get('previous_summary_meta'),
+        externalized_refs_enable=config.get('externalized_refs_enable', False),
+        externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
     )
-    saved = await Chats.upsert_message_to_chat_by_id_and_message_id(
-        chat_id,
-        checkpoint_message_id,
-        {'contextSummary': summary},
-        touch=False,
-    )
-    if saved is None:
+    return summary, summary_meta, checkpoint_history, checkpoint_message_id
+
+
+async def _save_checkpoint(chat_id: str, checkpoint_message_id: str, summary: str) -> None:
+    if not await ChatMessages.update_context_summary(chat_id, checkpoint_message_id, summary):
         raise RuntimeError('Context compaction checkpoint could not be saved; provider request was not sent')
-    return summary, summary_meta, checkpoint_history
+
+
+async def _finalize_prefetch_checkpoint(
+    generation: asyncio.Task,
+    chat_id: str,
+) -> tuple[str, dict[str, Any], tuple[list[dict[str, Any]], int], str]:
+    summary, summary_meta, checkpoint_history, checkpoint_message_id = await generation
+    await _save_checkpoint(chat_id, checkpoint_message_id, summary)
+    return summary, summary_meta, checkpoint_history, checkpoint_message_id
 
 
 def _prefetch_done(task: asyncio.Task) -> None:
@@ -548,6 +832,33 @@ async def _emit_compaction_status(event_emitter, description: str, done: bool, *
     await event_emitter({'type': 'context_compaction', 'data': data})
 
 
+def _checkpoint_for_boundary(
+    state: dict,
+    working: list[dict],
+    boundary: int,
+) -> tuple[tuple[list[dict[str, Any]], int], list[dict]] | None:
+    default = _history_source(state.get('checkpoint_history'))
+    history = default[0] if default is not None else state.get('checkpoint_messages')
+    if not isinstance(history, list):
+        return None
+    carrier_id = working[boundary].get('id') if boundary < len(working) else None
+    if not isinstance(carrier_id, str):
+        return None
+    raw_boundary = next(
+        (index for index, message in enumerate(history) if message.get('id') == carrier_id),
+        None,
+    )
+    if raw_boundary is None or raw_boundary <= 0:
+        return None
+    active_offset = state.get('active_offset')
+    if not isinstance(active_offset, int) or not 0 <= active_offset < raw_boundary:
+        active_offset = 0
+    return (
+        (history, raw_boundary),
+        _absorbed_files(history[active_offset:raw_boundary], history[raw_boundary:]),
+    )
+
+
 async def compact_provider_payload(
     request,
     user,
@@ -557,10 +868,9 @@ async def compact_provider_payload(
     models: dict,
     state: dict,
     *,
-    force: bool = False,
-    finalize_candidate: Callable[[dict], Awaitable[dict]] | None = None,
+    projected_messages: list[dict] | None = None,
 ) -> dict:
-    """Compact the final provider candidate or fail before provider dispatch."""
+    """Create a durable checkpoint before request filters can alter the DB branch."""
     messages = body.get('messages')
     if not isinstance(messages, list):
         return body
@@ -571,56 +881,22 @@ async def compact_provider_payload(
         return {**body, 'messages': _without_boundary_marker(messages)}
 
     system_messages, working = _split_leading_system_messages(messages)
-    source_messages = state.get('projection_source_messages')
-    if isinstance(source_messages, list):
-        _, source_working = _split_leading_system_messages(source_messages)
-        if len(source_working) != len(working):
-            source_working = working
-    else:
-        source_working = working
+    projected_system, projected_working = _split_leading_system_messages(
+        projected_messages if isinstance(projected_messages, list) else messages
+    )
+    if len(projected_working) != len(working):
+        projected_system, projected_working = system_messages, working
     boundary = next(
         (index for index, message in enumerate(working) if message.get(_BOUNDARY_KEY) is True),
         None,
     )
-    if boundary is None and not state.get('compacted'):
-        saved_boundary = state.get('provider_boundary')
-        if isinstance(saved_boundary, int) and 0 < saved_boundary < len(working):
-            working = list(working)
-            working[saved_boundary] = {**working[saved_boundary], _BOUNDARY_KEY: True}
-            body = {**body, 'messages': [*system_messages, *working]}
-            boundary = saved_boundary
-    if boundary is not None:
-        state['provider_boundary'] = boundary
-
-    usage_anchor = next(
-        (
-            (index, message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY])
-            for index, message in enumerate(working)
-            if isinstance(message.get(CONTEXT_COMPACTION_USAGE_ANCHOR_KEY), int)
-        ),
-        None,
-    )
-    if usage_anchor is None and not state.get('compacted'):
-        saved_anchor = state.get('provider_usage_anchor')
-        if (
-            isinstance(saved_anchor, tuple)
-            and len(saved_anchor) == 2
-            and isinstance(saved_anchor[0], int)
-            and 0 <= saved_anchor[0] < len(working)
-        ):
-            working = list(working)
-            working[saved_anchor[0]] = {
-                **working[saved_anchor[0]],
-                CONTEXT_COMPACTION_USAGE_ANCHOR_KEY: saved_anchor[1],
-            }
-            body = {**body, 'messages': [*system_messages, *working]}
-            usage_anchor = saved_anchor
-    if usage_anchor is not None:
-        state['provider_usage_anchor'] = usage_anchor
-
-    before = await asyncio.to_thread(estimate_provider_tokens, body)
+    projected_body = {
+        **body,
+        'messages': [*projected_system, *projected_working],
+    }
+    before = await asyncio.to_thread(estimate_provider_tokens, projected_body)
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
-    if before <= threshold and not force:
+    if before <= threshold:
         soft_ratio = config['soft_trigger_ratio']
         if (
             boundary
@@ -630,8 +906,8 @@ async def compact_provider_payload(
         ):
             # ponytail: duplicate cross-worker prefetches are harmless; add Redis
             # dedup only if measured summary cost warrants the coordination.
-            task = asyncio.create_task(
-                _create_checkpoint(
+            generation = asyncio.create_task(
+                _generate_checkpoint(
                     request,
                     user,
                     model_id,
@@ -639,21 +915,27 @@ async def compact_provider_payload(
                     metadata,
                     state,
                     config,
-                    _without_boundary_marker(source_working[:boundary], keep_transient=True),
-                    _without_boundary_marker(source_working[boundary:], keep_transient=True),
+                    _without_boundary_marker(projected_working[:boundary], keep_transient=True),
+                    _without_boundary_marker(projected_working[boundary:], keep_transient=True),
                 )
+            )
+            task = asyncio.create_task(
+                _finalize_prefetch_checkpoint(generation, metadata['chat_id'])
             )
             task.add_done_callback(_prefetch_done)
             state['prefetch_task'] = task
         return {**body, 'messages': _without_boundary_marker(messages)}
 
+    largest = find_safe_compaction_boundary(
+        projected_working,
+        config['retention_percentage'],
+        config['transient_patterns'],
+        maximize=True,
+    )
     if not boundary:
-        raise RuntimeError(
-            'Context limit reached, but no complete earlier user turn can be compacted; provider request was not sent'
-        )
-    compacted_messages = _without_boundary_marker(source_working[:boundary], keep_transient=True)
-    summary_recent_messages = _without_boundary_marker(source_working[boundary:], keep_transient=True)
-    recent_messages = _without_boundary_marker(working[boundary:], keep_transient=True)
+        if not largest or _checkpoint_for_boundary(state, working, largest) is None:
+            return {**body, 'messages': _without_boundary_marker(messages)}
+        boundary = largest
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
         from open_webui.socket.main import get_event_emitter
@@ -661,45 +943,369 @@ async def compact_provider_payload(
         event_emitter = await get_event_emitter(metadata)
     await _emit_compaction_status(event_emitter, 'Compacting context', False)
     try:
-        prefetch_task = state.get('prefetch_task')
-        if isinstance(prefetch_task, asyncio.Task):
-            summary, summary_meta, history_entry = await prefetch_task
-        else:
-            summary, summary_meta, history_entry = await _create_checkpoint(
-                request,
-                user,
-                model_id,
-                models,
-                metadata,
-                state,
-                config,
-                compacted_messages,
-                summary_recent_messages,
+        boundaries = [boundary]
+        if largest > boundary and _checkpoint_for_boundary(state, working, largest) is not None:
+            boundaries.append(largest)
+
+        compacted_body = None
+        summary = None
+        summary_meta = None
+        history_entry = None
+        selected_checkpoint = None
+        prefetch_task = state.pop('prefetch_task', None)
+        checkpoint_already_saved = False
+        for candidate_boundary in boundaries:
+            compacted_messages = _without_boundary_marker(
+                projected_working[:candidate_boundary],
+                keep_transient=True,
             )
-        compacted_body = {
-            **body,
-            'messages': [
-                *system_messages,
-                render_summary_message(summary, summary_meta),
-                *_without_boundary_marker(recent_messages),
-            ],
-        }
+            projected_recent = _without_boundary_marker(
+                projected_working[candidate_boundary:],
+                keep_transient=True,
+            )
+            recent_messages = _without_boundary_marker(working[candidate_boundary:], keep_transient=True)
+            checkpoint = _checkpoint_for_boundary(state, working, candidate_boundary)
+            if checkpoint is None:
+                continue
+            if candidate_boundary == boundary and isinstance(prefetch_task, asyncio.Task):
+                summary, summary_meta, history_entry, checkpoint_message_id = await prefetch_task
+                checkpoint_already_saved = True
+            else:
+                checkpoint_already_saved = False
+                summary, summary_meta, history_entry, checkpoint_message_id = await _generate_checkpoint(
+                    request,
+                    user,
+                    model_id,
+                    models,
+                    metadata,
+                    state,
+                    config,
+                    compacted_messages,
+                    projected_recent,
+                    checkpoint_history=checkpoint[0],
+                    absorbed_files=checkpoint[1],
+                )
+            compacted_body = {
+                **body,
+                'messages': [
+                    *system_messages,
+                    render_summary_message(summary, summary_meta),
+                    *recent_messages,
+                ],
+            }
+            projected_candidate = {
+                **compacted_body,
+                'messages': [
+                    *projected_system,
+                    render_summary_message(summary, summary_meta),
+                    *projected_recent,
+                ],
+            }
+            after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
+            if after <= threshold:
+                selected_checkpoint = checkpoint
+                break
+            compacted_body = None
+
+        if compacted_body is None or summary is None or summary_meta is None:
+            raise RuntimeError(
+                'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
+            )
+        if not checkpoint_already_saved:
+            await _save_checkpoint(metadata['chat_id'], checkpoint_message_id, summary)
         state.update(
             {
                 'summary': summary,
                 'summary_meta': summary_meta,
+                'previous_summary': summary,
+                'previous_summary_meta': summary_meta,
                 'selected_history': history_entry,
+                'checkpoint_history': history_entry,
+                'absorbed_files': selected_checkpoint[1],
+                'durable_compacted': True,
             }
         )
-        if finalize_candidate is not None:
-            compacted_body = await finalize_candidate(compacted_body)
-        after = await asyncio.to_thread(estimate_provider_tokens, compacted_body)
-        if after > threshold or (force and after >= before):
+    except Exception:
+        await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
+        raise
+    await _emit_compaction_status(event_emitter, 'Context compacted', True)
+    return compacted_body
+
+
+def _nested_checkpoint(
+    metadata: dict,
+    messages: list[dict],
+    output: list[dict] | None,
+    carrier: dict | None,
+    message_start: int | None,
+) -> tuple[list[dict], list[dict], list[dict], int] | None:
+    if (
+        not is_saved_chat_id(metadata.get('chat_id'))
+        or not isinstance(metadata.get('message_id'), str)
+        or not isinstance(output, list)
+        or not isinstance(carrier, dict)
+        or not isinstance(message_start, int)
+        or not 0 < message_start < len(messages)
+    ):
+        return None
+    carrier_index = next((index for index, item in enumerate(output) if item is carrier), None)
+    if carrier_index is None:
+        return None
+    system_messages, working = _split_leading_system_messages(messages)
+    working_start = message_start - len(system_messages)
+    if not 0 < working_start < len(working):
+        return None
+    return system_messages, working[:working_start], working[working_start:], carrier_index
+
+
+async def _save_nested_checkpoint(
+    chat_id: str,
+    message_id: str,
+    output: list[dict],
+    carrier: dict,
+    carrier_index: int,
+    summary: str,
+) -> None:
+    stored_output = list(output)
+    stored_carrier = dict(carrier)
+    stored_carrier['contextSummary'] = summary
+    stored_output[carrier_index] = stored_carrier
+    saved = await Chats.upsert_message_to_chat_by_id_and_message_id(
+        chat_id,
+        message_id,
+        {'output': stored_output},
+        touch=False,
+    )
+    if saved is None:
+        raise RuntimeError('Context compaction checkpoint could not be saved; provider request was not sent')
+    carrier['contextSummary'] = summary
+
+
+async def _nested_checkpoint_history(
+    state: dict,
+    message_id: str,
+    output: list[dict],
+    carrier_index: int,
+    transient_patterns: tuple[re.Pattern[str], ...],
+) -> tuple[list[dict], tuple[list[dict], int, int], dict[str, Any]]:
+    history = list(state.get('checkpoint_messages') or [])
+    message_index = next(
+        (index for index in range(len(history) - 1, -1, -1) if history[index].get('id') == message_id),
+        None,
+    )
+    if message_index is None:
+        message_index = len(history)
+        history.append({'id': message_id, 'role': 'assistant', 'content': '', 'output': output})
+    else:
+        history[message_index] = {**history[message_index], 'output': output}
+    position = (history, message_index, carrier_index)
+    summary_meta = {
+        'historical_user_messages': await asyncio.to_thread(
+            _historical_user_excerpts,
+            _history_prefix_messages(history, message_index, carrier_index),
+            _DEFAULT_EXCERPT_BYTES,
+            _DEFAULT_EXCERPT_COUNT,
+            transient_patterns,
+        )
+    }
+    return history, position, summary_meta
+
+
+async def compact_transient_provider_payload(
+    request,
+    user,
+    body: dict,
+    metadata: dict,
+    model_id: str,
+    models: dict,
+    state: dict,
+    *,
+    checkpoint_output: list[dict] | None = None,
+    checkpoint_carrier: dict | None = None,
+    checkpoint_message_start: int | None = None,
+) -> dict:
+    """Compact the provider payload and persist an in-turn cut when one is available."""
+    messages = body.get('messages')
+    if not isinstance(messages, list):
+        return body
+    config = state.get('config') or await _load_config()
+    if not config['enable'] or metadata.get('task') == 'context_compaction' or body.get('previous_response_id'):
+        return body
+
+    before = await asyncio.to_thread(estimate_provider_tokens, body)
+    threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
+    if before <= threshold:
+        return body
+
+    nested_checkpoint = _nested_checkpoint(
+        metadata,
+        messages,
+        checkpoint_output,
+        checkpoint_carrier,
+        checkpoint_message_start,
+    )
+    if nested_checkpoint is not None:
+        system_messages, compacted_messages, recent_messages, carrier_index = nested_checkpoint
+        event_emitter = None
+        if metadata.get('chat_id') and metadata.get('message_id'):
+            from open_webui.socket.main import get_event_emitter
+
+            event_emitter = await get_event_emitter(metadata)
+        await _emit_compaction_status(event_emitter, 'Compacting context', False)
+        try:
+            summary = await _generate_summary(
+                request,
+                user,
+                model_id,
+                models,
+                _without_boundary_marker(compacted_messages, keep_transient=True),
+                _without_boundary_marker(recent_messages, keep_transient=True),
+                state.get('previous_summary'),
+                config['prompt_template'],
+                config['transient_patterns'],
+                previous_summary_meta=state.get('previous_summary_meta'),
+                externalized_refs_enable=config.get('externalized_refs_enable', False),
+                externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+            )
+            history, position, summary_meta = await _nested_checkpoint_history(
+                state,
+                metadata['message_id'],
+                checkpoint_output,
+                carrier_index,
+                config['transient_patterns'],
+            )
+            candidate = {
+                **body,
+                'messages': [
+                    *system_messages,
+                    render_summary_message(summary, summary_meta),
+                    *_without_boundary_marker(recent_messages, keep_transient=True),
+                ],
+            }
+            after = await asyncio.to_thread(estimate_provider_tokens, candidate)
+            if after > threshold:
+                raise RuntimeError(
+                    'Context limit remains exceeded after preserving the latest completed tool round; '
+                    'reduce the active input and retry'
+                )
+            await _save_nested_checkpoint(
+                metadata['chat_id'],
+                metadata['message_id'],
+                checkpoint_output,
+                checkpoint_carrier,
+                carrier_index,
+                summary,
+            )
+            state.update(
+                {
+                    'summary': summary,
+                    'summary_meta': summary_meta,
+                    'previous_summary': summary,
+                    'previous_summary_meta': summary_meta,
+                    'selected_checkpoint_message_id': metadata['message_id'],
+                    'selected_checkpoint_output_index': carrier_index,
+                    'selected_history': position,
+                    'checkpoint_history': position,
+                    'checkpoint_messages': history,
+                    'active_offset': len(history) - 1,
+                    'compacted': True,
+                    'durable_compacted': True,
+                }
+            )
+        except Exception:
+            await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
+            raise
+        await _emit_compaction_status(event_emitter, 'Context compacted', True)
+        return candidate
+
+    system_messages, working = _split_leading_system_messages(messages)
+    boundary = find_safe_compaction_boundary(
+        working,
+        config['retention_percentage'],
+        config['transient_patterns'],
+        allow_tool_rounds=True,
+    )
+    largest = find_safe_compaction_boundary(
+        working,
+        config['retention_percentage'],
+        config['transient_patterns'],
+        maximize=True,
+        allow_tool_rounds=True,
+    )
+    if not boundary:
+        boundary = largest
+    if not boundary:
+        raise RuntimeError(
+            'Context limit reached, but no complete earlier user turn can be compacted; provider request was not sent'
+        )
+    boundaries = [boundary, *([largest] if largest > boundary else [])]
+
+    event_emitter = None
+    if metadata.get('chat_id') and metadata.get('message_id'):
+        from open_webui.socket.main import get_event_emitter
+
+        event_emitter = await get_event_emitter(metadata)
+    await _emit_compaction_status(event_emitter, 'Compacting context', False)
+    try:
+        compacted_body = None
+        for candidate_boundary in boundaries:
+            compacted_messages = _without_boundary_marker(
+                working[:candidate_boundary],
+                keep_transient=True,
+            )
+            recent_messages = _without_boundary_marker(working[candidate_boundary:], keep_transient=True)
+            summary = await _generate_summary(
+                request,
+                user,
+                model_id,
+                models,
+                compacted_messages,
+                recent_messages,
+                state.get('previous_summary'),
+                config['prompt_template'],
+                config['transient_patterns'],
+                previous_summary_meta=state.get('previous_summary_meta'),
+                externalized_refs_enable=config.get('externalized_refs_enable', False),
+                externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+            )
+            candidate = {
+                **body,
+                'messages': [
+                    *system_messages,
+                    render_summary_message(summary),
+                    *recent_messages,
+                ],
+            }
+            after = await asyncio.to_thread(estimate_provider_tokens, candidate)
+            if after <= threshold:
+                compacted_body = candidate
+                break
+        if compacted_body is None:
             raise RuntimeError(
                 'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
             )
-
-        state['compacted'] = True
+        ref_config = state.get('externalized_refs') or {}
+        registry = ref_config.get('registry')
+        history_entry = (
+            await asyncio.to_thread(_history_entry_at, working, candidate_boundary)
+            if ref_config.get('enable') is True
+            and ref_config.get('native') is True
+            and isinstance(registry, dict)
+            and can_externalize_refs(body, native=True, registry=registry)
+            else None
+        )
+        summary_meta: dict[str, Any] = {}
+        updates = {
+            'summary': summary,
+            'summary_meta': summary_meta,
+            'previous_summary': summary,
+            'previous_summary_meta': summary_meta,
+            'compacted': True,
+        }
+        if history_entry is not None:
+            updates['selected_history'] = history_entry
+            updates['checkpoint_history'] = history_entry
+        state.update(updates)
     except Exception:
         await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
         raise
@@ -727,6 +1333,21 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         messages_map = history.get('messages') or {}
 
     messages, previous_summary = _apply_latest_summary_checkpoint(get_message_list(messages_map, current_id))
+    absorbed_files = _absorbed_files(messages[:-1], messages[-1:])
+    from open_webui.utils.middleware import (
+        convert_url_images_to_base64,
+        get_reasoning_format,
+        inject_message_file_images,
+        process_messages_with_output,
+    )
+
+    messages = inject_message_file_images(messages)
+    messages = process_messages_with_output(
+        messages,
+        reasoning_format=get_reasoning_format(models.get(model_id, {})),
+        mark_transient=True,
+    )
+    messages = (await convert_url_images_to_base64({'messages': messages}, user=user))['messages']
     compacted_messages = messages[:-1]
     recent_messages = messages[-1:]
     if not compacted_messages or not recent_messages:
@@ -742,14 +1363,11 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         previous_summary,
         config['prompt_template'],
         config['transient_patterns'],
+        absorbed_files,
+        externalized_refs_enable=config.get('externalized_refs_enable', False),
+        externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
     )
-    saved = await Chats.upsert_message_to_chat_by_id_and_message_id(
-        chat.id,
-        current_id,
-        {'contextSummary': summary},
-        touch=False,
-    )
-    if saved is None:
+    if not await ChatMessages.update_context_summary(chat.id, current_id, summary):
         raise RuntimeError('Context compaction checkpoint could not be saved')
 
     return {
@@ -759,6 +1377,150 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         'kept_messages': len(recent_messages),
         'summary_chars': len(summary),
     }
+
+
+async def _completed_turn_provider_messages(
+    messages: list[dict],
+    user: Any,
+    model: dict,
+) -> list[dict]:
+    from open_webui.utils.middleware import (
+        convert_url_images_to_base64,
+        get_reasoning_format,
+        inject_message_file_images,
+        process_messages_with_output,
+        sanitize_tool_pairs,
+    )
+
+    def prepare() -> list[dict]:
+        prepared = inject_message_file_images(copy.deepcopy(messages))
+        prepared = process_messages_with_output(
+            prepared,
+            reasoning_format=get_reasoning_format(model),
+            mark_transient=True,
+        )
+        return sanitize_tool_pairs(prepared)
+
+    prepared = await asyncio.to_thread(prepare)
+    return (await convert_url_images_to_base64({'messages': prepared}, user=user))['messages']
+
+
+async def _completed_turn_checkpoint(
+    request: Request,
+    user: Any,
+    messages: list[dict],
+    metadata: dict,
+    model_id: str,
+    models: dict,
+    config: dict,
+) -> str | None:
+    _, _, active, _, _, previous_summary = _stored_checkpoint_view(messages)
+    if not active or active[-1].get('id') != metadata['message_id']:
+        return None
+    compacted_source = active[:-1]
+    if not compacted_source:
+        return None
+    recent_source = active[-1:]
+    model = models.get(model_id, {})
+    compacted_messages, recent_messages = await asyncio.gather(
+        _completed_turn_provider_messages(compacted_source, user, model),
+        _completed_turn_provider_messages(recent_source, user, model),
+    )
+    summary = await _generate_summary(
+        request,
+        user,
+        model_id,
+        models,
+        compacted_messages,
+        recent_messages,
+        previous_summary,
+        config['prompt_template'],
+        config['transient_patterns'],
+        _absorbed_files(compacted_source, recent_source),
+        previous_summary_meta={},
+        externalized_refs_enable=config.get('externalized_refs_enable', False),
+        externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+    )
+    await _save_checkpoint(metadata['chat_id'], metadata['message_id'], summary)
+    return summary
+
+
+def start_completed_turn_compaction_prefetch(
+    request: Request,
+    user: Any,
+    messages: list[dict],
+    metadata: dict,
+    model_id: str,
+    models: dict,
+    state: dict,
+    usage: dict | None,
+) -> asyncio.Task | None:
+    config = state.get('config') or {}
+    if (
+        not config.get('enable')
+        or not is_saved_chat_id(metadata.get('chat_id'))
+        or not isinstance(metadata.get('message_id'), str)
+        or metadata.get('assistant_message_id')
+        or metadata.get('task') == 'context_compaction'
+        or isinstance(state.get('completed_prefetch_task'), asyncio.Task)
+    ):
+        return None
+
+    durability_repair = state.get('compacted') is True and state.get('durable_compacted') is not True
+    if not durability_repair:
+        total = usage.get('total_tokens') if isinstance(usage, dict) else None
+        if isinstance(usage, dict) and any(
+            key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')
+        ):
+            parts = [
+                usage.get(key, 0)
+                for key in (
+                    'input_tokens',
+                    'cache_creation_input_tokens',
+                    'cache_read_input_tokens',
+                    'output_tokens',
+                )
+            ]
+            if all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value >= 0
+                for value in parts
+            ):
+                if (
+                    isinstance(total, bool)
+                    or not isinstance(total, (int, float))
+                    or not math.isfinite(total)
+                ):
+                    total = 0
+                total = max(total, sum(parts))
+        ratio = config.get('soft_trigger_ratio', 0)
+        if (
+            isinstance(total, bool)
+            or not isinstance(total, (int, float))
+            or not math.isfinite(total)
+            or ratio <= 0
+        ):
+            return None
+        threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
+        if total < int(threshold * ratio) or total >= threshold:
+            return None
+
+    task = asyncio.create_task(
+        _completed_turn_checkpoint(
+            request,
+            user,
+            messages,
+            metadata,
+            model_id,
+            models,
+            config,
+        )
+    )
+    task.add_done_callback(_prefetch_done)
+    state['completed_prefetch_task'] = task
+    return task
 
 
 async def _load_config() -> dict:
@@ -872,18 +1634,10 @@ def _build_context_usage(tokens: int, threshold: int) -> dict:
 
 
 def _apply_latest_summary_checkpoint(messages: list[dict]) -> tuple[list[dict], str | None]:
-    summary = None
-    summary_idx = None
-
-    for idx, message in enumerate(messages):
-        value = message.get('contextSummary') or message.get('context_summary')
-        if isinstance(value, str) and value.strip():
-            summary = value
-            summary_idx = idx
-
-    if summary_idx is None:
+    system, _, active, message_index, _, summary = _stored_checkpoint_view(messages)
+    if message_index is None:
         return messages, None
-    return messages[summary_idx:], summary
+    return [*system, *active], summary
 
 
 def _split_leading_system_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -893,8 +1647,17 @@ def _split_leading_system_messages(messages: list[dict]) -> tuple[list[dict], li
     return messages[:boundary], messages[boundary:]
 
 
+def _is_merged_cache_usage(usage: Any) -> bool:
+    return isinstance(usage, dict) and 'prompt_tokens' in usage and any(
+        key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')
+    )
+
+
 def _strict_usage_input_tokens(usage: dict | None) -> int | None:
     if not isinstance(usage, dict) or not usage:
+        return None
+    # merge_usage synthesizes prompt_tokens from only the latest non-cache leg.
+    if _is_merged_cache_usage(usage):
         return None
 
     def token(key: str) -> int | None:
@@ -1026,6 +1789,8 @@ def _candidate_input_tokens(messages: list[dict], system_prompt: str = '', summa
             continue
         info = message.get('info')
         usage = message.get('usage') or (info.get('usage') if isinstance(info, dict) else None)
+        if _is_merged_cache_usage(usage):
+            break
         input_tokens = _strict_usage_input_tokens(usage)
         if input_tokens is None:
             continue
@@ -1044,11 +1809,14 @@ def find_safe_compaction_boundary(
     messages: list[dict],
     retention_percentage: int = 40,
     transient_patterns: tuple[re.Pattern[str], ...] = (),
+    *,
+    maximize: bool = False,
+    allow_tool_rounds: bool = False,
 ) -> int:
     """Return a user-turn boundary that keeps system instructions and tool pairs intact."""
     retention_percentage = _clamp_retention_percentage(retention_percentage)
     keep_count = max(2, len(messages) * retention_percentage // 100)
-    target = max(1, len(messages) - keep_count)
+    target = len(messages) - 1 if maximize else max(1, len(messages) - keep_count)
     events = []
     right_requested: Counter[str] = Counter()
     right_completed: Counter[str] = Counter()
@@ -1091,6 +1859,25 @@ def find_safe_compaction_boundary(
     persistent_users = 0
     system_messages = 0
     selected = 0
+    completed_round = 0
+
+    def follows_complete_tool_round(boundary: int) -> bool:
+        cursor = boundary - 1
+        completed: Counter[str] = Counter()
+        while cursor >= 0 and messages[cursor].get('role') == 'tool':
+            tool_id = messages[cursor].get('tool_call_id')
+            if isinstance(tool_id, str):
+                completed[tool_id] += 1
+            cursor -= 1
+        if not completed or cursor < 0:
+            return False
+        requested = Counter(
+            call['id']
+            for call in messages[cursor].get('tool_calls') or []
+            if isinstance(call, dict) and isinstance(call.get('id'), str)
+        )
+        return messages[cursor].get('role') == 'assistant' and requested == completed
+
     for boundary, message in enumerate(messages):
         if boundary > target:
             break
@@ -1101,6 +1888,16 @@ def find_safe_compaction_boundary(
             and not invalid_ids
         ):
             selected = boundary
+        if (
+            allow_tool_rounds
+            and persistent_users > 0
+            and boundary > 0
+            and message.get('role') == 'assistant'
+            and follows_complete_tool_round(boundary)
+            and system_messages == 0
+            and not invalid_ids
+        ):
+            completed_round = boundary
 
         requested, completed, persistent_user = events[boundary]
         for tool_id in requested.keys() | completed.keys():
@@ -1116,7 +1913,32 @@ def find_safe_compaction_boundary(
             system_messages += 1
         if persistent_user:
             persistent_users += 1
-    return selected
+    return max(selected, completed_round)
+
+
+async def _summary_file_sources(request, user, model_id: str, messages: list[dict], files: list[dict]) -> list[dict]:
+    from open_webui.utils.middleware import chat_completion_files_handler
+
+    async def discard_event(_event: Any) -> None:
+        pass
+
+    items = await asyncio.to_thread(copy.deepcopy, files)
+    for item in items:
+        item['context'] = 'full'
+    _, flags = await chat_completion_files_handler(
+        request,
+        {
+            'model': model_id,
+            'messages': messages,
+            'metadata': {'files': items},
+        },
+        {'__event_emitter__': discard_event},
+        user,
+    )
+    sources = flags.get('sources') or []
+    if not sources:
+        raise RuntimeError('Context compaction could not read files that would be removed from active context')
+    return sources
 
 
 async def _generate_summary(
@@ -1129,6 +1951,11 @@ async def _generate_summary(
     previous_summary: str | None,
     summary_prompt_template: str,
     transient_patterns: tuple[re.Pattern[str], ...] = (),
+    absorbed_files: list[dict] | None = None,
+    *,
+    previous_summary_meta: dict | None = None,
+    externalized_refs_enable: bool = False,
+    externalized_refs_token_threshold: int = 10000,
 ) -> str:
     from open_webui.utils.chat import generate_chat_completion
 
@@ -1141,17 +1968,70 @@ async def _generate_summary(
     if task_model_id not in models:
         raise ValueError('No available model for context compaction')
 
-    summary_prompt_template = summary_prompt_template.strip() or DEFAULT_CONTEXT_COMPACTION_PROMPT
+    compacted_messages = _drop_rendered_summary_once(
+        compacted_messages,
+        previous_summary,
+        previous_summary_meta,
+    )
+    recent_messages = _drop_rendered_summary_once(
+        recent_messages,
+        previous_summary,
+        previous_summary_meta,
+    )
     all_messages = [*compacted_messages, *recent_messages]
+    if externalized_refs_enable:
+        all_messages = await project_tool_refs(
+            all_messages,
+            threshold_tokens=externalized_refs_token_threshold,
+            count_tokens=estimate_text_tokens,
+        )
+        compacted_messages = all_messages[: len(compacted_messages)]
+        recent_messages = all_messages[len(compacted_messages) :]
+
+    custom_prompt = summary_prompt_template.strip()
+    legacy_transcript_prompt = bool(
+        custom_prompt
+        and (
+            _SUMMARY_TRANSCRIPT_VARIABLE_RE.search(custom_prompt)
+            or '{{PREVIOUS_SUMMARY}}' in custom_prompt
+            or _SUMMARY_PROMPT_VARIABLE_RE.search(custom_prompt)
+        )
+    )
+    summary_prompt_template = custom_prompt or DEFAULT_CONTEXT_COMPACTION_PROMPT
+    prompt_compacted_messages = compacted_messages
+    prompt_all_messages = [*prompt_compacted_messages, *recent_messages]
     prompt = replace_prompt_variable(
         summary_prompt_template,
-        get_last_persistent_user_message(all_messages, transient_patterns) or '',
+        get_last_persistent_user_message(prompt_all_messages, transient_patterns) or '',
     )
-    prompt = replace_messages_variable(prompt, all_messages)
-    prompt = replace_messages_variable(prompt, compacted_messages, 'COMPACTED_MESSAGES')
-    prompt = replace_messages_variable(prompt, recent_messages, 'RECENT_MESSAGES')
-    prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': previous_summary or ''})
+    if custom_prompt:
+        prompt = replace_messages_variable(prompt, prompt_all_messages)
+        prompt = replace_messages_variable(prompt, prompt_compacted_messages, 'COMPACTED_MESSAGES')
+        prompt = replace_messages_variable(prompt, recent_messages, 'RECENT_MESSAGES')
+        prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': previous_summary or ''})
+    if legacy_transcript_prompt and previous_summary and '{{PREVIOUS_SUMMARY}}' not in custom_prompt:
+        prompt = f'{render_summary_message(previous_summary, previous_summary_meta)["content"]}\n\n{prompt}'
     prompt = await prompt_template(prompt, user)
+
+    if legacy_transcript_prompt:
+        summary_messages = [{'role': 'user', 'content': prompt}]
+    else:
+        summary_messages = _without_boundary_marker(
+            await asyncio.to_thread(copy.deepcopy, compacted_messages),
+        )
+        if previous_summary:
+            summary_messages.insert(0, render_summary_message(previous_summary, previous_summary_meta))
+        summary_messages.append({'role': 'user', 'content': prompt})
+    if absorbed_files:
+        from open_webui.utils.middleware import apply_source_context_to_messages
+
+        sources = await _summary_file_sources(request, user, task_model_id, summary_messages, absorbed_files)
+        summary_messages = await apply_source_context_to_messages(
+            request,
+            summary_messages,
+            sources,
+            prompt,
+        )
 
     task_model_params = task_config.get('task.model.params') or {}
     if not isinstance(task_model_params, dict):
@@ -1161,30 +2041,145 @@ async def _generate_summary(
         'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
     }
 
+    summary_metadata = dict(request.state.metadata) if hasattr(request.state, 'metadata') else {}
+    summary_metadata.pop('tools', None)
+    summary_metadata.pop('files', None)
+    summary_metadata['task'] = 'context_compaction'
+    summary_scope = {
+        **request.scope,
+        'state': {**(request.scope.get('state') or {}), 'metadata': summary_metadata},
+    }
+    summary_request = Request(summary_scope, receive=request.receive)
     payload = {
         'model': task_model_id,
-        'messages': [{'role': 'user', 'content': prompt}],
+        'messages': _summary_provider_messages(summary_messages),
         'stream': False,
-        'metadata': {
-            **(request.state.metadata if hasattr(request.state, 'metadata') else {}),
-            'task': 'context_compaction',
-        },
+        'metadata': summary_metadata,
     }
 
     payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
+    for key in ('tools', 'tool_choice', 'functions', 'function_call', 'parallel_tool_calls'):
+        payload.pop(key, None)
     response = await generate_chat_completion(
-        request,
+        summary_request,
         form_data=payload,
         user=user,
         bypass_filter=True,
         bypass_system_prompt=True,
     )
-    return _response_text(response)
+    return await _response_text(response)
 
 
-def _response_text(response: Any) -> str:
+async def _stream_summary_payload(response: StreamingResponse) -> dict:
+    from open_webui.utils.middleware import handle_responses_streaming_event
+
+    iterator = response.body_iterator.__aiter__()
+    parser = _SSEParser()
+    mode = None
+    output = []
+    chat_parts: list[str] = []
+    completed = False
+
+    def consume(tokens: list[tuple[str, Any]]) -> None:
+        nonlocal mode, output, completed
+        for kind, value in tokens:
+            if kind == 'unsafe':
+                raise RuntimeError('Context compaction model returned an invalid event stream')
+            event_name, data = value
+            if data.strip() == '[DONE]':
+                continue
+            try:
+                payload = JSONCodec.loads(data)
+            except Exception as exc:
+                raise RuntimeError('Context compaction model returned an invalid event stream') from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError('Context compaction model returned an invalid event stream')
+            if event_name == 'error' or payload.get('error') or payload.get('type') == 'error':
+                raise RuntimeError(f'Context compaction model failed: {payload.get("error") or payload}')
+
+            event_type = payload.get('type') or event_name
+            if isinstance(event_type, str) and event_type.startswith('response.'):
+                if mode == 'chat':
+                    raise RuntimeError('Context compaction model returned an invalid event stream')
+                mode = 'responses'
+                response_data = payload.get('response')
+                if event_type in {'response.failed', 'response.incomplete'} or (
+                    isinstance(response_data, dict)
+                    and (
+                        response_data.get('status') not in (None, 'completed', 'in_progress')
+                        or response_data.get('incomplete_details')
+                    )
+                ):
+                    raise RuntimeError('Context compaction model stopped before completing the summary')
+                if payload.get('type') != event_type:
+                    payload = {**payload, 'type': event_type}
+                output, metadata = handle_responses_streaming_event(payload, output)
+                if metadata and metadata.get('error'):
+                    raise RuntimeError(f'Context compaction model failed: {metadata["error"]}')
+                if metadata and metadata.get('done'):
+                    completed = True
+                continue
+
+            if mode == 'responses':
+                raise RuntimeError('Context compaction model returned an invalid event stream')
+            mode = 'chat'
+            choices = payload.get('choices')
+            if not choices and payload.get('usage') is not None:
+                continue
+            if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+                raise RuntimeError('Context compaction model returned multiple choices')
+            choice = choices[0]
+            if choice.get('index', 0) != 0:
+                raise RuntimeError('Context compaction model returned multiple choices')
+            delta = choice.get('delta') or choice.get('message') or {}
+            if not isinstance(delta, dict):
+                raise RuntimeError('Context compaction model returned an invalid event stream')
+            if delta.get('tool_calls') or delta.get('function_call'):
+                raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+            content = delta.get('content')
+            if isinstance(content, str):
+                chat_parts.append(content)
+            finish_reason = choice.get('finish_reason')
+            if finish_reason in (None, ''):
+                continue
+            if finish_reason in {'tool_calls', 'function_call'}:
+                raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+            if finish_reason != 'stop':
+                raise RuntimeError('Context compaction model stopped before completing the summary')
+            completed = True
+
+    try:
+        async for chunk in iterator:
+            if not isinstance(chunk, (bytes, str)):
+                raise RuntimeError('Context compaction model returned an invalid event stream')
+            consume(parser.feed(chunk))
+        consume(parser.flush())
+    finally:
+        await _close_stream_response(response, iterator)
+
+    if not completed:
+        raise RuntimeError('Context compaction model stopped before completing the summary')
+    if mode == 'responses':
+        return {'status': 'completed', 'output': output}
+    return {
+        'choices': [
+            {
+                'message': {'content': ''.join(chat_parts)},
+                'finish_reason': 'stop',
+            }
+        ]
+    }
+
+
+async def _response_text(response: Any) -> str:
     if isinstance(response, list) and len(response) == 1:
         response = response[0]
+
+    if isinstance(response, StreamingResponse):
+        if response.status_code >= 400:
+            await _close_stream_response(response, response.body_iterator.__aiter__())
+            raise RuntimeError(f'Context compaction model returned HTTP {response.status_code}')
+        response = await _stream_summary_payload(response)
 
     if isinstance(response, JSONResponse):
         if response.status_code >= 400:
@@ -1218,6 +2213,8 @@ def _response_text(response: Any) -> str:
         raise RuntimeError('Context compaction model stopped before completing the summary')
     parts = []
     for item in response.get('output') or []:
+        if not isinstance(item, dict):
+            continue
         if item.get('type') in {'function_call', 'tool_call'}:
             raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
         if item.get('status') not in (None, 'completed'):
@@ -1247,122 +2244,10 @@ def _estimate_tokens(value: Any) -> int:
     return max(1, len(value) // 4)
 
 
-_CONTEXT_ERROR_CODES = (
-    'context_length_exceeded',
-    'context_window_exceeded',
-    'context_limit',
-    'max_context_length',
-    'input_length_exceeded',
-    'input_too_long',
-    'prompt_too_long',
-    'token_limit_exceeded',
-)
-_CONTEXT_ERROR_MESSAGES = (
-    'maximum context length',
-    'max context length',
-    'context length exceeded',
-    'context window',
-    'context limit',
-    'exceeds context',
-    'exceeded context',
-    'prompt is too long',
-    'prompt too long',
-    'input is too long',
-    'input too long',
-    'input token count exceeds',
-    'input tokens exceed',
-    'prompt tokens exceed',
-    'too many input tokens',
-)
-_NON_CONTEXT_ERROR_MARKERS = (
-    'rate limit',
-    'rate_limit',
-    'too many requests',
-    'quota',
-    'tokens per minute',
-    'token-per-minute',
-    'insufficient_quota',
-    'authentication',
-    'permission',
-)
-_OUTPUT_TOKEN_MARKERS = (
-    'max_tokens',
-    'max_completion_tokens',
-    'max output tokens',
-    'max_output_tokens',
-)
 _SSE_FIELDS = ('data', 'event', 'id', 'retry')
-_SSE_PREFLIGHT_MAX_BYTES = 64 * 1024
-_SSE_PREFLIGHT_MAX_CHUNKS = 256
 
 
-def _structured_error_strings(value: Any) -> tuple[list[str], list[str]]:
-    codes: list[str] = []
-    messages: list[str] = []
-
-    def visit(item: Any, key: str = '') -> None:
-        if isinstance(item, str):
-            (codes if key in {'code', 'type', 'error_code'} else messages).append(item)
-        elif isinstance(item, list):
-            for child in item:
-                visit(child, key)
-        elif isinstance(item, dict):
-            for raw_key, child in item.items():
-                child_key = str(raw_key).lower()
-                if child_key in {
-                    'code',
-                    'type',
-                    'error_code',
-                    'message',
-                    'detail',
-                    'msg',
-                    'error_description',
-                    'error',
-                    'errors',
-                    'response',
-                    'cause',
-                }:
-                    visit(child, child_key)
-
-    visit(value)
-    return codes, messages
-
-
-def _is_context_overflow_payload(value: Any) -> bool:
-    codes, messages = _structured_error_strings(value)
-    joined_codes = ' '.join(codes).lower()
-    joined_messages = ' '.join(messages).lower()
-    combined = f'{joined_codes} {joined_messages}'
-    if any(marker in combined for marker in _NON_CONTEXT_ERROR_MARKERS):
-        return False
-    if any(marker in joined_messages for marker in _OUTPUT_TOKEN_MARKERS) and not any(
-        anchor in joined_messages for anchor in ('context', 'input', 'prompt')
-    ):
-        return False
-    return any(code in joined_codes for code in _CONTEXT_ERROR_CODES) or any(
-        marker in joined_messages for marker in _CONTEXT_ERROR_MESSAGES
-    )
-
-
-def is_context_overflow_error(value: Any) -> bool:
-    """Return whether an HTTP provider result is a structured context overflow."""
-    if isinstance(value, JSONResponse):
-        status_code = value.status_code
-        try:
-            payload = json.loads(value.body.decode('utf-8', 'replace'))
-        except Exception:
-            return False
-        if not isinstance(payload, (dict, list)):
-            return False
-    elif isinstance(value, HTTPException):
-        status_code = value.status_code
-        payload = value.detail
-    else:
-        return False
-    return status_code in {400, 413, 422} and _is_context_overflow_payload(payload)
-
-
-class _SSEProbeParser:
+class _SSEParser:
     def __init__(self) -> None:
         self._decoder = codecs.getincrementaldecoder('utf-8')('replace')
         self._buffer = ''
@@ -1375,14 +2260,6 @@ class _SSEProbeParser:
 
     def flush(self) -> list[tuple[str, Any]]:
         return self._process(self._decoder.decode(b'', final=True), final=True)
-
-    def has_unsafe_pending_line(self) -> bool:
-        line = self._buffer
-        if not line:
-            return False
-        if line.startswith(':'):
-            return False
-        return not any(field.startswith(line) or line == field or line.startswith(f'{field}:') for field in _SSE_FIELDS)
 
     def _process(self, text: str, *, final: bool) -> list[tuple[str, Any]]:
         self._buffer += text
@@ -1437,262 +2314,17 @@ class _SSEProbeParser:
         return event
 
 
-def _stream_value_present(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value)
-    if isinstance(value, list):
-        return any(_stream_value_present(item) for item in value)
-    if not isinstance(value, dict):
-        return value not in (None, False)
-    if value.get('type') in {
-        'function_call',
-        'tool_call',
-        'computer_call',
-        'file_search_call',
-        'web_search_call',
-    }:
-        return True
-    return any(
-        _stream_value_present(value.get(key))
-        for key in ('content', 'output', 'summary', 'text', 'refusal', 'arguments', 'tool_calls', 'function_call')
-        if key in value
-    )
-
-
-def _responses_output_item_present(value: Any) -> bool:
-    if not isinstance(value, dict):
-        return _stream_value_present(value)
-    return value.get('type') != 'message' or _stream_value_present(value)
-
-
-def _stream_error_source(payload: dict, event_name: str) -> Any | None:
-    if payload.get('error'):
-        return payload['error']
-    if payload.get('type') == 'response.failed':
-        response = payload.get('response')
-        return response.get('error') if isinstance(response, dict) else None
-    if payload.get('type') == 'error' or event_name == 'error':
-        return payload
-    return None
-
-
-def _responses_stream_event_state(payload: dict, event_type: str) -> str:
-    if event_type in {'response.created', 'response.in_progress'}:
-        response = payload.get('response')
-        output = response.get('output') if isinstance(response, dict) else None
-        return (
-            'output'
-            if output is not None
-            and (
-                not isinstance(output, list)
-                or any(_responses_output_item_present(item) for item in output)
-            )
-            else 'control'
-        )
-    if event_type in {
-        'response.output_item.added',
-        'response.content_part.added',
-        'response.reasoning_summary_part.added',
-    }:
-        value = payload.get('item') if event_type == 'response.output_item.added' else payload.get('part')
-        present = (
-            _responses_output_item_present(value)
-            if event_type == 'response.output_item.added'
-            else _stream_value_present(value)
-        )
-        return 'output' if present else 'control'
-    if event_type.startswith('response.'):
-        if event_type.endswith('.delta'):
-            return 'output' if _stream_value_present(payload.get('delta')) else 'control'
-        return 'output'
-
-
-def _chat_stream_event_state(payload: dict) -> str:
-    choices = payload.get('choices')
-    if isinstance(choices, list) and choices:
-        for choice in choices:
-            if not isinstance(choice, dict) or choice.get('finish_reason') not in (None, ''):
-                return 'output'
-            delta = choice.get('delta')
-            if not isinstance(delta, dict):
-                return 'output'
-            if delta.get('tool_calls') or delta.get('function_call'):
-                return 'output'
-            if any(
-                _stream_value_present(delta.get(key))
-                for key in ('content', 'reasoning', 'reasoning_content', 'reasoning_details', 'thinking', 'refusal')
-            ):
-                return 'output'
-        return 'control'
-    if (
-        payload.get('usage') is not None
-        and not choices
-        and not any(
-            _stream_value_present(payload.get(key))
-            for key in ('content', 'reasoning', 'reasoning_content', 'refusal', 'tool_calls', 'function_call')
-        )
-    ):
-        return 'control'
-    return 'output'
-
-
-def _stream_event_state(event: tuple[str, str]) -> str:
-    event_name, data = event
-    if not data:
-        return 'control'
-    if data.strip() == '[DONE]':
-        return 'output'
-    try:
-        payload = json.loads(data)
-    except Exception:
-        return 'output'
-    if not isinstance(payload, dict):
-        return 'output'
-
-    error = _stream_error_source(payload, event_name)
-    if error is not None:
-        return 'retry' if _is_context_overflow_payload(error) else 'output'
-    event_type = payload.get('type', '')
-    if event_type.startswith('response.'):
-        return _responses_stream_event_state(payload, event_type)
-    return _chat_stream_event_state(payload)
-
-
-def _stream_tokens_state(tokens: list[tuple[str, Any]]) -> str | None:
-    for kind, value in tokens:
-        if kind == 'unsafe':
-            return 'output'
-        state = _stream_event_state(value)
-        if state != 'control':
-            return state
-    return None
-
-
-async def _replay_stream(chunks: list[Any], iterator=None, response: StreamingResponse | None = None):
-    try:
-        for chunk in chunks:
-            yield chunk
-        if iterator is not None:
-            async for chunk in iterator:
-                yield chunk
-    finally:
-        if response is not None:
-            await _close_stream_response(response, iterator)
-
-
 async def _close_stream_response(response: StreamingResponse, iterator) -> None:
     close = getattr(iterator, 'aclose', None)
     if callable(close):
         try:
             await close()
         except Exception:
-            log.debug('Failed to close context-overflow stream iterator', exc_info=True)
+            log.debug('Failed to close context compaction stream iterator', exc_info=True)
     background = response.background
     response.background = None
     if background is not None:
         try:
             await background()
         except Exception:
-            log.debug('Failed to close context-overflow stream background task', exc_info=True)
-
-
-async def _snapshot_retry_body(body: dict) -> dict:
-    def snapshot() -> dict:
-        copied = copy.deepcopy({key: value for key, value in body.items() if key != 'metadata'})
-        if 'metadata' in body:
-            metadata = body['metadata']
-            copied['metadata'] = dict(metadata) if isinstance(metadata, dict) else metadata
-        return copied
-
-    return await asyncio.to_thread(snapshot)
-
-
-async def _preflight_stream_context_overflow(response: StreamingResponse) -> bool:
-    if 'text/event-stream' not in response.headers.get('content-type', '').lower():
-        return False
-
-    iterator = response.body_iterator.__aiter__()
-    buffered: list[Any] = []
-    buffered_bytes = 0
-    parser = _SSEProbeParser()
-    try:
-        while True:
-            chunk = await iterator.__anext__()
-            buffered.append(chunk)
-            if isinstance(chunk, bytes):
-                buffered_bytes += len(chunk)
-            elif isinstance(chunk, str):
-                buffered_bytes += len(chunk.encode('utf-8'))
-            else:
-                response.body_iterator = _replay_stream(buffered, iterator, response)
-                return False
-            if buffered_bytes > _SSE_PREFLIGHT_MAX_BYTES or len(buffered) > _SSE_PREFLIGHT_MAX_CHUNKS:
-                response.body_iterator = _replay_stream(buffered, iterator, response)
-                return False
-            state = _stream_tokens_state(parser.feed(chunk))
-            if state == 'output':
-                response.body_iterator = _replay_stream(buffered, iterator, response)
-                return False
-            if state == 'retry':
-                await _close_stream_response(response, iterator)
-                response.body_iterator = _replay_stream(buffered)
-                return True
-            if parser.has_unsafe_pending_line():
-                response.body_iterator = _replay_stream(buffered, iterator, response)
-                return False
-    except StopAsyncIteration:
-        state = _stream_tokens_state(parser.flush())
-        if state == 'output':
-            response.body_iterator = _replay_stream(buffered, response=response)
-            return False
-        if state == 'retry':
-            await _close_stream_response(response, iterator)
-            response.body_iterator = _replay_stream(buffered)
-            return True
-        response.body_iterator = _replay_stream(buffered, response=response)
-        return False
-    except Exception:
-        await _close_stream_response(response, iterator)
-        raise
-
-
-async def _retry_candidate(retry, body: dict) -> dict | None:
-    if not callable(retry):
-        return None
-    try:
-        candidate = await retry(body)
-        if not isinstance(candidate, dict) or candidate == body:
-            return None
-        return candidate
-    except Exception:
-        log.debug('Context-overflow retry preparation failed', exc_info=True)
-        return None
-
-
-async def forward_with_context_retry(send, body: dict, retry=None):
-    """Send once and return the response with the exact candidate used."""
-    if not callable(retry):
-        return await send(body), body
-    initial_body = await _snapshot_retry_body(body)
-    try:
-        response = await send(body)
-    except Exception as error:
-        if not is_context_overflow_error(error):
-            raise
-        candidate = await _retry_candidate(retry, initial_body)
-        if candidate is None:
-            raise
-        actual_body = await _snapshot_retry_body(candidate)
-        return await send(candidate), actual_body
-
-    retryable = is_context_overflow_error(response)
-    if isinstance(response, StreamingResponse):
-        retryable = await _preflight_stream_context_overflow(response)
-    if not retryable:
-        return response, initial_body
-
-    candidate = await _retry_candidate(retry, initial_body)
-    if candidate is None:
-        return response, initial_body
-    actual_body = await _snapshot_retry_body(candidate)
-    return await send(candidate), actual_body
+            log.debug('Failed to close context compaction stream background task', exc_info=True)

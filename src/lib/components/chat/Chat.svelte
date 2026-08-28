@@ -268,23 +268,44 @@
 
 		const messages = createMessagesList(history, history.currentId);
 		const threshold = contextCompactionEnabled
-			? (getContextThreshold() ?? serverContextUsage?.threshold ?? null)
+			? (serverContextUsage?.threshold ?? getContextThreshold() ?? null)
 			: null;
 		const systemTokens = estimateTokens($settings?.system ?? '');
 		let estimatedTokens = systemTokens;
 		let hasUsageCheckpoint = false;
 		let summary = '';
 		let startIdx = 0;
+		let outputStartIdx: number | null = null;
 
 		for (let idx = 0; idx < messages.length; idx += 1) {
 			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
 			if (typeof value === 'string' && value.trim()) {
 				summary = value;
 				startIdx = idx;
+				outputStartIdx = null;
+			}
+			for (let outputIdx = 0; outputIdx < (messages[idx]?.output?.length ?? 0); outputIdx += 1) {
+				const output = messages[idx].output[outputIdx];
+				const outputSummary = output?.contextSummary ?? output?.context_summary;
+				if (typeof outputSummary === 'string' && outputSummary.trim()) {
+					summary = outputSummary;
+					startIdx = idx;
+					outputStartIdx = outputIdx;
+				}
 			}
 		}
 
-		const activeMessages = messages.slice(startIdx);
+		let activeMessages = messages.slice(startIdx);
+		if (outputStartIdx !== null && activeMessages[0]) {
+			const output = activeMessages[0].output.slice(outputStartIdx);
+			const carrier = { ...output[0] };
+			delete carrier.contextSummary;
+			delete carrier.context_summary;
+			activeMessages = [
+				{ ...activeMessages[0], output: [carrier, ...output.slice(1)] },
+				...activeMessages.slice(1)
+			];
+		}
 
 		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {
 			const usage = activeMessages[idx]?.usage ?? activeMessages[idx]?.info?.usage;
@@ -2929,11 +2950,18 @@
 			return;
 		}
 
-		const model = atSelectedModel?.id ?? selectedModels.find((modelId) => modelId);
+		const model =
+			atSelectedModel ??
+			$models.find((item) => item.id === selectedModels.find((modelId) => modelId));
 		const toastId = toast.loading($i18n.t('Compacting context...'));
 
 		try {
-			const result = await compactChatById(localStorage.token, $chatId, model);
+			const result = await compactChatById(
+				localStorage.token,
+				$chatId,
+				model?.id,
+				(model as (Model & { direct?: boolean }) | undefined)?.direct ? model : null
+			);
 			serverContextUsage = result?.context_usage ?? serverContextUsage;
 
 			if (result?.compacted) {

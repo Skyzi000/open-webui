@@ -1308,7 +1308,12 @@ export const updateChatById = async (
 	return res;
 };
 
-export const compactChatById = async (token: string, id: string, model?: string | null) => {
+export const compactChatById = async (
+	token: string,
+	id: string,
+	model?: string | null,
+	modelItem?: object | null
+) => {
 	let error = null;
 
 	const res = await fetch(`${WEBUI_API_BASE_URL}/chats/${id}/compact`, {
@@ -1318,7 +1323,7 @@ export const compactChatById = async (token: string, id: string, model?: string 
 			'Content-Type': 'application/json',
 			...(token && { authorization: `Bearer ${token}` })
 		},
-		body: JSON.stringify({ model })
+		body: JSON.stringify({ model, ...(modelItem ? { model_item: modelItem } : {}) })
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

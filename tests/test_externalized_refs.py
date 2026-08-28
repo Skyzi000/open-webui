@@ -148,6 +148,58 @@ async def test_catalog_unions_on_reentry_without_replacing_reader():
 
 
 @pytest.mark.asyncio
+async def test_summary_projection_keeps_raw_messages_and_needs_no_reader():
+    source = 'summary payload ' * 1000
+    messages = _body(source)['messages']
+    before = copy.deepcopy(messages)
+
+    projected = await refs.project_tool_refs(
+        messages,
+        threshold_tokens=1,
+        count_tokens=lambda _text: 1,
+    )
+
+    assert messages == before
+    assert projected[0] is messages[0]
+    assert projected[1] is not messages[1]
+    assert re.fullmatch(r'tool:[0-9a-f]{64}', projected[1]['content'])
+
+
+@pytest.mark.asyncio
+async def test_captured_tool_entry_is_admitted_without_rehashing(monkeypatch):
+    source = 'captured payload ' * 1000
+
+    def count_tokens(text):
+        return 1 if text is source else 0
+
+    projected, entries = await refs.capture_tool_ref_projections(
+        _body(source)['messages'],
+        threshold_tokens=1,
+        count_tokens=count_tokens,
+    )
+    assert len(entries) == 1
+    assert projected[1]['content'] == entries[0].ref
+
+    def unexpected_hash():
+        raise AssertionError('captured source must reuse its immutable entry')
+
+    monkeypatch.setattr(refs.hashlib, 'sha256', unexpected_hash)
+    body = _body(source)
+    registry = {}
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=1,
+        count_tokens=count_tokens,
+        seed_entries=entries,
+    )
+    reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
+    assert body['messages'][1]['content'] == entries[0].ref
+    assert await reader(f'wc -c {entries[0].ref}') == str(len(source.encode('utf-8')))
+
+
+@pytest.mark.asyncio
 async def test_reader_output_is_below_threshold_and_not_reexternalized():
     _, registry, reader, ref = await _project('reader page ' * 5000)
     page = await reader(f'cat {ref}')

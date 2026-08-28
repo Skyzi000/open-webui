@@ -230,7 +230,6 @@ from open_webui.utils.chat_id import (
 from open_webui.utils.chat_variables import (
     normalize_chat_variables,
 )
-from open_webui.utils.context_compaction import forward_with_context_retry
 from open_webui.utils.embeddings import generate_embeddings
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.json_response import apply_orjson_http_json
@@ -238,7 +237,6 @@ from open_webui.utils.logger import start_logger
 from open_webui.utils.middleware import (
     background_tasks_handler,
     build_chat_response_context,
-    prepare_context_overflow_retry,
     process_chat_payload,
     process_chat_response,
 )
@@ -1639,31 +1637,11 @@ async def chat_completion(
             if compaction_state.get('paused'):
                 return {'status': True, 'chat_id': metadata.get('chat_id'), 'paused': True}
 
-            async def send(candidate):
-                return await chat_completion_handler(
-                    request,
-                    candidate,
-                    user,
-                    bypass_system_prompt=True,
-                )
-
-            async def retry(candidate):
-                return await prepare_context_overflow_retry(
-                    request,
-                    user,
-                    candidate,
-                    metadata,
-                    candidate.get('model') or form_data.get('model'),
-                    compaction_state,
-                )
-
-            retry_enabled = (compaction_state.get('config') or {}).get('enable') and not compaction_state.get(
-                'compacted'
-            )
-            response, form_data = await forward_with_context_retry(
-                send,
+            response = await chat_completion_handler(
+                request,
                 form_data,
-                retry if retry_enabled else None,
+                user,
+                bypass_system_prompt=True,
             )
 
             # When the upstream provider returns an error (e.g. HTTP 400

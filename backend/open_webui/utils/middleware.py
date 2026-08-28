@@ -89,17 +89,21 @@ from open_webui.utils.context_compaction import (
     CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
     CONTEXT_COMPACTION_USAGE_ANCHOR_KEY,
     compact_provider_payload,
+    compact_transient_provider_payload,
     estimate_text_tokens,
-    forward_with_context_retry,
     get_last_persistent_user_message,
     prepare_compaction_messages,
     replay_cached_compaction_messages,
+    replay_stored_compaction_checkpoint,
     resolve_request_history,
     set_summary_history_ref,
+    start_completed_turn_compaction_prefetch,
 )
 from open_webui.utils.externalized_refs import (
     REF_EXEC_TOOL_NAME,
     RefEntry,
+    can_externalize_refs,
+    capture_tool_ref_projections,
     externalize_refs,
     is_owned_ref_reader,
 )
@@ -2185,6 +2189,31 @@ async def convert_url_images_to_base64(form_data, user=None):
     return form_data
 
 
+def inject_message_file_images(messages: list[dict]) -> list[dict]:
+    injected = []
+    for message in messages:
+        image_files = [
+            item
+            for item in message.get('files', [])
+            if item.get('type') == 'image' or (item.get('content_type') or '').startswith('image/')
+        ]
+        content = message.get('content')
+        if message.get('role') == 'user' and image_files and isinstance(content, str):
+            message = {
+                **message,
+                'content': [
+                    {'type': 'text', 'text': content},
+                    *[
+                        {'type': 'image_url', 'image_url': {'url': item['url']}}
+                        for item in image_files
+                        if item.get('url')
+                    ],
+                ],
+            }
+        injected.append(message)
+    return injected
+
+
 MESSAGE_REPLAY_KEYS = (
     'id',
     'role',
@@ -2327,8 +2356,10 @@ async def _prepare_compaction_or_default(messages: list[dict], metadata: dict) -
     try:
         return await prepare_compaction_messages(messages, metadata)
     except Exception:
-        log.exception('Context compaction failed; continuing with full chat history')
-        return messages, {'config': {'enable': False}}
+        log.exception('Context compaction failed; continuing with the latest stored checkpoint')
+        replayed, state = replay_stored_compaction_checkpoint(messages)
+        state['config'] = {'enable': False}
+        return replayed, state
 
 
 def _can_install_externalized_ref_reader(metadata: dict, payload_tools: Any) -> bool:
@@ -2342,33 +2373,47 @@ def _can_install_externalized_ref_reader(metadata: dict, payload_tools: Any) -> 
 async def apply_externalized_refs(
     body: dict,
     state: dict,
-    *,
-    source_messages: list[dict] | None = None,
 ) -> dict:
     config = state.get('externalized_refs') or {}
-    if not config.get('enable'):
-        return body
-    if source_messages is not None:
-        state['projection_source_messages'] = source_messages
-    elif isinstance(body.get('messages'), list):
-        state['projection_source_messages'] = body['messages']
-
-    async def load_history():
-        entry = await resolve_request_history(state.get('selected_history'))
-        if entry is not None:
-            state['selected_history'] = entry
-        return entry
-
-    applied = await externalize_refs(
+    applied = False
+    seed_entries = tuple(state.get('tool_ref_entries') or ())
+    if config.get('enable') and can_externalize_refs(
         body,
-        config['registry'],
-        native=config['native'],
-        threshold_tokens=config['threshold'],
-        count_tokens=estimate_text_tokens,
-        history_loader=load_history if config.get('native') else None,
-    )
-    if applied:
-        config['metadata']['tools'] = config['registry']
+        native=config.get('native') is True,
+        registry=config['registry'],
+    ):
+        messages = body.get('messages')
+        captured_entries: tuple[RefEntry, ...] = ()
+        if isinstance(messages, list):
+            projected_messages, captured_entries = await capture_tool_ref_projections(
+                messages,
+                threshold_tokens=config['threshold'],
+                count_tokens=estimate_text_tokens,
+                seed_entries=seed_entries,
+            )
+            if projected_messages is not messages:
+                body = {**body, 'messages': projected_messages}
+                applied = True
+
+        async def load_history():
+            entry = await resolve_request_history(state.get('selected_history'))
+            if entry is not None:
+                state['selected_history'] = entry
+            return entry
+
+        installed = await externalize_refs(
+            body,
+            config['registry'],
+            native=True,
+            threshold_tokens=config['threshold'],
+            count_tokens=estimate_text_tokens,
+            history_loader=load_history,
+            seed_entries=(*seed_entries, *captured_entries),
+        )
+        if installed:
+            config['metadata']['tools'] = config['registry']
+        applied = applied or installed
+
     history_entry = state.get('selected_history')
     if history_entry is None:
         return body
@@ -2378,11 +2423,45 @@ async def apply_externalized_refs(
     )
 
 
-def _projection_source_after_append(state: dict, messages: list[dict], appended: list[dict]) -> list[dict]:
-    source = state.get('projection_source_messages')
-    if not isinstance(source, list) or source is messages:
-        return messages
-    return [*source, *appended]
+async def _capture_pre_filter_tool_refs(
+    body: dict,
+    metadata: dict,
+    state: dict,
+    payload_tools: Any,
+) -> list[dict] | None:
+    messages = body.get('messages')
+    config = state.get('config') or {}
+    if (
+        not isinstance(messages, list)
+        or config.get('externalized_refs_enable') is not True
+        or not _can_install_externalized_ref_reader(metadata, payload_tools)
+        or not can_externalize_refs(body, native=True, registry={})
+    ):
+        return None
+    projected, entries = await capture_tool_ref_projections(
+        messages,
+        threshold_tokens=config['externalized_refs_token_threshold'],
+        count_tokens=estimate_text_tokens,
+        seed_entries=state.get('tool_ref_entries') or (),
+    )
+    if entries:
+        state['tool_ref_entries'] = entries
+    return projected
+
+
+def _drop_absorbed_request_files(body: dict, state: dict) -> dict:
+    if not state.get('durable_compacted'):
+        return body
+    absorbed_ids = {
+        item.get('id')
+        for item in state.get('absorbed_files') or []
+        if isinstance(item, dict) and isinstance(item.get('id'), str)
+    }
+    files = body.get('files')
+    if not absorbed_ids or not isinstance(files, list):
+        return body
+    retained = [item for item in files if not isinstance(item, dict) or item.get('id') not in absorbed_ids]
+    return {**body, 'files': retained}
 
 
 async def _compact_final_provider_payload(
@@ -2394,9 +2473,12 @@ async def _compact_final_provider_payload(
     models: dict,
     state: dict,
     *,
-    force: bool = False,
+    checkpoint_output: list[dict] | None = None,
+    checkpoint_carrier: dict | None = None,
+    checkpoint_message_start: int | None = None,
 ) -> dict:
-    return await compact_provider_payload(
+    prior_checkpoint = state.get('checkpoint_history')
+    candidate = await compact_transient_provider_payload(
         request,
         user,
         body,
@@ -2404,33 +2486,12 @@ async def _compact_final_provider_payload(
         model_id,
         models,
         state,
-        force=force,
-        finalize_candidate=lambda value: apply_externalized_refs(value, state),
+        checkpoint_output=checkpoint_output,
+        checkpoint_carrier=checkpoint_carrier,
+        checkpoint_message_start=checkpoint_message_start,
     )
-
-
-async def prepare_context_overflow_retry(
-    request,
-    user,
-    body: dict,
-    metadata: dict,
-    model_id: str,
-    state: dict,
-) -> dict | None:
-    if state.get('compacted') or not (state.get('config') or {}).get('enable'):
-        return None
-    candidate = await _compact_final_provider_payload(
-        request,
-        user,
-        body,
-        metadata,
-        model_id,
-        state.get('models') or {},
-        state,
-        force=True,
-    )
-    if not state.get('compacted'):
-        return None
+    if state.get('checkpoint_history') is not prior_checkpoint:
+        candidate = await apply_externalized_refs(candidate, state)
     return candidate
 
 
@@ -2681,6 +2742,19 @@ async def process_chat_payload(
         form_data['messages'], compaction_state = await _prepare_compaction_or_default(
             form_data.get('messages', []), metadata
         )
+    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
+        models = {
+            request.state.model['id']: request.state.model,
+        }
+    else:
+        models = request.app.state.MODELS
+    compaction_models = (
+        compaction_models_for_request(request, models)
+        if (compaction_state.get('config') or {}).get('enable')
+        else models
+    )
+    compaction_state['models'] = compaction_models
+    payload_tools = form_data.get('tools', None)  # snapshot before filters
     transient_patterns = (compaction_state.get('config') or {}).get('transient_patterns', ())
     captured_message_files = {
         message_id: files
@@ -2691,27 +2765,7 @@ async def process_chat_payload(
         and files
     }
 
-    # Inject image files into content as image_url parts (mirrors frontend logic)
-    for message in form_data.get('messages', []):
-        image_files = [
-            f
-            for f in message.get('files', [])
-            if f.get('type') == 'image' or (f.get('content_type') or '').startswith('image/')
-        ]
-        if message.get('role') == 'user' and image_files:
-            text_content = message.get('content', '')
-            if isinstance(text_content, str):
-                message['content'] = [
-                    {'type': 'text', 'text': text_content},
-                    *[
-                        {
-                            'type': 'image_url',
-                            'image_url': {'url': f['url']},
-                        }
-                        for f in image_files
-                        if f.get('url')
-                    ],
-                ]
+    form_data['messages'] = inject_message_file_images(form_data.get('messages', []))
 
     if regeneration_prompt:
         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
@@ -2742,6 +2796,25 @@ async def process_chat_payload(
 
     form_data = await convert_url_images_to_base64(form_data, user=user)
 
+    if (compaction_state.get('config') or {}).get('enable'):
+        projected_messages = await _capture_pre_filter_tool_refs(
+            form_data,
+            metadata,
+            compaction_state,
+            payload_tools,
+        )
+        form_data = await compact_provider_payload(
+            request,
+            user,
+            form_data,
+            metadata,
+            form_data.get('model'),
+            compaction_models,
+            compaction_state,
+            projected_messages=projected_messages,
+        )
+        form_data = _drop_absorbed_request_files(form_data, compaction_state)
+
     event_emitter = await get_event_emitter(metadata)
     event_caller = await get_event_call(metadata)
 
@@ -2758,19 +2831,6 @@ async def process_chat_payload(
     }
     # Initialize events to store additional event to be sent to the client
     # Initialize contexts and citation
-    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
-        models = {
-            request.state.model['id']: request.state.model,
-        }
-    else:
-        models = request.app.state.MODELS
-    compaction_models = (
-        compaction_models_for_request(request, models)
-        if (compaction_state.get('config') or {}).get('enable')
-        else models
-    )
-    compaction_state['models'] = compaction_models
-
     task_model_id = get_task_model_id(
         form_data['model'],
         await Config.get('task.model.default'),
@@ -2855,7 +2915,6 @@ async def process_chat_payload(
         form_data['files'] = files
 
     variables = form_data.pop('variables', None)
-    payload_tools = form_data.get('tools', None)  # snapshot before filters
 
     # Process the form_data through the pipeline
     try:
@@ -3284,10 +3343,7 @@ async def process_chat_payload(
 
     request_config = compaction_state.get('config') or {}
     native_refs = _can_install_externalized_ref_reader(metadata, payload_tools)
-    if not native_refs:
-        ref_enabled = False
-        ref_threshold = 10000
-    elif 'externalized_refs_enable' in request_config:
+    if 'externalized_refs_enable' in request_config:
         ref_enabled = request_config['externalized_refs_enable']
         ref_threshold = request_config['externalized_refs_token_threshold']
     else:
@@ -3392,15 +3448,7 @@ async def process_chat_payload(
         compaction_state['paused'] = True
         return form_data, metadata, events, compaction_state
     if approved_messages:
-        form_data = await apply_externalized_refs(
-            form_data,
-            compaction_state,
-            source_messages=_projection_source_after_append(
-                compaction_state,
-                form_data['messages'],
-                approved_messages,
-            ),
-        )
+        form_data = await apply_externalized_refs(form_data, compaction_state)
     form_data = await _compact_final_provider_payload(
         request,
         user,
@@ -3945,6 +3993,22 @@ async def background_tasks_handler(ctx):
 
         message_list = get_message_list(messages_map, metadata['message_id'])
 
+        completed_compaction = ctx.get('completed_compaction') or {}
+        completed_model_id = form_data.get('model') or metadata.get('model_id') or ''
+        completed_models = (ctx.get('compaction_state') or {}).get('models') or {
+            completed_model_id: ctx.get('model') or {}
+        }
+        start_completed_turn_compaction_prefetch(
+            request,
+            user,
+            message_list,
+            metadata,
+            completed_model_id,
+            completed_models,
+            ctx.get('compaction_state') or {},
+            completed_compaction.get('usage'),
+        )
+
         # Remove details tags and files from the messages.
         # as get_message_list creates a new list, it does not affect
         # the original messages outside of this handler
@@ -3984,7 +4048,12 @@ async def background_tasks_handler(ctx):
     if (
         messages
         and is_saved_chat_id(metadata.get('chat_id'))
-        and (compaction_state.get('config') or {}).get('enable')
+        and (
+            (compaction_state.get('config') or {}).get('enable')
+            or compaction_state.get('summary')
+            or compaction_state.get('previous_summary')
+            or compaction_state.get('selected_history')
+        )
     ):
         messages = await replay_cached_compaction_messages(messages, compaction_state)
         messages = strip_compaction_fields(messages)
@@ -4450,6 +4519,9 @@ async def non_streaming_chat_response_handler(response, ctx):
                         'output': response_output,
                         **({'usage': usage} if usage else {}),
                     }
+                    ctx['completed_compaction'] = {
+                        'usage': usage,
+                    }
                     await outlet_filter_handler(ctx)
                     await background_tasks_handler(ctx)
 
@@ -4534,33 +4606,14 @@ async def streaming_chat_response_handler(response, ctx):
         task_id = str(uuid4())  # Create a unique task ID.
         model_id = form_data.get('model', '')
 
-        async def forward_continuation(candidate, retry_body=None):
-            async def send(body):
-                return await generate_chat_completion(
-                    request,
-                    body,
-                    user,
-                    bypass_system_prompt=True,
-                )
-
-            async def retry(body):
-                return await prepare_context_overflow_retry(
-                    request,
-                    user,
-                    retry_body if retry_body is not None else body,
-                    metadata,
-                    model_id,
-                    ctx['compaction_state'],
-                )
-
-            retry_enabled = (ctx['compaction_state'].get('config') or {}).get('enable') and not ctx[
-                'compaction_state'
-            ].get('compacted')
-            return await forward_with_context_retry(
-                send,
+        async def forward_continuation(candidate):
+            response = await generate_chat_completion(
+                request,
                 candidate,
-                retry if retry_enabled else None,
+                user,
+                bypass_system_prompt=True,
             )
+            return response, candidate
 
         # Handle as a background task
         async def response_handler(response, events):
@@ -4900,6 +4953,7 @@ async def streaming_chat_response_handler(response, ctx):
                     output = []
 
             usage = None
+            response_usage = None
             last_response_id = None
 
             def full_output():
@@ -4908,6 +4962,7 @@ async def streaming_chat_response_handler(response, ctx):
             def start_next_response():
                 nonlocal prior_output
                 nonlocal output
+                nonlocal response_usage
                 prior_output = list(full_output())
                 if (
                     prior_output
@@ -4918,6 +4973,7 @@ async def streaming_chat_response_handler(response, ctx):
                     if not parts or (len(parts) == 1 and not parts[0].get('text', '').strip()):
                         prior_output.pop()
                 output = []
+                response_usage = None
 
             def get_message_error_content(error):
                 if isinstance(error, HTTPException):
@@ -4995,6 +5051,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                 async def stream_body_handler(response, form_data):
                     nonlocal usage
+                    nonlocal response_usage
                     nonlocal output
                     nonlocal prior_output
                     nonlocal last_response_id
@@ -5249,6 +5306,7 @@ async def streaming_chat_response_handler(response, ctx):
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
                                             usage = merge_usage(usage, response_metadata['usage'])
+                                            response_usage = merge_usage(response_usage, response_metadata['usage'])
                                             response_metadata['usage'] = usage
 
                                         if response_metadata.get('error'):
@@ -5277,6 +5335,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     raw_usage.update(data.get('timings', {}))  # llama.cpp
                                     if raw_usage:
                                         usage = merge_usage(usage, raw_usage)
+                                        response_usage = merge_usage(response_usage, raw_usage)
                                         await event_emitter(
                                             {
                                                 'type': 'chat:completion',
@@ -6167,10 +6226,18 @@ async def streaming_chat_response_handler(response, ctx):
                             # Restore pre-RAG message state before re-applying
                             # to prevent RAG template duplication.
                             original_user_message = metadata.get('user_prompt') or user_message
-                            set_last_user_message_content(
-                                original_user_message,
-                                continuation_body['messages'],
+                            last_user_message = get_last_user_message_item(continuation_body['messages'])
+                            last_user_content = (last_user_message or {}).get('content')
+                            last_user_is_summary = (
+                                isinstance(last_user_content, str)
+                                and last_user_content.startswith('<auto_compaction_context>')
+                                and last_user_content.endswith('</auto_compaction_context>')
                             )
+                            if not last_user_is_summary:
+                                set_last_user_message_content(
+                                    original_user_message,
+                                    continuation_body['messages'],
+                                )
                             if original_system_content is not None:
                                 if get_system_message(continuation_body['messages']):
                                     replace_system_message_content(
@@ -6207,6 +6274,14 @@ async def streaming_chat_response_handler(response, ctx):
                                         rag_content,
                                         continuation_body['messages'],
                                         append=True,
+                                    )
+                                elif last_user_is_summary:
+                                    continuation_body['messages'].append(
+                                        {
+                                            'role': 'user',
+                                            'content': rag_content,
+                                            CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY: True,
+                                        }
                                     )
                                 else:
                                     continuation_body['messages'] = add_or_update_user_message(
@@ -6251,29 +6326,31 @@ async def streaming_chat_response_handler(response, ctx):
                             'metadata': metadata,
                             'messages': [*continuation_body['messages'], *continuation_messages],
                         }
+                        checkpoint = {
+                            'checkpoint_output': full_output(),
+                            'checkpoint_carrier': output[0] if output else None,
+                            'checkpoint_message_start': len(continuation_body['messages']),
+                        }
                         standalone_body.pop('previous_response_id', None)
-                        source_base = ctx['compaction_state'].get('projection_source_messages')
-                        if not isinstance(source_base, list):
-                            source_base = continuation_body['messages']
-
                         standalone_body = await apply_externalized_refs(
                             standalone_body,
                             ctx['compaction_state'],
-                            source_messages=[*source_base, *continuation_messages],
                         )
-                        if not stateful:
-                            standalone_body = await _compact_final_provider_payload(
-                                request,
-                                user,
-                                standalone_body,
-                                metadata,
-                                model_id,
-                                ctx['compaction_state'].get('models') or {model_id: model},
-                                ctx['compaction_state'],
-                            )
+                        prior_checkpoint = ctx['compaction_state'].get('checkpoint_history')
+                        standalone_body = await _compact_final_provider_payload(
+                            request,
+                            user,
+                            standalone_body,
+                            metadata,
+                            model_id,
+                            ctx['compaction_state'].get('models') or {model_id: model},
+                            ctx['compaction_state'],
+                            **checkpoint,
+                        )
+                        checkpoint_advanced = ctx['compaction_state'].get('checkpoint_history') is not prior_checkpoint
 
                         send_body = standalone_body
-                        if stateful:
+                        if stateful and not checkpoint_advanced:
                             call_ids = {
                                 tool_call['id']
                                 for tool_call in response_tool_calls
@@ -6284,13 +6361,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 last_response_id,
                                 call_ids,
                             )
-                        res, actual_body = await forward_continuation(
-                            send_body,
-                            retry_body=standalone_body if stateful else None,
-                        )
+                        res, actual_body = await forward_continuation(send_body)
                         next_body = (
                             standalone_body
-                            if stateful and actual_body.get('previous_response_id')
+                            if stateful and not checkpoint_advanced and actual_body.get('previous_response_id')
                             else actual_body
                         )
 
@@ -6476,14 +6550,14 @@ async def streaming_chat_response_handler(response, ctx):
                                     *continuation_messages,
                                 ],
                             }
-                            source_base = ctx['compaction_state'].get('projection_source_messages')
-                            if not isinstance(source_base, list):
-                                source_base = continuation_body['messages']
-
+                            checkpoint = {
+                                'checkpoint_output': full_output(),
+                                'checkpoint_carrier': output[0] if output else None,
+                                'checkpoint_message_start': len(continuation_body['messages']),
+                            }
                             new_form_data = await apply_externalized_refs(
                                 new_form_data,
                                 ctx['compaction_state'],
-                                source_messages=[*source_base, *continuation_messages],
                             )
                             new_form_data = await _compact_final_provider_payload(
                                 request,
@@ -6493,6 +6567,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 model_id,
                                 ctx['compaction_state'].get('models') or {model_id: model},
                                 ctx['compaction_state'],
+                                **checkpoint,
                             )
 
                             res, new_form_data = await forward_continuation(new_form_data)
@@ -6555,6 +6630,9 @@ async def streaming_chat_response_handler(response, ctx):
                     'content': ''.join(content_parts) or get_output_text(current_output),
                     'output': current_output,
                     **({'usage': usage} if usage else {}),
+                }
+                ctx['completed_compaction'] = {
+                    'usage': response_usage,
                 }
                 await outlet_filter_handler(ctx)
                 await background_tasks_handler(ctx)

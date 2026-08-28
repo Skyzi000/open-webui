@@ -23,6 +23,7 @@ from sqlalchemy import (
     delete,
     func,
     select,
+    update,
 )
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -318,6 +319,24 @@ class ChatMessageTable:
                     db.add(self._build_message(composite_id, chat_id, user_id, data, now))
 
             await db.commit()
+
+    async def update_context_summary(
+        self,
+        chat_id: str,
+        message_id: str,
+        summary: str,
+        db: Optional[AsyncSession] = None,
+    ) -> bool:
+        """Set one normalized checkpoint without touching chat or message timestamps."""
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                update(ChatMessage)
+                .where(ChatMessage.id == f'{chat_id}-{message_id}')
+                .where(ChatMessage.chat_id == chat_id)
+                .values(context_summary=summary.replace('\x00', ''))
+            )
+            await db.commit()
+            return result.rowcount == 1
 
     async def get_message_by_id(self, id: str, db: Optional[AsyncSession] = None) -> Optional[ChatMessageModel]:
         async with get_async_db_context(db) as db:

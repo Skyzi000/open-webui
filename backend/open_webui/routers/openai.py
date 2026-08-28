@@ -1446,6 +1446,15 @@ def convert_responses_result(response: dict) -> dict:
                 if part.get('type') == 'output_text':
                     content += part.get('text', '')
 
+    incomplete_details = response.get('incomplete_details')
+    finish_reason = 'stop'
+    if response.get('status') not in (None, 'completed') or incomplete_details:
+        reason = incomplete_details.get('reason') if isinstance(incomplete_details, dict) else None
+        finish_reason = {
+            'max_output_tokens': 'length',
+            'content_filter': 'content_filter',
+        }.get(reason, 'length')
+
     return {
         'id': response.get('id', ''),
         'object': 'chat.completion',
@@ -1457,7 +1466,7 @@ def convert_responses_result(response: dict) -> dict:
                     'role': 'assistant',
                     'content': content,
                 },
-                'finish_reason': 'stop',
+                'finish_reason': finish_reason,
             }
         ],
         'usage': response.get('usage', {}),

@@ -250,16 +250,33 @@ def _has_collision(body: dict[str, Any], registry: dict[str, Any]) -> bool:
     return owned is None or any(tool != REF_EXEC_TOOL_SPEC for tool in matching)
 
 
+def can_externalize_refs(
+    body: dict[str, Any],
+    *,
+    native: bool,
+    registry: dict[str, Any],
+) -> bool:
+    """Return whether this Core request can safely expose the ref reader."""
+    return (
+        native
+        and body.get('stream') is True
+        and _reader_is_selectable(body)
+        and not _has_collision(body, registry)
+    )
+
+
 async def _capture_projections(
     messages: list[Any],
     *,
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None,
     existing_refs: Iterable[str] = (),
+    seed_entries: Iterable[RefEntry] = (),
 ) -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
     existing = set(existing_refs)
+    seeds_by_text_id = {id(entry.text): entry for entry in seed_entries}
     candidates = [
-        (index, message, source)
+        (index, message, source, seeds_by_text_id.get(id(source)))
         for index, message in enumerate(messages)
         if isinstance(message, dict)
         and message.get('role') == 'tool'
@@ -269,19 +286,108 @@ async def _capture_projections(
 
     def classify() -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
         projected: list[tuple[int, dict[str, Any], RefEntry]] = []
-        for index, message, source in candidates:
-            if not _is_externalization_eligible(
-                source,
-                threshold_tokens=threshold_tokens,
-                count_tokens=count_tokens,
-            ):
+        classified_by_text_id: dict[int, RefEntry | None] = {}
+        for index, message, source, seed in candidates:
+            if seed is not None and source is seed.text:
+                projected.append((index, message, seed))
                 continue
-            entry = make_ref_entry(source, kind='tool')
-            if entry is not None:
-                projected.append((index, message, entry))
+            source_id = id(source)
+            if source_id not in classified_by_text_id:
+                classified_by_text_id[source_id] = (
+                    make_ref_entry(source, kind='tool')
+                    if _is_externalization_eligible(
+                        source,
+                        threshold_tokens=threshold_tokens,
+                        count_tokens=count_tokens,
+                    )
+                    else None
+                )
+            entry = classified_by_text_id[source_id]
+            if entry is None:
+                continue
+            projected.append((index, message, entry))
         return tuple(projected)
 
     return await asyncio.to_thread(classify)
+
+
+def _projections_are_current(
+    messages: list[Any],
+    projections: tuple[tuple[int, dict[str, Any], RefEntry], ...],
+) -> bool:
+    return all(
+        index < len(messages) and messages[index] is message and message.get('content') is entry.text
+        for index, message, entry in projections
+    )
+
+
+def _apply_projections(
+    messages: list[Any],
+    projections: tuple[tuple[int, dict[str, Any], RefEntry], ...],
+) -> list[Any]:
+    if not projections:
+        return messages
+    projected_messages = list(messages)
+    for index, original, entry in projections:
+        message = dict(original)
+        message['content'] = entry.ref
+        projected_messages[index] = message
+    return projected_messages
+
+
+async def capture_tool_ref_projections(
+    messages: list[Any],
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None = None,
+    seed_entries: Iterable[RefEntry] = (),
+) -> tuple[list[Any], tuple[RefEntry, ...]]:
+    """Project eligible tool text and return the exact entries for later catalog admission."""
+    seeds = tuple(
+        entry
+        for entry in seed_entries
+        if isinstance(entry, RefEntry) and entry.ref.startswith('tool:') and _valid_ref(entry.ref)
+    )
+    projections = await _capture_projections(
+        messages,
+        threshold_tokens=threshold_tokens,
+        count_tokens=count_tokens,
+        existing_refs=chain(
+            (entry.ref for entry in seeds),
+            (
+                source
+                for message in messages
+                if isinstance(message, dict)
+                and message.get('role') == 'tool'
+                and isinstance((source := message.get('content')), str)
+                and _valid_ref(source)
+            ),
+        ),
+        seed_entries=seeds,
+    )
+    if not _projections_are_current(messages, projections):
+        return messages, ()
+    entries: dict[str, RefEntry] = {}
+    for entry in seeds:
+        entries.setdefault(entry.ref, entry)
+    for _, _, entry in projections:
+        entries.setdefault(entry.ref, entry)
+    return _apply_projections(messages, projections), tuple(entries.values())
+
+
+async def project_tool_refs(
+    messages: list[Any],
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None = None,
+) -> list[Any]:
+    """Replace eligible tool text with content-addressed refs without installing a reader."""
+    projected, _ = await capture_tool_ref_projections(
+        messages,
+        threshold_tokens=threshold_tokens,
+        count_tokens=count_tokens,
+    )
+    return projected
 
 
 async def externalize_refs(
@@ -292,6 +398,7 @@ async def externalize_refs(
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None = None,
     history_loader: Callable[[], Awaitable[RefEntry | None]] | None = None,
+    seed_entries: Iterable[RefEntry] = (),
 ) -> bool:
     """Install or extend one Core-owned reader and project eligible tool messages.
 
@@ -299,35 +406,36 @@ async def externalize_refs(
     The original messages list and message dictionaries remain unchanged.
     """
 
-    if (
-        not native
-        or body.get('stream') is not True
-        or not _reader_is_selectable(body)
-        or _has_collision(body, registry)
-    ):
+    if not can_externalize_refs(body, native=native, registry=registry):
         return False
     messages = body.get('messages')
     if not isinstance(messages, list):
         return False
 
+    seeds = tuple(
+        entry
+        for entry in seed_entries
+        if isinstance(entry, RefEntry) and entry.ref.startswith('tool:') and _valid_ref(entry.ref)
+    )
     reader = _owned_reader(registry)
     projections = await _capture_projections(
         messages,
         threshold_tokens=threshold_tokens,
         count_tokens=count_tokens,
-        existing_refs=(reader.__externalized_ref_catalog__ if reader is not None else ()),
+        existing_refs=(
+            *(reader.__externalized_ref_catalog__ if reader is not None else ()),
+            *(entry.ref for entry in seeds),
+        ),
+        seed_entries=seeds,
     )
     history_entry = await history_loader() if history_loader is not None else None
     if history_entry is not None and (
         not history_entry.ref.startswith('history:') or not _valid_ref(history_entry.ref)
     ):
         return False
-    if not projections and history_entry is None:
+    if not projections and history_entry is None and not seeds:
         return False
-    if not all(
-        index < len(messages) and messages[index] is message and message.get('content') is entry.text
-        for index, message, entry in projections
-    ):
+    if not _projections_are_current(messages, projections):
         return False
 
     if reader is None:
@@ -340,6 +448,8 @@ async def externalize_refs(
     else:
         catalog = reader.__externalized_ref_catalog__
 
+    for entry in seeds:
+        catalog.setdefault(entry.ref, entry)
     for _, _, entry in projections:
         catalog.setdefault(entry.ref, entry)
     if history_entry is not None:
@@ -358,12 +468,7 @@ async def externalize_refs(
         body['tools'] = [*tools, copy.deepcopy(REF_EXEC_TOOL_SPEC)]
 
     # Copy only the list and dictionaries whose content changes. Strings remain shared.
-    projected_messages = list(messages)
-    for index, original, entry in projections:
-        message = dict(original)
-        message['content'] = entry.ref
-        projected_messages[index] = message
-    body['messages'] = projected_messages
+    body['messages'] = _apply_projections(messages, projections)
     return True
 
 
@@ -548,9 +653,14 @@ def _parse_command(command: str) -> tuple[_Stage, ...]:
     )
 
 
-def _iter_text_lines(text: str, *, source_offsets: bool = False) -> Iterator[_Line]:
+def _iter_text_lines(
+    text: str,
+    *,
+    source_offsets: bool = False,
+    source_byte_start: int = 0,
+) -> Iterator[_Line]:
     offset = 0
-    byte_start = 0
+    byte_start = source_byte_start
     while offset < len(text):
         newline = text.find('\n', offset)
         end = len(text) if newline < 0 else newline
@@ -788,6 +898,24 @@ def _truncated_marker(next_command: str) -> str:
     return f'\n<auto_compact_ref_truncated>{payload}</auto_compact_ref_truncated>'
 
 
+def _byte_range_marker(
+    *,
+    requested_start: int,
+    requested_end: int | None,
+    actual_start: int | None,
+    actual_end: int | None,
+) -> str:
+    def format_range(start: int, end: int | None) -> str:
+        return f'{start}-{end if end is not None else "*"}'
+
+    metadata = {
+        'actual': None if actual_start is None else format_range(actual_start, actual_end),
+        'requested': format_range(requested_start, requested_end),
+    }
+    payload = json.dumps(metadata, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
+    return f'\n<auto_compact_ref_range>{payload}</auto_compact_ref_range>'
+
+
 def _truncate_rendered(
     text: str,
     marker: str,
@@ -816,13 +944,22 @@ def _page_source(
     start: int = 1,
     end: int | None = None,
 ) -> str:
-    requested = max(0, start - 1)
+    requested = min(max(0, start - 1), entry.utf8_bytes)
     char_start, actual_start = _seek_source_byte(entry, requested)
     effective_end = entry.utf8_bytes if end is None else min(entry.utf8_bytes, end)
     remaining = max(0, effective_end - actual_start)
     if remaining <= REF_EXEC_RESPONSE_MAX_BYTES:
-        char_end, _ = _utf8_prefix_end(entry.text, char_start, remaining)
+        char_end, emitted = _utf8_prefix_end(entry.text, char_start, remaining)
         complete = entry.text[char_start:char_end]
+        if actual_start != requested or emitted != remaining:
+            complete += _byte_range_marker(
+                requested_start=requested + 1,
+                requested_end=None if end is None else effective_end,
+                actual_start=None if emitted == 0 else actual_start + 1,
+                actual_end=(
+                    None if end is None or emitted == 0 else actual_start + emitted
+                ),
+            )
         if response_fits(complete):
             return complete
 
@@ -931,12 +1068,17 @@ def _head_bytes(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
     for line in lines:
         presented = line.presented
         line_bytes = len(presented.encode('utf-8'))
+        source_byte_start = line.source_byte_start if not line.display_prefix else None
         if line_bytes > remaining:
             end, _ = _utf8_prefix_end(presented, 0, remaining)
             if end:
-                yield _Line(presented[:end], False)
+                yield _Line(presented[:end], False, source_byte_start=source_byte_start)
             return
-        yield _Line(presented, line.has_newline and line_bytes < remaining)
+        yield _Line(
+            presented,
+            line.has_newline and line_bytes < remaining,
+            source_byte_start=source_byte_start,
+        )
         remaining -= line_bytes
         if line.has_newline:
             if remaining == 0:
@@ -952,15 +1094,42 @@ def _tail_bytes(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
     if count <= 0:
         return
     retained = bytearray()
+    retained_source_start: int | None = None
+    expected_source_start: int | None = None
     for line in lines:
-        retained.extend(line.presented.encode('utf-8'))
+        presented = line.presented
+        encoded = presented.encode('utf-8')
+        line_source_start = line.source_byte_start if not line.display_prefix else None
+        if line_source_start is None or (
+            expected_source_start is not None and line_source_start != expected_source_start
+        ):
+            retained_source_start = None
+        elif not retained:
+            retained_source_start = line_source_start
+        retained.extend(encoded)
         if line.has_newline:
             retained.append(0x0A)
+        expected_source_start = (
+            line_source_start + len(encoded) + int(line.has_newline)
+            if line_source_start is not None
+            else None
+        )
         if len(retained) > count:
-            del retained[: len(retained) - count]
+            removed = len(retained) - count
+            del retained[:removed]
+            if retained_source_start is not None:
+                retained_source_start += removed
+    snapped = 0
     while retained and retained[0] & 0b1100_0000 == 0b1000_0000:
         del retained[0]
-    yield from _iter_text_lines(retained.decode('utf-8'))
+        snapped += 1
+    if retained_source_start is not None:
+        retained_source_start += snapped
+    yield from _iter_text_lines(
+        retained.decode('utf-8'),
+        source_offsets=retained_source_start is not None,
+        source_byte_start=retained_source_start or 0,
+    )
 
 
 def _tail_from_byte(lines: Iterable[_Line], start: int) -> Iterator[_Line]:
@@ -975,10 +1144,23 @@ def _tail_from_byte(lines: Iterable[_Line], start: int) -> Iterator[_Line]:
         suffix = encoded[remaining:]
         while suffix and suffix[0] & 0b1100_0000 == 0b1000_0000:
             suffix = suffix[1:]
-        yield from _iter_text_lines(suffix.decode('utf-8'))
+        source_byte_start = (
+            line.source_byte_start + len(encoded) - len(suffix)
+            if line.source_byte_start is not None and not line.display_prefix
+            else None
+        )
+        yield from _iter_text_lines(
+            suffix.decode('utf-8'),
+            source_offsets=source_byte_start is not None,
+            source_byte_start=source_byte_start or 0,
+        )
         break
     for line in lines:
-        yield _Line(line.presented, line.has_newline)
+        yield _Line(
+            line.presented,
+            line.has_newline,
+            source_byte_start=(line.source_byte_start if not line.display_prefix else None),
+        )
 
 
 def _apply_stage(lines: Iterable[_Line], stage: _Stage, budget: MatchBudget) -> Iterable[_Line]:
@@ -1049,6 +1231,7 @@ def _direct_response(
             entry,
             response_fits,
             start=max(1, entry.utf8_bytes - stage.byte_count + 1),
+            end=entry.utf8_bytes,
         )
     if stage.command == 'wc':
         return _direct_wc(entry, next(iter(stage.flags)))
@@ -1115,25 +1298,36 @@ def _execute_reader(
     )
 
 
-async def _load_history_refs(
+async def _load_catalog_refs(
     stages: tuple[_Stage, ...],
     catalog: dict[str, RefEntry],
 ) -> None:
     first = stages[0]
-    requested = first.ref if isinstance(first.ref, str) and first.ref.startswith('history:') else None
-    wants_listing = first.command == 'ls' and first.flags == frozenset({'history'})
-    if not wants_listing and (requested is None or requested in catalog):
+    requests: list[str | None] = []
+    if first.command == 'ls':
+        if not first.flags or first.flags == frozenset({'history'}):
+            requests.append(None)
+        if not first.flags or first.flags == frozenset({'tool'}):
+            requests.append('tool:')
+    elif isinstance(first.ref, str) and first.ref not in catalog:
+        requests.append(first.ref)
+    if not requests:
         return
     loader = next(
-        (entry.load_history for entry in catalog.values() if entry.ref.startswith('history:') and entry.load_history),
+        (
+            entry.load_history
+            for entry in reversed(catalog.values())
+            if entry.ref.startswith('history:') and entry.load_history
+        ),
         None,
     )
     if loader is None:
         return
-    loaded = await loader(requested)
-    for entry in loaded or ():
-        if isinstance(entry, RefEntry) and entry.ref.startswith('history:') and _valid_ref(entry.ref):
-            catalog.setdefault(entry.ref, entry)
+    for requested in requests:
+        loaded = await loader(requested)
+        for entry in loaded or ():
+            if isinstance(entry, RefEntry) and _valid_ref(entry.ref):
+                catalog.setdefault(entry.ref, entry)
 
 
 def _new_reader(
@@ -1152,7 +1346,7 @@ def _new_reader(
             if not isinstance(command, str):
                 return REF_EXEC_USAGE_ERROR
             stages = _parse_command(command)
-            await _load_history_refs(stages, catalog)
+            await _load_catalog_refs(stages, catalog)
             return await asyncio.to_thread(
                 _execute_reader,
                 stages,
