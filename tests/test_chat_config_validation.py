@@ -14,7 +14,9 @@ for name in ('data', 'static'):
     os.environ[name.upper() + '_DIR'] = str(path)
 os.environ.setdefault('WEBUI_SECRET_KEY', 'local-test-only')
 
-ChatConfigForm = importlib.import_module('open_webui.routers.chats').ChatConfigForm
+chats_router = importlib.import_module('open_webui.routers.chats')
+ChatConfigForm = chats_router.ChatConfigForm
+CompactChatForm = chats_router.CompactChatForm
 
 app = FastAPI()
 
@@ -123,3 +125,56 @@ def test_context_usage_ignores_invalid_persisted_regex(monkeypatch, caplog):
 
     assert result is None
     assert 'Context compaction configuration is invalid' in caplog.text
+
+
+def test_direct_manual_compact_preserves_websocket_metadata(monkeypatch):
+    chat = SimpleNamespace(
+        id='chat-1',
+        current_message_id='assistant-1',
+        chat={},
+    )
+    captured = {}
+
+    async def get_chat(*_args, **_kwargs):
+        return chat
+
+    async def no_active_tasks(*_args, **_kwargs):
+        return False
+
+    async def get_messages(_chat_id):
+        return {}
+
+    async def compact(request, *_args, **_kwargs):
+        captured.update(request.state.metadata)
+        return {'ok': True, 'compacted': False}
+
+    async def context_usage(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_and_user_id', get_chat)
+    monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(chats_router, 'has_active_tasks', no_active_tasks)
+    monkeypatch.setattr(chats_router, 'compact_chat_branch', compact)
+    monkeypatch.setattr(chats_router, 'get_chat_context_usage', context_usage)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(
+            state=SimpleNamespace(MODELS={'server-model': {'id': 'server-model'}}, redis=None)
+        ),
+    )
+    form = CompactChatForm(
+        model='direct-model',
+        model_item={'id': 'direct-model', 'direct': True},
+        session_id='socket-1',
+    )
+    user = SimpleNamespace(id='user-1', role='user')
+
+    asyncio.run(chats_router.compact_chat_by_id(request, 'chat-1', form, user, None))
+
+    assert captured == {
+        'user_id': 'user-1',
+        'session_id': 'socket-1',
+        'chat_id': 'chat-1',
+        'message_id': 'assistant-1',
+    }

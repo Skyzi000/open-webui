@@ -268,7 +268,7 @@
 
 		const messages = createMessagesList(history, history.currentId);
 		const threshold = contextCompactionEnabled
-			? (serverContextUsage?.threshold ?? getContextThreshold() ?? null)
+			? (getContextThreshold() ?? serverContextUsage?.threshold ?? null)
 			: null;
 		const systemTokens = estimateTokens($settings?.system ?? '');
 		let estimatedTokens = systemTokens;
@@ -2960,7 +2960,8 @@
 				localStorage.token,
 				$chatId,
 				model?.id,
-				(model as (Model & { direct?: boolean }) | undefined)?.direct ? model : null
+				(model as (Model & { direct?: boolean }) | undefined)?.direct ? model : null,
+				$socket?.id
 			);
 			serverContextUsage = result?.context_usage ?? serverContextUsage;
 

@@ -1312,7 +1312,8 @@ export const compactChatById = async (
 	token: string,
 	id: string,
 	model?: string | null,
-	modelItem?: object | null
+	modelItem?: object | null,
+	sessionId?: string | null
 ) => {
 	let error = null;
 
@@ -1323,7 +1324,11 @@ export const compactChatById = async (
 			'Content-Type': 'application/json',
 			...(token && { authorization: `Bearer ${token}` })
 		},
-		body: JSON.stringify({ model, ...(modelItem ? { model_item: modelItem } : {}) })
+		body: JSON.stringify({
+			model,
+			...(modelItem ? { model_item: modelItem } : {}),
+			...(sessionId ? { session_id: sessionId } : {})
+		})
 	})
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();

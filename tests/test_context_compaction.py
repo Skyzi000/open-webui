@@ -375,6 +375,22 @@ def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
     assert fork_history.text == canonical_history_entry([root]).text
 
 
+def test_top_level_checkpoint_drops_stale_carrier_usage():
+    carrier = {
+        'role': 'assistant',
+        'content': 'answer',
+        'usage': {'prompt_tokens': 51_300},
+        'info': {'usage': {'prompt_tokens': 51_300}, 'provider': 'test'},
+    }
+
+    active = compaction._messages_from_checkpoint([carrier], 0, None)
+
+    assert 'usage' not in active[0]
+    assert active[0]['info'] == {'provider': 'test'}
+    assert carrier['usage'] == {'prompt_tokens': 51_300}
+    assert carrier['info']['usage'] == {'prompt_tokens': 51_300}
+
+
 def test_checkpoint_source_is_isolated_from_image_payload_mutation(monkeypatch):
     messages = [
         {
@@ -1408,6 +1424,85 @@ def test_tool_only_refs_do_not_rewrite_user_content():
 
     assert result['messages'][0]['content'] == content
     assert result['messages'][1]['content'].startswith('tool:')
+
+
+def test_post_filter_payload_controls_ref_catalog():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    hidden = refs.make_ref_entry('filtered secret', kind='tool')
+    visible = refs.make_ref_entry('allowed result', kind='tool')
+    history = refs.make_ref_entry('filtered history', kind='history')
+    assert hidden is not None and visible is not None and history is not None
+
+    filtered_state = {
+        'selected_history': history,
+        'tool_ref_entries': (hidden,),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    filtered_body = {
+        'stream': True,
+        'messages': [
+            {'role': 'user', 'content': 'filtered'},
+            {'role': 'assistant', 'output': []},
+        ],
+    }
+
+    assert asyncio.run(middleware.apply_externalized_refs(filtered_body, filtered_state)) is filtered_body
+    assert filtered_state['externalized_refs']['registry'] == {}
+
+    summary_text = f'preserve {visible.ref}'
+    summary = compaction.render_summary_message(summary_text)
+    allowed_state = {
+        'selected_history': history,
+        'previous_summary': summary_text,
+        'previous_summary_meta': {},
+        'tool_ref_entries': (hidden, visible),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    allowed = asyncio.run(
+        middleware.apply_externalized_refs(
+            {'stream': True, 'messages': [summary]},
+            allowed_state,
+        )
+    )
+    reader = allowed_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+
+    assert visible.ref in asyncio.run(reader('ls tool')).splitlines()
+    assert hidden.ref not in asyncio.run(reader('ls tool')).splitlines()
+    assert asyncio.run(reader(f'cat {hidden.ref}')).startswith('Error:')
+    assert history.ref in asyncio.run(reader('ls history')).splitlines()
+    assert f'<history_ref>{history.ref}</history_ref>' in allowed['messages'][0]['content']
+
+    masked_state = {
+        **allowed_state,
+        'externalized_refs': {
+            **allowed_state['externalized_refs'],
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    masked = {
+        'stream': True,
+        'messages': [compaction.render_summary_message(f'filtered {visible.ref}')],
+    }
+
+    masked = asyncio.run(middleware.apply_externalized_refs(masked, masked_state))
+    masked_reader = masked_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert visible.ref in asyncio.run(masked_reader('ls tool')).splitlines()
+    assert asyncio.run(masked_reader('ls history')) == ''
+    assert '<history_ref>' not in masked['messages'][0]['content']
 
 
 def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):

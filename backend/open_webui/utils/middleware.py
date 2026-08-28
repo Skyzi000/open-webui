@@ -93,6 +93,7 @@ from open_webui.utils.context_compaction import (
     estimate_text_tokens,
     get_last_persistent_user_message,
     prepare_compaction_messages,
+    render_summary_message,
     replay_cached_compaction_messages,
     replay_stored_compaction_checkpoint,
     resolve_request_history,
@@ -2370,12 +2371,51 @@ def _can_install_externalized_ref_reader(metadata: dict, payload_tools: Any) -> 
     )
 
 
+_TOOL_REF_TOKEN_RE = re.compile(r'(?<![0-9A-Za-z_])tool:[0-9a-f]{64}(?![0-9A-Za-z_])')
+
+
+def _post_filter_ref_state(
+    messages: list[Any],
+    seed_entries: tuple[RefEntry, ...],
+    summary_content: str | None,
+) -> tuple[tuple[RefEntry, ...], bool]:
+    seeds_by_ref = {entry.ref: entry for entry in seed_entries}
+    seeds_by_text_id = {id(entry.text): entry for entry in seed_entries}
+    visible_refs: set[str] = set()
+    has_summary = False
+    pending: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get('content')
+        if message.get('role') == 'tool' and isinstance(content, str):
+            entry = seeds_by_text_id.get(id(content))
+            if entry is not None:
+                visible_refs.add(entry.ref)
+        has_summary = has_summary or (summary_content is not None and content == summary_content)
+        pending.append(content)
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str) and 'tool:' in value:
+            visible_refs.update(
+                match.group(0)
+                for match in _TOOL_REF_TOKEN_RE.finditer(value)
+                if match.group(0) in seeds_by_ref
+            )
+    return tuple(entry for entry in seed_entries if entry.ref in visible_refs), has_summary
+
+
 async def apply_externalized_refs(
     body: dict,
     state: dict,
 ) -> dict:
     config = state.get('externalized_refs') or {}
     applied = False
+    has_summary = False
     seed_entries = tuple(state.get('tool_ref_entries') or ())
     if config.get('enable') and can_externalize_refs(
         body,
@@ -2383,13 +2423,29 @@ async def apply_externalized_refs(
         registry=config['registry'],
     ):
         messages = body.get('messages')
+        admitted_seed_entries: tuple[RefEntry, ...] = ()
         captured_entries: tuple[RefEntry, ...] = ()
         if isinstance(messages, list):
+            summary = state.get('summary')
+            summary_meta = state.get('summary_meta')
+            if not isinstance(summary, str):
+                summary = state.get('previous_summary')
+                summary_meta = state.get('previous_summary_meta')
+            rendered_summary = (
+                render_summary_message(summary, summary_meta if isinstance(summary_meta, dict) else {})
+                if isinstance(summary, str)
+                else {}
+            )
+            admitted_seed_entries, has_summary = _post_filter_ref_state(
+                messages,
+                seed_entries,
+                rendered_summary.get('content'),
+            )
             projected_messages, captured_entries = await capture_tool_ref_projections(
                 messages,
                 threshold_tokens=config['threshold'],
                 count_tokens=estimate_text_tokens,
-                seed_entries=seed_entries,
+                seed_entries=admitted_seed_entries,
             )
             if projected_messages is not messages:
                 body = {**body, 'messages': projected_messages}
@@ -2407,8 +2463,8 @@ async def apply_externalized_refs(
             native=True,
             threshold_tokens=config['threshold'],
             count_tokens=estimate_text_tokens,
-            history_loader=load_history,
-            seed_entries=(*seed_entries, *captured_entries),
+            history_loader=load_history if has_summary else None,
+            seed_entries=(*admitted_seed_entries, *captured_entries),
         )
         if installed:
             config['metadata']['tools'] = config['registry']
@@ -2419,7 +2475,7 @@ async def apply_externalized_refs(
         return body
     return set_summary_history_ref(
         body,
-        history_entry.ref if applied and isinstance(history_entry, RefEntry) else None,
+        history_entry.ref if has_summary and applied and isinstance(history_entry, RefEntry) else None,
     )
 
 

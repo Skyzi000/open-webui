@@ -111,6 +111,21 @@ async def test_exact_wc_and_all_reader_commands():
     assert f'sha256={ref.split(":", 1)[1]}' in stat
 
 
+@pytest.mark.asyncio
+async def test_tail_rejects_line_counts_above_response_budget(monkeypatch):
+    reader, ref = await _history_reader('one\ntwo\nthree\n')
+
+    def unreadable(_entry):
+        raise AssertionError('oversized tail must fail before reading the source')
+        yield
+
+    monkeypatch.setattr(refs, '_iter_source_lines', unreadable)
+
+    result = await reader(f'tail -n {refs.REF_EXEC_RESPONSE_MAX_BYTES + 1} {ref}')
+
+    assert result == 'Error: tail line count exceeds the 65,536 line limit'
+
+
 @pytest.mark.parametrize(
     ('command', 'expected'),
     [

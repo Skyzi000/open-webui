@@ -603,9 +603,16 @@ def _messages_from_checkpoint(
     if not 0 <= message_index < len(messages):
         return list(messages)
     active = list(messages[message_index:])
-    if output_index is None or not active:
+    if not active:
         return active
     carrier = dict(active[0])
+    carrier.pop('usage', None)
+    info = carrier.get('info')
+    if isinstance(info, dict) and 'usage' in info:
+        carrier['info'] = {key: value for key, value in info.items() if key != 'usage'}
+    active[0] = carrier
+    if output_index is None:
+        return active
     output = carrier.get('output')
     if (
         isinstance(output_index, bool)
@@ -616,11 +623,6 @@ def _messages_from_checkpoint(
         return list(messages)
     carrier['content'] = ''
     carrier['output'] = output[output_index:]
-    carrier.pop('usage', None)
-    info = carrier.get('info')
-    if isinstance(info, dict) and 'usage' in info:
-        carrier['info'] = {key: value for key, value in info.items() if key != 'usage'}
-    active[0] = carrier
     return active
 
 

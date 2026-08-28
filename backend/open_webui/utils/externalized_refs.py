@@ -685,6 +685,10 @@ def _head(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
 def _tail(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
     if count <= 0:
         return
+    if count > REF_EXEC_RESPONSE_MAX_BYTES:
+        raise RefExecError(
+            f'Error: tail line count exceeds the {REF_EXEC_RESPONSE_MAX_BYTES:,} line limit'
+        )
     retained: deque[_Line] = deque(maxlen=count)
     retained.extend(lines)
     yield from retained

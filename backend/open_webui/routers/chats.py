@@ -197,6 +197,7 @@ class ChatConfigForm(BaseModel):
 class CompactChatForm(BaseModel):
     model: str | None = None
     model_item: dict | None = None
+    session_id: str | None = None
 
 
 def chat_search_content_text(text: str) -> str:
@@ -1346,6 +1347,12 @@ async def compact_chat_by_id(
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail='Direct model does not match model ID.')
         request.state.direct = True
         request.state.model = model_item
+        request.state.metadata = {
+            'user_id': user.id,
+            'session_id': form_data.session_id,
+            'chat_id': id,
+            'message_id': current_message_id,
+        }
         from open_webui.utils.middleware import compaction_models_for_request
 
         models = compaction_models_for_request(request, {model_id: model_item})
