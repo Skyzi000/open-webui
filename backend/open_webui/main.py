@@ -1620,7 +1620,24 @@ async def chat_completion(
             detail=str(e),
         )
 
-    async def process_chat(request, form_data, user, metadata, model, tasks=None):
+    # model_info_params were resolved for the originally requested model. After
+    # a missing-base fallback the payload routes through the fallback model, so
+    # the resolved params must bind to that routing ID; a plain arena request
+    # keeps no binding so the selected sub-model's own params win (Core parity).
+    resolved_params_model_id = fallback_model['id'] if fallback_model is not None else model_id
+    bind_resolved_params = fallback_model is not None or model.get('owned_by') != 'arena'
+
+    async def process_chat(
+        request,
+        form_data,
+        user,
+        metadata,
+        model,
+        tasks=None,
+        *,
+        resolved_model_id: str | None = None,
+        resolved_model_params: dict | None = None,
+    ):
         try:
             form_data, metadata, events, compaction_state = await process_chat_payload(
                 request,
@@ -1630,8 +1647,8 @@ async def chat_completion(
                 model,
                 default_model_params=default_model_params,
                 request_params=request_params,
-                resolved_model_id=model_id,
-                resolved_model_params=model_info_params,
+                resolved_model_id=resolved_model_id,
+                resolved_model_params=resolved_model_params,
             )
 
             if compaction_state.get('paused'):
@@ -1825,6 +1842,10 @@ async def chat_completion(
             # Resolve the model object for this specific model
             resolved_model = request.app.state.MODELS.get(target_model_id, model)
 
+            # Primary is decided by ID match with the pre-swap requested model —
+            # never by fan-out position, and never for plain arena requests.
+            is_primary_call = bind_resolved_params and target_model_id == model_id
+
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
             process = process_chat(
@@ -1839,6 +1860,8 @@ async def chat_completion(
                     k: v for k, v in (tasks or {}).items() if k not in (TASKS.TITLE_GENERATION, TASKS.TAGS_GENERATION)
                 }
                 or None,
+                resolved_model_id=model_id if is_primary_call else None,
+                resolved_model_params=model_info_params if is_primary_call else None,
             )
             if is_internal:
                 subagent_results.append(await process)
@@ -1878,7 +1901,16 @@ async def chat_completion(
     else:
         # Legacy/direct: single model, synchronous
         metadata['message_id'] = message_ids[0]['message_id']
-        return await process_chat(request, form_data, user, metadata, model, tasks)
+        return await process_chat(
+            request,
+            form_data,
+            user,
+            metadata,
+            model,
+            tasks,
+            resolved_model_id=resolved_params_model_id if bind_resolved_params else None,
+            resolved_model_params=model_info_params if bind_resolved_params else None,
+        )
 
 
 # Alias for chat_completion (Legacy)

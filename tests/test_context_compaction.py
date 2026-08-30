@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import importlib
+import json
 import logging
 import os
 import re
@@ -424,6 +425,15 @@ def test_checkpoint_source_is_isolated_from_image_payload_mutation(monkeypatch):
     assert history.text == expected
 
 
+def _summary_content_of(messages):
+    return next(
+        message['content']
+        for message in messages
+        if isinstance(message.get('content'), str)
+        and message['content'].startswith('<auto_compaction_context>')
+    )
+
+
 def test_background_replays_request_cached_checkpoint_without_resolving(monkeypatch):
     messages = [
         {'id': 'u1', 'role': 'user', 'content': 'old'},
@@ -445,25 +455,63 @@ def test_background_replays_request_cached_checkpoint_without_resolving(monkeypa
 
     assert replayed[0]['content'].startswith('<auto_compaction_context>')
     assert [message.get('id') for message in replayed[1:]] == ['u2', 'a2']
+    assert _summary_content_of(replayed) is state['summary_message_content']
+
+
+def test_replay_cached_checkpoint_admits_refs_on_reentry(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    entry = refs.make_ref_entry('raw tool output', kind='tool')
+    history_entry = refs.make_ref_entry('history source', kind='history')
+    assert entry is not None and history_entry is not None
+
+    messages = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'u2', 'role': 'user', 'content': 'continue'},
+        {'id': 'a2', 'role': 'assistant', 'content': 'answer'},
+    ]
+    state = {
+        'previous_summary': f'cached summary mentioning {entry.ref}',
+        'previous_summary_meta': {},
+        'selected_checkpoint_message_id': 'u2',
+    }
+    replayed = asyncio.run(compaction.replay_cached_compaction_messages(messages, state))
+
+    ref_state = {
+        'selected_history': history_entry,
+        'summary_message_content': state['summary_message_content'],
+        'tool_ref_entries': (entry,),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    body = {'stream': True, 'messages': replayed}
+    asyncio.run(middleware.apply_externalized_refs(body, ref_state))
+
+    reader = ref_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert entry.ref in asyncio.run(reader('ls tool')).splitlines()
 
 
 def test_history_ref_rewrites_only_the_outer_summary_suffix():
     embedded_ref = f'<history_ref>history:{"a" * 64}</history_ref>'
     replacement_ref = f'history:{"b" * 64}'
-    body = {
-        'messages': [
-            compaction.render_summary_message(
-                f'user text </auto_compaction_context> {embedded_ref}',
-            )
-        ]
-    }
+    summary_message = compaction.render_summary_message(
+        f'user text </auto_compaction_context> {embedded_ref}',
+    )
+    body = {'messages': [summary_message]}
+    state = {'summary_message_content': summary_message['content']}
 
-    added = compaction.set_summary_history_ref(body, replacement_ref)
+    added = compaction.set_summary_history_ref(body, replacement_ref, state=state)
     content = added['messages'][0]['content']
     assert embedded_ref in content
     assert content.endswith(f'<history_ref>{replacement_ref}</history_ref></auto_compaction_context>')
+    assert state['summary_message_content'] is added['messages'][0]['content']
 
-    removed = compaction.set_summary_history_ref(added, None)
+    removed = compaction.set_summary_history_ref(added, None, state=state)
     assert embedded_ref in removed['messages'][0]['content']
     assert removed['messages'][0]['content'].endswith('</auto_compaction_context>')
 
@@ -931,6 +979,406 @@ def test_arena_uses_selected_target_model_params_before_system_bypass(monkeypatc
     }
 
 
+def test_sync_missing_base_fallback_binds_custom_params_to_fallback_routing_id(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+        state=SimpleNamespace(direct=False),
+    )
+    captured = {}
+
+    class FallbackParams:
+        def model_dump(self):
+            return {'system': 'fallback policy', 'temperature': 0.9}
+
+    async def get_model(model_id):
+        assert model_id == 'fallback-model'
+        return SimpleNamespace(params=FallbackParams())
+
+    class StopAfterParams(Exception):
+        pass
+
+    def capture(form_data, _model):
+        captured.update(copy.deepcopy(form_data))
+        raise StopAfterParams
+
+    monkeypatch.setattr(middleware.Models, 'get_model_by_id', staticmethod(get_model))
+    monkeypatch.setattr(middleware, 'apply_params_to_form_data', capture)
+
+    with pytest.raises(StopAfterParams):
+        asyncio.run(
+            middleware.process_chat_payload(
+                request,
+                {'model': 'fallback-model', 'messages': []},
+                None,
+                {'chat_id': ''},
+                {'id': 'fallback-model', 'owned_by': 'openai'},
+                default_model_params={},
+                request_params={'temperature': 0.7},
+                resolved_model_id='fallback-model',
+                resolved_model_params={
+                    'system': 'custom policy',
+                    'temperature': 0.1,
+                    'custom_params': {'top_p': '0.8'},
+                },
+            )
+        )
+
+    assert captured['params'] == {
+        'system': 'custom policy',
+        'temperature': 0.7,
+        'custom_params': {'top_p': '0.8'},
+    }
+
+
+def test_fallback_bound_custom_params_follow_arena_selection(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    request = SimpleNamespace(
+        app=SimpleNamespace(
+            state=SimpleNamespace(MODELS={'target-model': {'id': 'target-model', 'owned_by': 'openai'}})
+        ),
+        state=SimpleNamespace(direct=False),
+    )
+    arena = {'owned_by': 'arena', 'info': {'meta': {'model_ids': ['target-model']}}}
+    captured = {}
+
+    async def get_model(_model_id):
+        raise AssertionError('bound params must win without DB re-resolution')
+
+    class StopAfterParams(Exception):
+        pass
+
+    def capture(form_data, _model):
+        captured.update(copy.deepcopy(form_data))
+        raise StopAfterParams
+
+    monkeypatch.setattr(middleware.Models, 'get_model_by_id', staticmethod(get_model))
+    monkeypatch.setattr(middleware, 'apply_params_to_form_data', capture)
+
+    with pytest.raises(StopAfterParams):
+        asyncio.run(
+            middleware.process_chat_payload(
+                request,
+                {'model': 'arena-fallback', 'messages': []},
+                None,
+                {'chat_id': ''},
+                arena,
+                default_model_params={},
+                request_params={'temperature': 0.7},
+                resolved_model_id='arena-fallback',
+                resolved_model_params={'system': 'custom policy', 'temperature': 0.1},
+            )
+        )
+
+    assert captured['model'] == 'target-model'
+    assert captured['params'] == {'system': 'custom policy', 'temperature': 0.7}
+
+
+class _EntryParams:
+    def __init__(self, values):
+        self.values = dict(values)
+
+    def model_dump(self):
+        return dict(self.values)
+
+
+class _EntryModelInfo:
+    def __init__(self, values, base_model_id=None):
+        self.params = _EntryParams(values)
+        self.base_model_id = base_model_id
+
+    def model_copy(self, update=None):
+        return self
+
+
+def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
+    main = importlib.import_module('open_webui.main')
+    captured = {}
+
+    async def payload(
+        _request,
+        form_data,
+        _user,
+        metadata,
+        _model,
+        *,
+        default_model_params=None,
+        request_params=None,
+        resolved_model_id=None,
+        resolved_model_params=None,
+    ):
+        captured[form_data['model']] = (resolved_model_id, resolved_model_params)
+        return form_data, metadata, None, {}
+
+    async def handler(*_args, **_kwargs):
+        return SimpleNamespace(status_code=200)
+
+    async def build_ctx(*_args, **_kwargs):
+        return {}
+
+    async def respond(*_args, **_kwargs):
+        return {'status': True}
+
+    async def fake_create_task(_redis, process, id=None, task_id=None):
+        await process
+        return task_id, None
+
+    async def fake_event_emitter(*_args, **_kwargs):
+        return None
+
+    async def fake_config_get(key, default=None):
+        return {
+            'models.default_params': {},
+            'chat.tool_permissions.enable': False,
+            'ui.default_models': 'fallback-model',
+        }.get(key, default)
+
+    async def fake_access(*_args, **_kwargs):
+        return None
+
+    model_infos: dict = {}
+
+    async def get_model(model_id):
+        return model_infos.get(model_id)
+
+    monkeypatch.setattr(main, 'process_chat_payload', payload)
+    monkeypatch.setattr(main, 'chat_completion_handler', handler)
+    monkeypatch.setattr(main, 'build_chat_response_context', build_ctx)
+    monkeypatch.setattr(main, 'process_chat_response', respond)
+    monkeypatch.setattr(main, 'create_task', fake_create_task)
+    monkeypatch.setattr(main, 'get_event_emitter', fake_event_emitter)
+    monkeypatch.setattr(main, 'cleanup_task', fake_create_task)
+    monkeypatch.setattr(main, 'has_active_tasks', fake_event_emitter)
+    monkeypatch.setattr(main.Config, 'get', staticmethod(fake_config_get))
+    monkeypatch.setattr(main.Models, 'get_model_by_id', staticmethod(get_model))
+    monkeypatch.setattr(main, 'check_model_access', fake_access)
+    monkeypatch.setattr(main, 'BYPASS_MODEL_ACCESS_CONTROL', False)
+    monkeypatch.setattr(main, 'BYPASS_ADMIN_ACCESS_CONTROL', True)
+    monkeypatch.setattr(main, 'ENABLE_CUSTOM_MODEL_FALLBACK', True)
+
+    request = SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(internal=False),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={}, redis=None)),
+    )
+    user = SimpleNamespace(id='user-1', role='admin')
+
+    def run(model, message_ids):
+        captured.clear()
+        request.app.state.MODELS = models_map
+
+        form_data = {
+            'model': model,
+            'messages': [{'role': 'user', 'content': 'hi'}],
+            'session_id': 'sess-1',
+            'chat_id': 'local:unit',
+            'message_ids': message_ids,
+        }
+        result = asyncio.run(main.chat_completion(request, form_data, user))
+        assert result['status'] is True
+        return dict(captured)
+
+    models_map = {
+        'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
+        'sibling-model': {'id': 'sibling-model', 'owned_by': 'openai', 'info': {}},
+    }
+    model_infos.update(
+        {
+            'primary-model': _EntryModelInfo({'system': 'primary policy'}),
+            'sibling-model': _EntryModelInfo({'system': 'sibling policy'}),
+        }
+    )
+    bound = run(
+        'primary-model',
+        [
+            {'model_id': 'primary-model', 'message_id': 'm1'},
+            {'model_id': 'sibling-model', 'message_id': 'm2'},
+        ],
+    )
+    assert bound['primary-model'] == ('primary-model', {'system': 'primary policy'})
+    assert bound['sibling-model'] == (None, None)
+
+    reordered = run(
+        'primary-model',
+        [
+            {'model_id': 'sibling-model', 'message_id': 'm1'},
+            {'model_id': 'primary-model', 'message_id': 'm2'},
+        ],
+    )
+    assert reordered['primary-model'] == ('primary-model', {'system': 'primary policy'})
+    assert reordered['sibling-model'] == (None, None)
+
+    models_map = {
+        'custom-model': {'id': 'custom-model', 'owned_by': 'openai', 'info': {}},
+        'fallback-model': {'id': 'fallback-model', 'owned_by': 'openai', 'info': {}},
+    }
+    model_infos.clear()
+    model_infos.update(
+        {
+            'custom-model': _EntryModelInfo({'system': 'custom policy'}, base_model_id='missing-base'),
+            'fallback-model': _EntryModelInfo({'system': 'fallback policy'}),
+        }
+    )
+    fallback = run(
+        'custom-model',
+        [
+            {'model_id': 'custom-model', 'message_id': 'm1'},
+            {'model_id': 'fallback-model', 'message_id': 'm2'},
+        ],
+    )
+    assert fallback['custom-model'] == ('custom-model', {'system': 'custom policy'})
+    assert fallback['fallback-model'] == (None, None)
+
+    models_map = {
+        'arena-model': {
+            'id': 'arena-model',
+            'owned_by': 'arena',
+            'info': {'meta': {'model_ids': ['target-model']}},
+        },
+        'target-model': {'id': 'target-model', 'owned_by': 'openai', 'info': {}},
+    }
+    model_infos.clear()
+    model_infos.update(
+        {
+            'arena-model': _EntryModelInfo({'system': 'arena policy'}),
+            'target-model': _EntryModelInfo({'system': 'target policy'}),
+        }
+    )
+    arena = run(
+        'arena-model',
+        [{'model_id': 'arena-model', 'message_id': 'm1'}],
+    )
+    assert arena['arena-model'] == (None, None)
+
+
+def test_chat_completion_sync_leg_binds_fallback_params(monkeypatch):
+    main = importlib.import_module('open_webui.main')
+    captured = {}
+
+    async def payload(
+        _request,
+        form_data,
+        _user,
+        metadata,
+        _model,
+        *,
+        default_model_params=None,
+        request_params=None,
+        resolved_model_id=None,
+        resolved_model_params=None,
+    ):
+        captured[form_data['model']] = (resolved_model_id, resolved_model_params)
+        return form_data, metadata, None, {}
+
+    async def handler(*_args, **_kwargs):
+        return SimpleNamespace(status_code=200)
+
+    async def build_ctx(*_args, **_kwargs):
+        return {}
+
+    async def respond(*_args, **_kwargs):
+        return {'status': True}
+
+    async def fake_config_get(key, default=None):
+        return {
+            'models.default_params': {},
+            'chat.tool_permissions.enable': False,
+            'ui.default_models': 'fallback-model',
+        }.get(key, default)
+
+    async def fake_access(*_args, **_kwargs):
+        return None
+
+    model_infos = {
+        'custom-model': _EntryModelInfo({'system': 'custom policy'}, base_model_id='missing-base'),
+        'fallback-model': _EntryModelInfo({'system': 'fallback policy'}),
+    }
+
+    async def get_model(model_id):
+        return model_infos.get(model_id)
+
+    monkeypatch.setattr(main, 'process_chat_payload', payload)
+    monkeypatch.setattr(main, 'chat_completion_handler', handler)
+    monkeypatch.setattr(main, 'build_chat_response_context', build_ctx)
+    monkeypatch.setattr(main, 'process_chat_response', respond)
+    monkeypatch.setattr(main.Config, 'get', staticmethod(fake_config_get))
+    monkeypatch.setattr(main.Models, 'get_model_by_id', staticmethod(get_model))
+    monkeypatch.setattr(main, 'check_model_access', fake_access)
+    monkeypatch.setattr(main, 'BYPASS_MODEL_ACCESS_CONTROL', False)
+    monkeypatch.setattr(main, 'BYPASS_ADMIN_ACCESS_CONTROL', True)
+    monkeypatch.setattr(main, 'ENABLE_CUSTOM_MODEL_FALLBACK', True)
+
+    request = SimpleNamespace(
+        headers={},
+        state=SimpleNamespace(internal=False),
+        app=SimpleNamespace(
+            state=SimpleNamespace(
+                MODELS={
+                    'custom-model': {'id': 'custom-model', 'owned_by': 'openai', 'info': {}},
+                    'fallback-model': {'id': 'fallback-model', 'owned_by': 'openai', 'info': {}},
+                },
+                redis=None,
+            )
+        ),
+    )
+    user = SimpleNamespace(id='user-1', role='admin')
+    form_data = {
+        'model': 'custom-model',
+        'messages': [{'role': 'user', 'content': 'hi'}],
+        'message_ids': [{'model_id': 'custom-model', 'message_id': 'm1'}],
+    }
+
+    result = asyncio.run(main.chat_completion(request, form_data, user))
+
+    assert result == {'status': True}
+    assert list(captured) == ['fallback-model']
+    assert captured['fallback-model'] == ('fallback-model', {'system': 'custom policy'})
+
+
+def test_fanout_sibling_re_resolves_own_db_params_without_primary_leak(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={})),
+        state=SimpleNamespace(direct=False),
+    )
+    captured = {}
+
+    class SiblingParams:
+        def model_dump(self):
+            return {'system': 'sibling policy', 'temperature': 0.4}
+
+    async def get_model(model_id):
+        assert model_id == 'sibling-model'
+        return SimpleNamespace(params=SiblingParams())
+
+    class StopAfterParams(Exception):
+        pass
+
+    def capture(form_data, _model):
+        captured.update(copy.deepcopy(form_data))
+        raise StopAfterParams
+
+    monkeypatch.setattr(middleware.Models, 'get_model_by_id', staticmethod(get_model))
+    monkeypatch.setattr(middleware, 'apply_params_to_form_data', capture)
+
+    with pytest.raises(StopAfterParams):
+        asyncio.run(
+            middleware.process_chat_payload(
+                request,
+                {'model': 'sibling-model', 'messages': []},
+                None,
+                {'chat_id': ''},
+                {'id': 'sibling-model', 'owned_by': 'openai'},
+                default_model_params={},
+                request_params={},
+                resolved_model_id=None,
+                resolved_model_params=None,
+            )
+        )
+
+    assert captured['params'] == {'system': 'sibling policy', 'temperature': 0.4}
+
+
 def test_canonical_history_projects_core_fields_and_ignores_metadata():
     empty_string = [{'role': 'user', 'content': ''}]
     empty_parts = [{'role': 'user', 'content': []}]
@@ -1174,6 +1622,208 @@ def test_manual_compaction_persists_only_core_checkpoint(monkeypatch):
     assert saved_update == ('chat', 'u2', 'summary')
 
 
+def _tool_round_tip_messages():
+    return {
+        'u1': {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'find evidence'},
+        'a1': {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
+        'u2': {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'continue'},
+        'a2': {
+            'id': 'a2',
+            'parentId': 'u2',
+            'role': 'assistant',
+            'content': 'final',
+            'output': [
+                {
+                    'type': 'function_call',
+                    'call_id': 'call-1',
+                    'name': 'lookup',
+                    'arguments': '{}',
+                    'status': 'completed',
+                },
+                {
+                    'type': 'function_call_output',
+                    'call_id': 'call-1',
+                    'output': [{'type': 'input_text', 'text': 'tool result'}],
+                    'status': 'completed',
+                },
+            ],
+        },
+    }
+
+
+def test_manual_compact_excludes_tip_tool_round_from_summary_input(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages = _tool_round_tip_messages()
+    captured = {}
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': ()}
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def generate_summary(*args, **_kwargs):
+        captured['compacted'] = args[4]
+        captured['recent'] = args[5]
+        return 'summary'
+
+    async def save(chat_id, message_id, summary, **_kwargs):
+        messages[message_id]['contextSummary'] = summary
+        return True
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', save)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id='a2',
+        chat={'history': {'currentId': 'a2', 'messages': messages}},
+    )
+
+    result = asyncio.run(compaction.compact_chat_branch(None, None, chat, 'model', {}))
+
+    assert result['compacted'] is True
+    assert result['dropped_messages'] == 3
+    assert result['kept_messages'] == 1
+    compacted_text = json.dumps(captured['compacted'])
+    assert 'lookup' not in compacted_text
+    assert 'tool result' not in compacted_text
+    recent_text = json.dumps(captured['recent'])
+    assert 'lookup' in recent_text
+    assert 'tool result' in recent_text
+
+    replayed, replay_state = compaction.replay_stored_compaction_checkpoint(
+        compaction.get_message_list(messages, 'a2')
+    )
+    assert _summary_content_of(replayed) is replay_state['summary_message_content']
+    expanded = middleware.process_messages_with_output(replayed)
+    tool_calls = [call for message in expanded for call in (message.get('tool_calls') or [])]
+    assert [call.get('id') for call in tool_calls] == ['call-1']
+    assert [message.get('tool_call_id') for message in expanded if message.get('role') == 'tool'] == ['call-1']
+
+
+def test_manual_compact_nested_tip_only_is_too_short(monkeypatch):
+    messages = {'a1': _tool_round_tip_messages()['a2']}
+    saves = []
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': ()}
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def generate_summary(*_args, **_kwargs):
+        raise AssertionError('too-short branches must not summarize')
+
+    async def save(_chat_id, _message_id, _summary, **_kwargs):
+        saves.append(True)
+        return True
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', save)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id='a1',
+        chat={'history': {'currentId': 'a1', 'messages': messages}},
+    )
+
+    result = asyncio.run(compaction.compact_chat_branch(None, None, chat, 'model', {}))
+
+    assert result == {'ok': True, 'compacted': False, 'reason': 'too_short'}
+    assert saves == []
+
+
+def _run_manual_compact(monkeypatch, messages, current_id):
+    captured = {}
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': ()}
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def generate_summary(*args, **_kwargs):
+        captured['compacted'] = args[4]
+        captured['recent'] = args[5]
+        return 'summary'
+
+    async def save(chat_id, message_id, summary, **_kwargs):
+        messages[message_id]['contextSummary'] = summary
+        return True
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', save)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id=current_id,
+        chat={'history': {'currentId': current_id, 'messages': messages}},
+    )
+    return asyncio.run(compaction.compact_chat_branch(None, None, chat, 'model', {})), captured
+
+
+def test_manual_compact_summary_input_excludes_system_messages(monkeypatch):
+    messages = {
+        's1': {'id': 's1', 'parentId': None, 'role': 'system', 'content': 'system policy'},
+        'u1': {'id': 'u1', 'parentId': 's1', 'role': 'user', 'content': 'find evidence'},
+        'a1': {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
+        'u2': {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'continue'},
+    }
+
+    result, captured = _run_manual_compact(monkeypatch, messages, 'u2')
+
+    assert result['compacted'] is True
+    assert result['dropped_messages'] == 2
+    assert result['kept_messages'] == 1
+    assert all(message.get('role') != 'system' for message in captured['compacted'])
+    assert all(message.get('role') != 'system' for message in captured['recent'])
+    assert [message.get('content') for message in captured['compacted']] == ['find evidence', 'answer']
+    assert [message.get('content') for message in captured['recent']] == ['continue']
+
+
+def test_manual_compact_system_with_nested_checkpoint_tip_is_too_short(monkeypatch):
+    tip = _tool_round_tip_messages()['a2']
+    tip['parentId'] = 's1'
+    tip['output'][0]['contextSummary'] = 'earlier nested checkpoint'
+    messages = {
+        's1': {'id': 's1', 'parentId': None, 'role': 'system', 'content': 'system policy'},
+        'a2': tip,
+    }
+    saves = []
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': ()}
+
+    async def get_messages(_chat_id):
+        return messages
+
+    async def generate_summary(*_args, **_kwargs):
+        raise AssertionError('too-short branches must not summarize')
+
+    async def save(_chat_id, _message_id, _summary, **_kwargs):
+        saves.append(True)
+        return True
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', save)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    chat = SimpleNamespace(
+        id='chat',
+        current_message_id='a2',
+        chat={'history': {'currentId': 'a2', 'messages': messages}},
+    )
+
+    result = asyncio.run(compaction.compact_chat_branch(None, None, chat, 'model', {}))
+
+    assert result == {'ok': True, 'compacted': False, 'reason': 'too_short'}
+    assert saves == []
+
+
 def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path, monkeypatch):
     from contextlib import asynccontextmanager
 
@@ -1329,9 +1979,26 @@ def test_checkpoint_preparation_copies_only_the_active_suffix(monkeypatch):
 
     monkeypatch.setattr(compaction, '_load_config', load_config)
     monkeypatch.setattr(compaction.copy, 'deepcopy', deepcopy)
-    asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
+    prepared, state = asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
 
     assert copied == [messages[2:]]
+    assert _summary_content_of(prepared) is state['summary_message_content']
+
+
+def test_prepare_disabled_replay_pins_summary_identity(monkeypatch):
+    messages = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'u2', 'role': 'user', 'content': 'current', 'contextSummary': 'stored summary'},
+    ]
+
+    async def load_config():
+        return {'enable': False, 'transient_patterns': ()}
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    prepared, state = asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
+
+    assert _summary_content_of(prepared) is state['summary_message_content']
+    assert state['previous_summary'] == 'stored summary'
 
 
 def test_historical_excerpts_stop_after_the_requested_recent_messages():
@@ -1462,6 +2129,7 @@ def test_post_filter_payload_controls_ref_catalog():
         'selected_history': history,
         'previous_summary': summary_text,
         'previous_summary_meta': {},
+        'summary_message_content': summary['content'],
         'tool_ref_entries': (hidden, visible),
         'externalized_refs': {
             'enable': True,
@@ -1499,10 +2167,208 @@ def test_post_filter_payload_controls_ref_catalog():
     }
 
     masked = asyncio.run(middleware.apply_externalized_refs(masked, masked_state))
-    masked_reader = masked_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
-    assert visible.ref in asyncio.run(masked_reader('ls tool')).splitlines()
-    assert asyncio.run(masked_reader('ls history')) == ''
+    assert masked_state['externalized_refs']['registry'] == {}
     assert '<history_ref>' not in masked['messages'][0]['content']
+
+
+def _ref_admission_state(refs, seed_entries):
+    return {
+        'tool_ref_entries': tuple(seed_entries),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 2,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+
+
+def test_post_filter_user_text_tokens_do_not_admit_refs():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool_text = 'raw tool output'
+    entry = refs.make_ref_entry(tool_text, kind='tool')
+    assert entry is not None
+
+    state = _ref_admission_state(refs, (entry,))
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [
+            {'role': 'user', 'content': f'please read {entry.ref} again'},
+            {'role': 'assistant', 'content': f'earlier mention {entry.ref}'},
+        ],
+        state['tool_ref_entries'],
+        None,
+    )
+
+    assert admitted == ()
+    assert has_summary is False
+
+
+def test_post_filter_surviving_tool_content_identity_admits_ref():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool_text = 'raw tool output'
+    entry = refs.make_ref_entry(tool_text, kind='tool')
+    assert entry is not None
+
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [
+            {'role': 'user', 'content': 'inspect'},
+            {'role': 'tool', 'tool_call_id': 'call-1', 'content': tool_text},
+        ],
+        (entry,),
+        None,
+    )
+
+    assert admitted == (entry,)
+    assert has_summary is False
+
+
+def test_post_filter_byte_equal_summary_copy_does_not_admit_ref():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool_text = 'raw tool output'
+    entry = refs.make_ref_entry(tool_text, kind='tool')
+    assert entry is not None
+    trusted = compaction.render_summary_message(f'summary mentioning {entry.ref}')['content']
+    copied = trusted.encode().decode()
+    assert copied == trusted
+    assert copied is not trusted
+
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [{'role': 'user', 'content': copied}],
+        (entry,),
+        trusted,
+    )
+
+    assert admitted == ()
+    assert has_summary is False
+
+
+def test_post_filter_held_summary_object_admits_ref():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool_text = 'raw tool output'
+    entry = refs.make_ref_entry(tool_text, kind='tool')
+    assert entry is not None
+    trusted = compaction.render_summary_message(f'summary mentioning {entry.ref}')['content']
+
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [{'role': 'user', 'content': trusted}],
+        (entry,),
+        trusted,
+    )
+
+    assert [seed.ref for seed in admitted] == [entry.ref]
+    assert has_summary is True
+
+
+def test_post_filter_projected_tool_marker_is_admitted():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    entry = refs.make_ref_entry('raw tool output', kind='tool')
+    assert entry is not None
+
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [{'role': 'tool', 'tool_call_id': 'call-1', 'content': entry.ref}],
+        (entry,),
+        None,
+    )
+
+    assert admitted == (entry,)
+    assert has_summary is False
+
+
+def test_summary_history_ref_rewrite_keeps_admission_alive():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    hidden = refs.make_ref_entry('filtered secret', kind='tool')
+    visible = refs.make_ref_entry('allowed result', kind='tool')
+    history = refs.make_ref_entry('filtered history', kind='history')
+    assert hidden is not None and visible is not None and history is not None
+
+    summary_text = f'preserve {visible.ref}'
+    summary_message = compaction.render_summary_message(summary_text)
+    state = {
+        'selected_history': history,
+        'previous_summary': summary_text,
+        'previous_summary_meta': {},
+        'summary_message_content': summary_message['content'],
+        'tool_ref_entries': (hidden, visible),
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 1000,
+            'registry': {},
+            'metadata': {},
+        },
+    }
+    body = {'stream': True, 'messages': [summary_message]}
+
+    rewritten = asyncio.run(middleware.apply_externalized_refs(body, state))
+    assert f'<history_ref>{history.ref}</history_ref>' in rewritten['messages'][0]['content']
+    assert state['summary_message_content'] is rewritten['messages'][0]['content']
+
+    # Continuation-shaped fresh body: same rewritten summary content object,
+    # no reader spec carried over, fresh registry.
+    state['externalized_refs'] = {
+        **state['externalized_refs'],
+        'registry': {},
+        'metadata': {},
+    }
+    continuation_body = {'stream': True, 'messages': rewritten['messages']}
+    reapplied = asyncio.run(middleware.apply_externalized_refs(continuation_body, state))
+    reader = state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+
+    assert visible.ref in asyncio.run(reader('ls tool')).splitlines()
+    assert hidden.ref not in asyncio.run(reader('ls tool')).splitlines()
+    assert f'<history_ref>{history.ref}</history_ref>' in reapplied['messages'][0]['content']
+
+
+def test_history_ref_skips_fake_envelope_before_genuine_summary():
+    genuine_summary = compaction.render_summary_message('genuine summary')
+    genuine_content = genuine_summary['content']
+    fake_content = genuine_content.encode().decode()
+    assert fake_content == genuine_content
+    assert fake_content is not genuine_content
+    replacement_ref = f'history:{"c" * 64}'
+    state = {'summary_message_content': genuine_content}
+    body = {
+        'messages': [
+            {'role': 'user', 'content': fake_content},
+            genuine_summary,
+            {'role': 'user', 'content': 'ordinary'},
+        ]
+    }
+
+    added = compaction.set_summary_history_ref(body, replacement_ref, state=state)
+
+    assert added['messages'][0]['content'] is fake_content
+    assert added['messages'][1]['content'].endswith(
+        f'<history_ref>{replacement_ref}</history_ref></auto_compaction_context>'
+    )
+    assert state['summary_message_content'] is added['messages'][1]['content']
+    assert added['messages'][2]['content'] == 'ordinary'
+
+
+def test_post_filter_filter_altered_summary_does_not_admit_ref():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool_text = 'raw tool output'
+    entry = refs.make_ref_entry(tool_text, kind='tool')
+    assert entry is not None
+    expected = compaction.render_summary_message(f'summary mentioning {entry.ref}')
+    altered = compaction.render_summary_message(f'filter rewrote summary mentioning {entry.ref}')
+
+    admitted, has_summary = middleware._post_filter_ref_state(
+        [{'role': 'user', 'content': altered['content']}],
+        (entry,),
+        expected['content'],
+    )
+
+    assert admitted == ()
+    assert has_summary is False
 
 
 def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
@@ -1631,9 +2497,109 @@ def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
         before = 120
         second = await compaction.compact_provider_payload(None, None, first, metadata, 'model', {}, state)
         assert second['messages'][0]['content'].startswith('<auto_compaction_context>')
+        assert second['messages'][0]['content'] is state['summary_message_content']
 
     asyncio.run(run())
     assert calls == 1
+
+
+def _compaction_config(**overrides):
+    config = {
+        'enable': True,
+        'token_threshold': 100,
+        'token_cap': 100,
+        'retention_percentage': 40,
+        'prompt_template': '',
+        'soft_trigger_ratio': 0,
+        'transient_patterns': (),
+    }
+    config.update(overrides)
+    return config
+
+
+def _estimate_compacted_when_summarized(body):
+    return (
+        20
+        if any(
+            isinstance(message.get('content'), str)
+            and message['content'].startswith('<auto_compaction_context>')
+            for message in body['messages']
+        )
+        else 120
+    )
+
+
+def test_nested_compact_pins_summary_identity(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'FOLDED'
+
+    async def save(_chat_id, _message_id, update, **_kwargs):
+        return update
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+    monkeypatch.setattr(compaction.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
+
+    carrier = {'type': 'function_call', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}'}
+    output = [carrier]
+    messages = [
+        {'id': 'user', 'role': 'user', 'content': 'start'},
+        {'id': 'assistant', 'role': 'assistant', 'content': '', 'output': output},
+        {'id': 'user2', 'role': 'user', 'content': 'follow-up'},
+    ]
+    state = {'config': _compaction_config()}
+
+    candidate = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'chat', 'message_id': 'assistant'},
+            'model',
+            {},
+            state,
+            checkpoint_output=output,
+            checkpoint_carrier=carrier,
+            checkpoint_message_start=1,
+        )
+    )
+
+    assert _summary_content_of(candidate['messages']) is state['summary_message_content']
+
+
+def test_boundary_compact_pins_summary_identity(monkeypatch):
+    async def generate_summary(*_args, **_kwargs):
+        return 'BOUNDARY'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+
+    messages = [
+        {'role': 'user', 'content': 'old question'},
+        {'role': 'assistant', 'content': 'old answer'},
+        {'role': 'user', 'content': 'new question'},
+    ]
+    state = {'config': _compaction_config()}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
 
 
 def test_stateful_continuation_sends_only_current_output():

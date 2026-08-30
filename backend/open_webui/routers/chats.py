@@ -176,7 +176,9 @@ class ChatConfigForm(BaseModel):
     )
     CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS: str = ''
     ENABLE_EXTERNALIZED_REFS: bool = False
-    EXTERNALIZED_REFS_TOKEN_THRESHOLD: int = Field(default=10000, gt=0)
+    # The floor also keeps the on-demand reader response budget large enough
+    # to return non-empty pages.
+    EXTERNALIZED_REFS_TOKEN_THRESHOLD: int = Field(default=10000, ge=1000)
 
     @field_validator('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS')
     @classmethod
@@ -258,6 +260,15 @@ async def get_chat_config_values() -> dict:
         config['ENABLE_EXTERNALIZED_REFS'] = False
     if config.get('EXTERNALIZED_REFS_TOKEN_THRESHOLD') is None:
         config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = 10000
+    else:
+        # Normalize pre-floor DB/env values so the ge=1000 response model
+        # cannot turn a persisted 1-999 into a response-validation 500.
+        try:
+            config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = max(
+                1000, int(config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'])
+            )
+        except (TypeError, ValueError):
+            config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = 10000
     return config
 
 
@@ -1372,6 +1383,8 @@ async def compact_chat_by_id(
                 ) from exc
 
     result = await compact_chat_branch(request, user, chat, model_id, models)
+    # The map fetched above predates compaction; let usage re-read the
+    # post-compaction normalized rows instead of the stale snapshot.
     result['context_usage'] = await get_chat_context_usage(chat, model_id)
     if result.get('compacted'):
         await publish_event(
@@ -1387,6 +1400,45 @@ async def compact_chat_by_id(
 ############################
 # GetChatById
 ############################
+
+
+def _overlay_context_summaries(data: dict, messages_map: dict | None) -> dict:
+    """Overlay only checkpoint markers from the normalized rows onto the embedded history.
+
+    The embedded message stays authoritative for everything else (modelIdx,
+    followUps, content, ...); the normalized map contributes contextSummary
+    markers only, so the response never becomes a dual-write of the chat blob.
+    """
+    if not messages_map:
+        return data
+    history_messages = ((data.get('chat') or {}).get('history') or {}).get('messages')
+    if not isinstance(history_messages, dict):
+        return data
+
+    for message_id, normalized in messages_map.items():
+        embedded = history_messages.get(message_id)
+        if not isinstance(normalized, dict) or not isinstance(embedded, dict):
+            continue
+        summary = normalized.get('contextSummary')
+        if isinstance(summary, str) and summary.strip():
+            history_messages[message_id] = {**embedded, 'contextSummary': summary}
+        normalized_output = normalized.get('output')
+        embedded_output = embedded.get('output')
+        if not (isinstance(normalized_output, list) and isinstance(embedded_output, list)):
+            continue
+        patched_output = None
+        for index, item in enumerate(embedded_output):
+            normalized_item = normalized_output[index] if index < len(normalized_output) else None
+            if not isinstance(item, dict) or not isinstance(normalized_item, dict):
+                continue
+            item_summary = normalized_item.get('contextSummary')
+            if isinstance(item_summary, str) and item_summary.strip():
+                patched_output = list(embedded_output) if patched_output is None else patched_output
+                patched_output[index] = {**item, 'contextSummary': item_summary}
+        if patched_output is not None:
+            current = history_messages[message_id]
+            history_messages[message_id] = {**current, 'output': patched_output}
+    return data
 
 
 @router.get('/{id}', response_model=ChatResponse | None)
@@ -1408,7 +1460,9 @@ async def get_chat_by_id(
             data,
             await get_response_streams_by_chat_id(request.app.state.redis, id),
         )
-        data['context_usage'] = await get_chat_context_usage(chat)
+        messages_map = await Chats.get_messages_map_by_chat_id(id)
+        data = _overlay_context_summaries(data, messages_map)
+        data['context_usage'] = await get_chat_context_usage(chat, messages_map=messages_map)
         return data
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)

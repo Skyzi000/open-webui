@@ -555,35 +555,41 @@ async def replay_cached_compaction_messages(messages: list[dict], state: dict) -
         if not isinstance(carrier_summary, str) or carrier_summary.strip() != summary.strip():
             return messages
     active_messages = _messages_from_checkpoint(raw_messages, carrier_index, carrier_output_index)
+    summary_message = render_summary_message(
+        summary, summary_meta if isinstance(summary_meta, dict) else {}
+    )
+    state['summary_message_content'] = summary_message['content']
     return [
         *system_messages,
-        render_summary_message(summary, summary_meta if isinstance(summary_meta, dict) else {}),
+        summary_message,
         *active_messages,
     ]
 
-
-def set_summary_history_ref(body: dict, ref: str | None) -> dict:
+def set_summary_history_ref(body: dict, ref: str | None, state: dict | None = None) -> dict:
     if not isinstance(ref, str) or re.fullmatch(r'history:[0-9a-f]{64}', ref) is None:
         return body
     messages = body.get('messages')
     if not isinstance(messages, list):
         return body
+    held = state.get('summary_message_content') if isinstance(state, dict) else None
+    if not isinstance(held, str):
+        return body
     replacement = f'<history_ref>{ref}</history_ref>'
     updated = None
     for index, message in enumerate(messages):
         content = message.get('content') if isinstance(message, dict) else None
-        closing = '</auto_compaction_context>'
-        if (
-            not isinstance(content, str)
-            or not content.startswith('<auto_compaction_context>')
-            or not content.endswith(closing)
-        ):
+        if content is not held:
             continue
+        closing = '</auto_compaction_context>'
         clean = _HISTORY_REF_XML_SUFFIX_RE.sub('', content)
         clean = f'{clean[: -len(closing)]}{replacement}{closing}'
         if clean != content:
             updated = list(messages)
             updated[index] = {**message, 'content': clean}
+            # The rewrite mints a new str; keep the held reference tracking the
+            # content actually sent to the provider. Externally altered copies
+            # never match `is` above, so they can never update this reference.
+            state['summary_message_content'] = clean
         break
     return {**body, 'messages': updated} if updated is not None else body
 
@@ -649,6 +655,7 @@ def replay_stored_compaction_checkpoint(messages: list[dict]) -> tuple[list[dict
         if output_index is not None
         else (history, message_index)
     )
+    summary_message = render_summary_message(summary)
     state = {
         'active_offset': message_index,
         'checkpoint_messages': history,
@@ -657,8 +664,9 @@ def replay_stored_compaction_checkpoint(messages: list[dict]) -> tuple[list[dict
         'selected_history': position,
         'previous_summary': summary,
         'previous_summary_meta': {},
+        'summary_message_content': summary_message['content'],
     }
-    return [*system, render_summary_message(summary), *active], state
+    return [*system, summary_message, *active], state
 
 
 async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> tuple[list[dict], dict]:
@@ -694,7 +702,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         if previous_summary:
             state['previous_summary'] = previous_summary
             state['previous_summary_meta'] = summary_meta
-            active_messages = [render_summary_message(previous_summary, summary_meta), *active_messages]
+            summary_message = render_summary_message(previous_summary, summary_meta)
+            state['summary_message_content'] = summary_message['content']
+            active_messages = [summary_message, *active_messages]
         return [*system_messages, *active_messages], state
     for index in range(len(active_messages) - 1, -1, -1):
         message = active_messages[index]
@@ -725,7 +735,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         )
 
     if previous_summary:
-        active_messages = [render_summary_message(previous_summary, summary_meta), *active_messages]
+        summary_message = render_summary_message(previous_summary, summary_meta)
+        state['summary_message_content'] = summary_message['content']
+        active_messages = [summary_message, *active_messages]
         state['previous_summary'] = previous_summary
         state['previous_summary_meta'] = summary_meta
     return [*system_messages, *active_messages], state
@@ -987,11 +999,15 @@ async def compact_provider_payload(
                     checkpoint_history=checkpoint[0],
                     absorbed_files=checkpoint[1],
                 )
+            # The held identity must track the candidate actually returned to
+            # the provider; the projected copy below is estimation-only and its
+            # separate render must never become the held reference.
+            summary_message = render_summary_message(summary, summary_meta)
             compacted_body = {
                 **body,
                 'messages': [
                     *system_messages,
-                    render_summary_message(summary, summary_meta),
+                    summary_message,
                     *recent_messages,
                 ],
             }
@@ -1025,6 +1041,7 @@ async def compact_provider_payload(
                 'checkpoint_history': history_entry,
                 'absorbed_files': selected_checkpoint[1],
                 'durable_compacted': True,
+                'summary_message_content': summary_message['content'],
             }
         )
     except Exception:
@@ -1176,11 +1193,12 @@ async def compact_transient_provider_payload(
                 carrier_index,
                 config['transient_patterns'],
             )
+            summary_message = render_summary_message(summary, summary_meta)
             candidate = {
                 **body,
                 'messages': [
                     *system_messages,
-                    render_summary_message(summary, summary_meta),
+                    summary_message,
                     *_without_boundary_marker(recent_messages, keep_transient=True),
                 ],
             }
@@ -1212,6 +1230,7 @@ async def compact_transient_provider_payload(
                     'active_offset': len(history) - 1,
                     'compacted': True,
                     'durable_compacted': True,
+                    'summary_message_content': summary_message['content'],
                 }
             )
         except Exception:
@@ -1270,11 +1289,12 @@ async def compact_transient_provider_payload(
                 externalized_refs_enable=config.get('externalized_refs_enable', False),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
             )
+            summary_message = render_summary_message(summary)
             candidate = {
                 **body,
                 'messages': [
                     *system_messages,
-                    render_summary_message(summary),
+                    summary_message,
                     *recent_messages,
                 ],
             }
@@ -1303,6 +1323,7 @@ async def compact_transient_provider_payload(
             'previous_summary': summary,
             'previous_summary_meta': summary_meta,
             'compacted': True,
+            'summary_message_content': summary_message['content'],
         }
         if history_entry is not None:
             updates['selected_history'] = history_entry
@@ -1334,24 +1355,23 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
     if not messages_map:
         messages_map = history.get('messages') or {}
 
-    messages, previous_summary = _apply_latest_summary_checkpoint(get_message_list(messages_map, current_id))
-    absorbed_files = _absorbed_files(messages[:-1], messages[-1:])
-    from open_webui.utils.middleware import (
-        convert_url_images_to_base64,
-        get_reasoning_format,
-        inject_message_file_images,
-        process_messages_with_output,
+    branch_messages = get_message_list(messages_map, current_id)
+    _system, _checkpoint_messages, active_messages, _summary_index, _summary_output, previous_summary = (
+        _stored_checkpoint_view(branch_messages)
     )
-
-    messages = inject_message_file_images(messages)
-    messages = process_messages_with_output(
-        messages,
-        reasoning_format=get_reasoning_format(models.get(model_id, {})),
-        mark_transient=True,
+    # Split the checkpoint-view active suffix in the saved-message space so the
+    # tip message never leaks its own tool rounds into the summary input after
+    # provider expansion, and leading system messages stay out of the summary.
+    compacted_source = active_messages[:-1]
+    recent_source = active_messages[-1:]
+    if not compacted_source or not recent_source:
+        return {'ok': True, 'compacted': False, 'reason': 'too_short'}
+    absorbed_files = _absorbed_files(compacted_source, recent_source)
+    model = models.get(model_id, {})
+    compacted_messages, recent_messages = await asyncio.gather(
+        _completed_turn_provider_messages(compacted_source, user, model),
+        _completed_turn_provider_messages(recent_source, user, model),
     )
-    messages = (await convert_url_images_to_base64({'messages': messages}, user=user))['messages']
-    compacted_messages = messages[:-1]
-    recent_messages = messages[-1:]
     if not compacted_messages or not recent_messages:
         return {'ok': True, 'compacted': False, 'reason': 'too_short'}
 
@@ -1375,8 +1395,8 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
     return {
         'ok': True,
         'compacted': True,
-        'dropped_messages': len(compacted_messages),
-        'kept_messages': len(recent_messages),
+        'dropped_messages': len(compacted_source),
+        'kept_messages': len(recent_source),
         'summary_chars': len(summary),
     }
 
@@ -1547,8 +1567,10 @@ async def _load_config() -> dict:
         'prompt_template': values.get('chat.context_compaction.prompt_template', '') or '',
         'soft_trigger_ratio': _soft_trigger_ratio(values.get('chat.context_compaction.soft_trigger_ratio')),
         'externalized_refs_enable': values.get('chat.externalized_refs.enable') is True,
-        'externalized_refs_token_threshold': (
-            _parse_positive_int(values.get('chat.externalized_refs.token_threshold')) or 10000
+        # The threshold doubles as the reader response token budget; keep the
+        # 1000 floor so reader pages stay non-empty.
+        'externalized_refs_token_threshold': max(
+            1000, _parse_positive_int(values.get('chat.externalized_refs.token_threshold')) or 10000
         ),
         'transient_patterns': (
             tuple(
@@ -1591,7 +1613,12 @@ def _resolve_token_threshold(global_threshold: int, global_cap: int, metadata: d
     return min(configured_threshold or global_threshold, global_cap)
 
 
-async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict | None:
+async def get_chat_context_usage(
+    chat: Any,
+    model_id: str | None = None,
+    *,
+    messages_map: dict | None = None,
+) -> dict | None:
     chat_data = chat.chat or {}
     history = chat_data.get('history') or {}
     current_id = getattr(chat, 'current_message_id', None) or history.get('currentId')
@@ -1602,7 +1629,8 @@ async def get_chat_context_usage(chat: Any, model_id: str | None = None) -> dict
     if not current_id:
         return None
 
-    messages_map = await Chats.get_messages_map_by_chat_id(chat.id)
+    if messages_map is None:
+        messages_map = await Chats.get_messages_map_by_chat_id(chat.id)
     messages = get_message_list(messages_map or history.get('messages') or {}, current_id)
     if not messages:
         return None

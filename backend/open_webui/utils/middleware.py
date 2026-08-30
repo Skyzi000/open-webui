@@ -93,7 +93,6 @@ from open_webui.utils.context_compaction import (
     estimate_text_tokens,
     get_last_persistent_user_message,
     prepare_compaction_messages,
-    render_summary_message,
     replay_cached_compaction_messages,
     replay_stored_compaction_checkpoint,
     resolve_request_history,
@@ -2388,12 +2387,17 @@ def _post_filter_ref_state(
         if not isinstance(message, dict):
             continue
         content = message.get('content')
-        if message.get('role') == 'tool' and isinstance(content, str):
-            entry = seeds_by_text_id.get(id(content))
-            if entry is not None:
-                visible_refs.add(entry.ref)
-        has_summary = has_summary or (summary_content is not None and content == summary_content)
-        pending.append(content)
+        if message.get('role') == 'tool':
+            if isinstance(content, str):
+                entry = seeds_by_text_id.get(id(content))
+                if entry is not None:
+                    visible_refs.add(entry.ref)
+            pending.append(content)
+        elif summary_content is not None and content is summary_content:
+            # Only the held summary content object itself is trusted; byte-equal
+            # copies rebuilt by user text or filters must not re-admit seeds.
+            has_summary = True
+            pending.append(content)
     while pending:
         value = pending.pop()
         if isinstance(value, dict):
@@ -2426,20 +2430,10 @@ async def apply_externalized_refs(
         admitted_seed_entries: tuple[RefEntry, ...] = ()
         captured_entries: tuple[RefEntry, ...] = ()
         if isinstance(messages, list):
-            summary = state.get('summary')
-            summary_meta = state.get('summary_meta')
-            if not isinstance(summary, str):
-                summary = state.get('previous_summary')
-                summary_meta = state.get('previous_summary_meta')
-            rendered_summary = (
-                render_summary_message(summary, summary_meta if isinstance(summary_meta, dict) else {})
-                if isinstance(summary, str)
-                else {}
-            )
             admitted_seed_entries, has_summary = _post_filter_ref_state(
                 messages,
                 seed_entries,
-                rendered_summary.get('content'),
+                state.get('summary_message_content'),
             )
             projected_messages, captured_entries = await capture_tool_ref_projections(
                 messages,
@@ -2476,6 +2470,7 @@ async def apply_externalized_refs(
     return set_summary_history_ref(
         body,
         history_entry.ref if has_summary and applied and isinstance(history_entry, RefEntry) else None,
+        state=state,
     )
 
 
@@ -2693,6 +2688,21 @@ async def connect_mcp_server(
     return client, tool_specs
 
 
+async def _runtime_externalized_refs_config() -> tuple[bool, int]:
+    ref_config = await Config.get_many(
+        'chat.externalized_refs.enable',
+        'chat.externalized_refs.token_threshold',
+    )
+    enabled = ref_config.get('chat.externalized_refs.enable') is True
+    try:
+        # The threshold doubles as the reader response token budget; keep
+        # the 1000 floor so reader pages stay non-empty.
+        threshold = max(1000, int(ref_config.get('chat.externalized_refs.token_threshold') or 10000))
+    except (TypeError, ValueError):
+        threshold = 10000
+    return enabled, threshold
+
+
 async def process_chat_payload(
     request,
     form_data,
@@ -2738,9 +2748,15 @@ async def process_chat_payload(
 
         selected_model = request.app.state.MODELS.get(selected_model_id)
         if selected_model:
+            arena_wrapper_id = form_data.get('model')
             model = selected_model
             form_data['model'] = selected_model_id
             metadata['selected_model_id'] = selected_model_id
+            # A caller that bound resolved params to the arena wrapper (the
+            # missing-base fallback path) must keep them on the selected
+            # sub-model; unbound arena calls re-resolve the target's own params.
+            if resolved_model_id == arena_wrapper_id:
+                resolved_model_id = selected_model_id
 
     async def resolve_target_params(target_id: str | None, target_model: dict | None) -> dict:
         if target_id == resolved_model_id and resolved_model_params is not None:
@@ -3403,15 +3419,7 @@ async def process_chat_payload(
         ref_enabled = request_config['externalized_refs_enable']
         ref_threshold = request_config['externalized_refs_token_threshold']
     else:
-        ref_config = await Config.get_many(
-            'chat.externalized_refs.enable',
-            'chat.externalized_refs.token_threshold',
-        )
-        ref_enabled = ref_config.get('chat.externalized_refs.enable') is True
-        try:
-            ref_threshold = max(1, int(ref_config.get('chat.externalized_refs.token_threshold') or 10000))
-        except (TypeError, ValueError):
-            ref_threshold = 10000
+        ref_enabled, ref_threshold = await _runtime_externalized_refs_config()
     compaction_state['externalized_refs'] = {
         'enable': ref_enabled,
         'threshold': ref_threshold,

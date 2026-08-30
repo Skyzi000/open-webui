@@ -427,8 +427,8 @@
 					>
 						<input
 							type="number"
-							min="1"
-							step="1"
+							min="1000"
+							step="1000"
 							class={inputClass}
 							bind:value={chatConfig.EXTERNALIZED_REFS_TOKEN_THRESHOLD}
 						/>

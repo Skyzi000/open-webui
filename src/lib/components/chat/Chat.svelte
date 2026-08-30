@@ -296,15 +296,40 @@
 		}
 
 		let activeMessages = messages.slice(startIdx);
-		if (outputStartIdx !== null && activeMessages[0]) {
-			const output = activeMessages[0].output.slice(outputStartIdx);
-			const carrier = { ...output[0] };
-			delete carrier.contextSummary;
-			delete carrier.context_summary;
-			activeMessages = [
-				{ ...activeMessages[0], output: [carrier, ...output.slice(1)] },
-				...activeMessages.slice(1)
-			];
+		if (activeMessages[0]) {
+			const carrierSource = activeMessages[0];
+			const carrierInfo = carrierSource?.info;
+			let carrier = carrierSource;
+
+			// Mirror the backend checkpoint view: the selected carrier's own
+			// usage predates the compaction cut and must not anchor the estimate.
+			if (summary && (carrierSource?.usage ?? carrierInfo?.usage) != null) {
+				carrier = { ...carrier };
+				if (carrierSource?.usage != null) {
+					delete carrier.usage;
+				}
+				if (carrierInfo?.usage != null) {
+					carrier.info = { ...carrierInfo };
+					delete carrier.info.usage;
+				}
+			}
+
+			if (outputStartIdx !== null) {
+				const output = Array.isArray(carrierSource.output)
+					? carrierSource.output.slice(outputStartIdx)
+					: [];
+				if (output[0]) {
+					const outputCarrier = { ...output[0] };
+					delete outputCarrier.contextSummary;
+					delete outputCarrier.context_summary;
+					output[0] = outputCarrier;
+				}
+				carrier = { ...carrier, content: '', output };
+			}
+
+			if (carrier !== carrierSource) {
+				activeMessages = [carrier, ...activeMessages.slice(1)];
+			}
 		}
 
 		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {

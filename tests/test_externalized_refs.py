@@ -586,6 +586,18 @@ async def test_history_ancestors_load_only_on_demand_and_union_with_selected():
 
 
 @pytest.mark.asyncio
+async def test_threshold_floor_keeps_reader_output_non_empty():
+    source = 'floor budget content ' * 400
+    assert compaction.estimate_text_tokens(source) >= 1000
+
+    _, _, reader, ref = await _project(source)
+
+    page = await reader(f'cat {ref}')
+    assert page
+    assert compaction.estimate_text_tokens(page) < TOKEN_THRESHOLD
+
+
+@pytest.mark.asyncio
 async def test_current_core_tool_wrapper_returns_exact_wc_bytes():
     from open_webui.utils.tools import get_updated_tool_function
 
