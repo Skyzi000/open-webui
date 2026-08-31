@@ -1106,8 +1106,10 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
         request_params=None,
         resolved_model_id=None,
         resolved_model_params=None,
+        **_kwargs,
     ):
-        captured[form_data['model']] = (resolved_model_id, resolved_model_params)
+        # Correlate per column: fan-out columns may share one routing id.
+        captured[metadata['message_id']] = (form_data['model'], resolved_model_id, resolved_model_params)
         return form_data, metadata, None, {}
 
     async def handler(*_args, **_kwargs):
@@ -1195,8 +1197,8 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
             {'model_id': 'sibling-model', 'message_id': 'm2'},
         ],
     )
-    assert bound['primary-model'] == ('primary-model', {'system': 'primary policy'})
-    assert bound['sibling-model'] == (None, None)
+    assert bound['m1'] == ('primary-model', 'primary-model', {'system': 'primary policy'})
+    assert bound['m2'] == ('sibling-model', None, None)
 
     reordered = run(
         'primary-model',
@@ -1205,8 +1207,8 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
             {'model_id': 'primary-model', 'message_id': 'm2'},
         ],
     )
-    assert reordered['primary-model'] == ('primary-model', {'system': 'primary policy'})
-    assert reordered['sibling-model'] == (None, None)
+    assert reordered['m2'] == ('primary-model', 'primary-model', {'system': 'primary policy'})
+    assert reordered['m1'] == ('sibling-model', None, None)
 
     models_map = {
         'custom-model': {'id': 'custom-model', 'owned_by': 'openai', 'info': {}},
@@ -1226,8 +1228,10 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
             {'model_id': 'fallback-model', 'message_id': 'm2'},
         ],
     )
-    assert fallback['custom-model'] == ('custom-model', {'system': 'custom policy'})
-    assert fallback['fallback-model'] == (None, None)
+    # Custom column routes through the fallback while keeping custom params;
+    # the explicit fallback column re-resolves the fallback's own DB params.
+    assert fallback['m1'] == ('fallback-model', 'fallback-model', {'system': 'custom policy'})
+    assert fallback['m2'] == ('fallback-model', None, None)
 
     models_map = {
         'arena-model': {
@@ -1248,7 +1252,7 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
         'arena-model',
         [{'model_id': 'arena-model', 'message_id': 'm1'}],
     )
-    assert arena['arena-model'] == (None, None)
+    assert arena['m1'] == ('arena-model', None, None)
 
 
 def test_chat_completion_sync_leg_binds_fallback_params(monkeypatch):
@@ -1266,6 +1270,7 @@ def test_chat_completion_sync_leg_binds_fallback_params(monkeypatch):
         request_params=None,
         resolved_model_id=None,
         resolved_model_params=None,
+        **_kwargs,
     ):
         captured[form_data['model']] = (resolved_model_id, resolved_model_params)
         return form_data, metadata, None, {}

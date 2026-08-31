@@ -174,10 +174,16 @@ async def _generate_chat_completion(
         if 'metadata' not in form_data:
             form_data['metadata'] = request.state.metadata
         else:
+            # request.state keeps authority over identity keys (user_id /
+            # chat_id / message_id / ...) and their merge order; only the
+            # per-call params resolved per fan-out column must survive.
+            per_call_params = form_data['metadata'].get('params')
             form_data['metadata'] = {
                 **form_data['metadata'],
                 **request.state.metadata,
             }
+            if per_call_params is not None:
+                form_data['metadata']['params'] = per_call_params
 
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         # Merge the direct connection model into server models so that

@@ -2714,6 +2714,8 @@ async def process_chat_payload(
     request_params: dict | None = None,
     resolved_model_id: str | None = None,
     resolved_model_params: dict | None = None,
+    resolved_model_capabilities: dict | None = None,
+    forced_tool_approval_full: bool | None = None,
 ):
     # Ensure chat_id is always a string — external API clients may omit it.
     if not isinstance(metadata.get('chat_id'), str):
@@ -2758,11 +2760,13 @@ async def process_chat_payload(
             if resolved_model_id == arena_wrapper_id:
                 resolved_model_id = selected_model_id
 
-    async def resolve_target_params(target_id: str | None, target_model: dict | None) -> dict:
+    async def resolve_target_params(target_id: str | None, target_model: dict | None) -> tuple[dict, dict, bool]:
         if target_id == resolved_model_id and resolved_model_params is not None:
-            base_params = resolved_model_params
+            target_base = resolved_model_params
+            bound_call = True
         elif getattr(request.state, 'direct', False):
-            base_params = default_model_params or {}
+            target_base = default_model_params or {}
+            bound_call = False
         else:
             target_info = await Models.get_model_by_id(target_id)
             target_model_info = (target_model or {}).get('info') or {}
@@ -2771,14 +2775,61 @@ async def process_chat_payload(
                 or (isinstance(target_model_info, dict) and target_model_info.get('user_id'))
             ):
                 raise RuntimeError(f'Could not resolve saved parameters for model {target_id}')
-            base_params = merge_model_params(
+            target_base = merge_model_params(
                 default_model_params or {},
                 target_info.params.model_dump() if target_info and target_info.params else {},
             )
-        return merge_model_params(base_params, request_params or {})
+            bound_call = False
+        return merge_model_params(target_base, request_params or {}), target_base, bound_call
 
     if resolved_model_params is not None or default_model_params is not None or request_params is not None:
-        form_data['params'] = await resolve_target_params(form_data.get('model'), model)
+        target_merged, target_base, bound_call = await resolve_target_params(form_data.get('model'), model)
+        form_data['params'] = target_merged
+
+        # Per-call control block: a NEW dict so fan-out columns never share the
+        # primary-derived metadata['params'] (chat.py's request.state merge and
+        # tools/compaction all read this block per call).
+        per_call_params = {
+            'stream_delta_chunk_size': target_merged.get('stream_delta_chunk_size'),
+            'reasoning_tags': target_merged.get('reasoning_tags'),
+            'compact_token_threshold': target_merged.get('compact_token_threshold'),
+            'function_calling': (
+                (request_params or {}).get('function_calling')
+                or target_base.get('function_calling')
+                or 'native'
+            ),
+            'tool_approval_mode': (
+                'full'
+                if forced_tool_approval_full
+                else (target_merged.get('tool_approval_mode') or 'full')
+            ),
+        }
+        # Reproduce main's per-key model-level wins: truthiness for
+        # stream_delta_chunk_size, presence for the other two.
+        if target_base.get('stream_delta_chunk_size'):
+            per_call_params['stream_delta_chunk_size'] = target_base['stream_delta_chunk_size']
+        if target_base.get('reasoning_tags') is not None:
+            per_call_params['reasoning_tags'] = target_base['reasoning_tags']
+        if target_base.get('compact_token_threshold') is not None:
+            per_call_params['compact_token_threshold'] = target_base['compact_token_threshold']
+        metadata['params'] = per_call_params
+
+        # Per-call stream surface from the caller prototype restored by main:
+        # the target's stream_response when configured, else the caller's own.
+        if target_base.get('stream_response') is not None:
+            form_data['stream'] = target_base['stream_response']
+        # A bound primary keeps the pre-swap custom model's capabilities
+        # (missing-base fallback); every other call reads its final target.
+        if bound_call and resolved_model_capabilities is not None:
+            capability_usage = resolved_model_capabilities.get('usage')
+        else:
+            capability_usage = (
+                ((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}
+            ).get('usage')
+        if not form_data.get('stream'):
+            form_data.pop('stream_options', None)
+        elif capability_usage:
+            form_data['stream_options'] = {**(form_data.get('stream_options') or {}), 'include_usage': True}
 
     # Captured before apply_params_to_form_data pops 'params'; feeds metadata['system_prompt'] below
     model_system_prompt = (form_data.get('params') or {}).get('system')
@@ -3450,7 +3501,7 @@ async def process_chat_payload(
     final_model_id = form_data.get('model')
     if final_model_id != params_model_id and not getattr(request.state, 'direct', False):
         final_model = request.app.state.MODELS.get(final_model_id)
-        final_model_params = await resolve_target_params(final_model_id, final_model)
+        final_model_params, _, _ = await resolve_target_params(final_model_id, final_model)
         model_system_prompt = final_model_params.get('system')
     resolved_model_system_prompt = await resolve_system_prompt(
         model_system_prompt,

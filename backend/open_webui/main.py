@@ -1165,6 +1165,15 @@ async def chat_completion(
         reasoning_tags = form_data.get('params', {}).get('reasoning_tags')
         compact_token_threshold = form_data.get('params', {}).get('compact_token_threshold')
 
+        # Caller's stream surface, stashed before the model-level override below.
+        # Kept in locals only: metadata would expose it to request.state and
+        # filter __metadata__; each fan-out column / sync call gets a fresh
+        # restore so middleware re-derives stream per target.
+        caller_has_stream = 'stream' in form_data
+        caller_stream = form_data.get('stream')
+        caller_has_stream_options = 'stream_options' in form_data
+        caller_stream_options = form_data.get('stream_options')
+
         # Model Params
         if model_info_params.get('stream_response') is not None:
             form_data['stream'] = model_info_params.get('stream_response')
@@ -1228,12 +1237,19 @@ async def chat_completion(
             tool_servers = None
 
         automation_id = form_data.pop('automation_id', None)
+        forced_by_context = bool(automation_id or chat_id.startswith('channel:'))
+        tool_permissions_enabled = (
+            False if forced_by_context else await Config.get('chat.tool_permissions.enable', False)
+        )
+        # Forced legs (automation / channel chat / feature off) pin 'full' for
+        # every column; per-call params only re-derive the non-forced case.
+        forced_tool_approval_full = forced_by_context or not tool_permissions_enabled
         tool_approval_mode = (
             'full'
-            if automation_id or chat_id.startswith('channel:')
+            if forced_by_context
             else (
                 form_data.get('params', {}).get('tool_approval_mode')
-                if await Config.get('chat.tool_permissions.enable', False)
+                if tool_permissions_enabled
                 else 'full'
             )
             or 'full'
@@ -1627,6 +1643,21 @@ async def chat_completion(
     resolved_params_model_id = fallback_model['id'] if fallback_model is not None else model_id
     bind_resolved_params = fallback_model is not None or model.get('owned_by') != 'arena'
 
+    def _restore_caller_stream(target: dict) -> dict:
+        if caller_has_stream:
+            target['stream'] = caller_stream
+        else:
+            target.pop('stream', None)
+        if caller_has_stream_options:
+            target['stream_options'] = (
+                {**caller_stream_options}
+                if isinstance(caller_stream_options, dict)
+                else caller_stream_options
+            )
+        else:
+            target.pop('stream_options', None)
+        return target
+
     async def process_chat(
         request,
         form_data,
@@ -1637,6 +1668,7 @@ async def chat_completion(
         *,
         resolved_model_id: str | None = None,
         resolved_model_params: dict | None = None,
+        resolved_model_capabilities: dict | None = None,
     ):
         try:
             form_data, metadata, events, compaction_state = await process_chat_payload(
@@ -1649,6 +1681,8 @@ async def chat_completion(
                 request_params=request_params,
                 resolved_model_id=resolved_model_id,
                 resolved_model_params=resolved_model_params,
+                resolved_model_capabilities=resolved_model_capabilities,
+                forced_tool_approval_full=forced_tool_approval_full,
             )
 
             if compaction_state.get('paused'):
@@ -1825,6 +1859,14 @@ async def chat_completion(
             if not assistant_message_id:
                 continue
 
+            # Primary is decided by ID match with the pre-swap requested model —
+            # never by fan-out position or message_id, and never for plain arena.
+            is_primary_call = bind_resolved_params and target_model_id == model_id
+            # Route the primary column through the missing-base fallback when
+            # one swapped in, so fan-out cannot undo the swap; siblings keep
+            # their explicitly selected target.
+            routed_model_id = resolved_params_model_id if is_primary_call else target_model_id
+
             # Per-model metadata: own message_id + model
             per_model_metadata = {
                 **metadata,
@@ -1832,19 +1874,17 @@ async def chat_completion(
                 'task_id': str(uuid4()),
             }
 
-            # Per-model form_data: own model
-            model_form_data = {
-                **form_data,
-                'model': target_model_id,
-                'metadata': per_model_metadata,
-            }
+            # Per-model form_data: own model + restored caller stream surface
+            model_form_data = _restore_caller_stream(
+                {
+                    **form_data,
+                    'model': routed_model_id,
+                    'metadata': per_model_metadata,
+                }
+            )
 
-            # Resolve the model object for this specific model
-            resolved_model = request.app.state.MODELS.get(target_model_id, model)
-
-            # Primary is decided by ID match with the pre-swap requested model —
-            # never by fan-out position, and never for plain arena requests.
-            is_primary_call = bind_resolved_params and target_model_id == model_id
+            # Resolve the model object for the routing target
+            resolved_model = request.app.state.MODELS.get(routed_model_id, model)
 
             # Only the first model runs chat-level background tasks;
             # subsequent models only run follow-ups.
@@ -1860,8 +1900,9 @@ async def chat_completion(
                     k: v for k, v in (tasks or {}).items() if k not in (TASKS.TITLE_GENERATION, TASKS.TAGS_GENERATION)
                 }
                 or None,
-                resolved_model_id=model_id if is_primary_call else None,
+                resolved_model_id=resolved_params_model_id if is_primary_call else None,
                 resolved_model_params=model_info_params if is_primary_call else None,
+                resolved_model_capabilities=model_capabilities if is_primary_call else None,
             )
             if is_internal:
                 subagent_results.append(await process)
@@ -1903,13 +1944,14 @@ async def chat_completion(
         metadata['message_id'] = message_ids[0]['message_id']
         return await process_chat(
             request,
-            form_data,
+            _restore_caller_stream(dict(form_data)),
             user,
             metadata,
             model,
             tasks,
             resolved_model_id=resolved_params_model_id if bind_resolved_params else None,
             resolved_model_params=model_info_params if bind_resolved_params else None,
+            resolved_model_capabilities=model_capabilities if bind_resolved_params else None,
         )
 
 
