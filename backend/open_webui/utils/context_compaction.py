@@ -1142,6 +1142,7 @@ async def compact_transient_provider_payload(
     checkpoint_output: list[dict] | None = None,
     checkpoint_carrier: dict | None = None,
     checkpoint_message_start: int | None = None,
+    projected_messages: list | None = None,
 ) -> dict:
     """Compact the provider payload and persist an in-turn cut when one is available."""
     messages = body.get('messages')
@@ -1151,7 +1152,17 @@ async def compact_transient_provider_payload(
     if not config['enable'] or metadata.get('task') == 'context_compaction' or body.get('previous_response_id'):
         return body
 
-    before = await asyncio.to_thread(estimate_provider_tokens, body)
+    system_messages, working = _split_leading_system_messages(messages)
+    projected_system, projected_working = _split_leading_system_messages(
+        projected_messages if isinstance(projected_messages, list) else messages
+    )
+    if len(projected_working) != len(working):
+        projected_system, projected_working = system_messages, working
+    projected_body = {
+        **body,
+        'messages': [*projected_system, *projected_working],
+    }
+    before = await asyncio.to_thread(estimate_provider_tokens, projected_body)
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
     if before <= threshold:
         return body
@@ -1165,6 +1176,13 @@ async def compact_transient_provider_payload(
     )
     if nested_checkpoint is not None:
         system_messages, compacted_messages, recent_messages, carrier_index = nested_checkpoint
+        working_start = len(compacted_messages)
+        projected_compacted = _without_boundary_marker(
+            projected_working[:working_start], keep_transient=True
+        )
+        projected_recent = _without_boundary_marker(
+            projected_working[working_start:], keep_transient=True
+        )
         event_emitter = None
         if metadata.get('chat_id') and metadata.get('message_id'):
             from open_webui.socket.main import get_event_emitter
@@ -1177,8 +1195,8 @@ async def compact_transient_provider_payload(
                 user,
                 model_id,
                 models,
-                _without_boundary_marker(compacted_messages, keep_transient=True),
-                _without_boundary_marker(recent_messages, keep_transient=True),
+                projected_compacted,
+                projected_recent,
                 state.get('previous_summary'),
                 config['prompt_template'],
                 config['transient_patterns'],
@@ -1193,6 +1211,9 @@ async def compact_transient_provider_payload(
                 carrier_index,
                 config['transient_patterns'],
             )
+            # The held identity must track the candidate actually returned to
+            # the provider; the projected copy below is estimation-only and its
+            # separate render must never become the held reference.
             summary_message = render_summary_message(summary, summary_meta)
             candidate = {
                 **body,
@@ -1202,7 +1223,15 @@ async def compact_transient_provider_payload(
                     *_without_boundary_marker(recent_messages, keep_transient=True),
                 ],
             }
-            after = await asyncio.to_thread(estimate_provider_tokens, candidate)
+            projected_candidate = {
+                **candidate,
+                'messages': [
+                    *projected_system,
+                    render_summary_message(summary, summary_meta),
+                    *projected_recent,
+                ],
+            }
+            after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
             if after > threshold:
                 raise RuntimeError(
                     'Context limit remains exceeded after preserving the latest completed tool round; '
@@ -1239,15 +1268,14 @@ async def compact_transient_provider_payload(
         await _emit_compaction_status(event_emitter, 'Context compacted', True)
         return candidate
 
-    system_messages, working = _split_leading_system_messages(messages)
     boundary = find_safe_compaction_boundary(
-        working,
+        projected_working,
         config['retention_percentage'],
         config['transient_patterns'],
         allow_tool_rounds=True,
     )
     largest = find_safe_compaction_boundary(
-        working,
+        projected_working,
         config['retention_percentage'],
         config['transient_patterns'],
         maximize=True,
@@ -1271,7 +1299,11 @@ async def compact_transient_provider_payload(
         compacted_body = None
         for candidate_boundary in boundaries:
             compacted_messages = _without_boundary_marker(
-                working[:candidate_boundary],
+                projected_working[:candidate_boundary],
+                keep_transient=True,
+            )
+            projected_recent = _without_boundary_marker(
+                projected_working[candidate_boundary:],
                 keep_transient=True,
             )
             recent_messages = _without_boundary_marker(working[candidate_boundary:], keep_transient=True)
@@ -1281,7 +1313,7 @@ async def compact_transient_provider_payload(
                 model_id,
                 models,
                 compacted_messages,
-                recent_messages,
+                projected_recent,
                 state.get('previous_summary'),
                 config['prompt_template'],
                 config['transient_patterns'],
@@ -1289,6 +1321,9 @@ async def compact_transient_provider_payload(
                 externalized_refs_enable=config.get('externalized_refs_enable', False),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
             )
+            # The held identity must track the candidate actually returned to
+            # the provider; the projected copy below is estimation-only and its
+            # separate render must never become the held reference.
             summary_message = render_summary_message(summary)
             candidate = {
                 **body,
@@ -1298,7 +1333,15 @@ async def compact_transient_provider_payload(
                     *recent_messages,
                 ],
             }
-            after = await asyncio.to_thread(estimate_provider_tokens, candidate)
+            projected_candidate = {
+                **candidate,
+                'messages': [
+                    *projected_system,
+                    render_summary_message(summary),
+                    *projected_recent,
+                ],
+            }
+            after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
             if after <= threshold:
                 compacted_body = candidate
                 break

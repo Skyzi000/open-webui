@@ -2479,13 +2479,16 @@ async def _capture_pre_filter_tool_refs(
     metadata: dict,
     state: dict,
     payload_tools: Any,
+    native: bool | None = None,
 ) -> list[dict] | None:
     messages = body.get('messages')
     config = state.get('config') or {}
     if (
         not isinstance(messages, list)
         or config.get('externalized_refs_enable') is not True
-        or not _can_install_externalized_ref_reader(metadata, payload_tools)
+        or not (
+            native if native is not None else _can_install_externalized_ref_reader(metadata, payload_tools)
+        )
         or not can_externalize_refs(body, native=True, registry={})
     ):
         return None
@@ -2527,6 +2530,7 @@ async def _compact_final_provider_payload(
     checkpoint_output: list[dict] | None = None,
     checkpoint_carrier: dict | None = None,
     checkpoint_message_start: int | None = None,
+    projected_messages: list | None = None,
 ) -> dict:
     prior_checkpoint = state.get('checkpoint_history')
     candidate = await compact_transient_provider_payload(
@@ -2540,6 +2544,7 @@ async def _compact_final_provider_payload(
         checkpoint_output=checkpoint_output,
         checkpoint_carrier=checkpoint_carrier,
         checkpoint_message_start=checkpoint_message_start,
+        projected_messages=projected_messages,
     )
     if state.get('checkpoint_history') is not prior_checkpoint:
         candidate = await apply_externalized_refs(candidate, state)
