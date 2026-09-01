@@ -434,7 +434,10 @@ async def externalize_refs(
     ):
         return False
     if not projections and history_entry is None and not seeds:
-        return False
+        # Stateful continuations carry no new externalizable content, but the
+        # trimmed body still needs the owned reader schema re-attached.
+        if reader is None or not body.get('previous_response_id'):
+            return False
     if not _projections_are_current(messages, projections):
         return False
 

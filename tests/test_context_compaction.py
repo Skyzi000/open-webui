@@ -686,7 +686,7 @@ def test_approved_tool_pair_appends_without_replacing_prepared_messages(monkeypa
             form_data,
             None,
             {'id': 'model'},
-            {'chat_id': 'chat', 'message_id': 'assistant', 'params': {}},
+            {'chat_id': 'chat', 'message_id': 'assistant', 'assistant_message_id': 'assistant', 'params': {}},
         )
     )
 
@@ -797,7 +797,12 @@ def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypat
 
     async def run():
         registry = {}
-        metadata = {'chat_id': 'chat', 'message_id': 'assistant', 'params': {}}
+        metadata = {
+            'chat_id': 'chat',
+            'message_id': 'assistant',
+            'assistant_message_id': 'assistant',
+            'params': {},
+        }
         state = {
             'externalized_refs': {
                 'enable': True,
@@ -881,13 +886,12 @@ def test_reader_installation_requires_the_core_native_dispatch_context():
     )
 
 
-def test_middleware_reapplies_externalized_refs_after_checkpoint_advance(monkeypatch):
+def test_middleware_compaction_passes_through_without_applying_refs(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     state = {}
 
     async def externalize(candidate, actual_state):
-        assert actual_state is state
-        return {**candidate, 'finalized': True}
+        raise AssertionError('compaction must not apply externalized refs itself')
 
     async def compact(*args, **_kwargs):
         assert args[-1] is state
@@ -896,11 +900,12 @@ def test_middleware_reapplies_externalized_refs_after_checkpoint_advance(monkeyp
 
     monkeypatch.setattr(middleware, 'apply_externalized_refs', externalize)
     monkeypatch.setattr(middleware, 'compact_transient_provider_payload', compact)
+    body = {'messages': []}
     result = asyncio.run(
         middleware._compact_final_provider_payload(
             None,
             None,
-            {'messages': []},
+            body,
             {},
             'model',
             {},
@@ -908,7 +913,8 @@ def test_middleware_reapplies_externalized_refs_after_checkpoint_advance(monkeyp
         )
     )
 
-    assert result['finalized'] is True
+    assert result is body
+    assert state['checkpoint_history'] is not None
 
 
 def test_arena_uses_selected_target_model_params_before_system_bypass(monkeypatch):
@@ -2728,7 +2734,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
             'params': {'tool_approval_mode': 'full'},
             'tools': tools,
         }
-        return {
+        ctx = {
             'request': SimpleNamespace(
                 state=SimpleNamespace(max_tool_call_iterations=5),
                 app=SimpleNamespace(state=SimpleNamespace(redis=None, MODELS={})),
@@ -2765,6 +2771,9 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
                 'externalized_refs': {'enable': False},
             },
         }
+        ctx['compaction_state']['canonical_body'] = ctx['form_data']
+        ctx['compaction_state']['last_send_body'] = ctx['form_data']
+        return ctx
 
     real_compact = middleware._compact_final_provider_payload
 
@@ -2873,3 +2882,1538 @@ def test_transient_messages_use_core_provenance_before_regex_fallback():
     )
     assert compaction._is_transient_message({'role': 'user', 'content': '  injected:value'}, patterns)
     assert not compaction._is_transient_message({'role': 'user', 'content': 'ordinary'}, patterns)
+
+
+# ---- v0.11.3 merge: canonical/send split, send copies, and ref apply contracts ----
+
+
+def _payload_leg_patches(monkeypatch, middleware, *, request_filter=None, refs_runtime=None):
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def config_get(_key, default=None):
+        return default
+
+    async def pipeline_inlet(_request, form_data, _user, _models):
+        return form_data
+
+    async def url_images(form_data, user=None):
+        return form_data
+
+    async def system_prompt(*_args, **_kwargs):
+        return None
+
+    def apply_params(form_data, _model):
+        return form_data
+
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', pipeline_inlet)
+    monkeypatch.setattr(middleware, 'convert_url_images_to_base64', url_images)
+    monkeypatch.setattr(middleware, 'resolve_system_prompt', system_prompt)
+    monkeypatch.setattr(middleware, 'apply_params_to_form_data', apply_params)
+    monkeypatch.setattr(middleware, 'get_event_emitter', noop)
+    monkeypatch.setattr(middleware, 'get_event_call', noop)
+    monkeypatch.setattr(middleware, 'get_system_oauth_token', noop)
+    monkeypatch.setattr(middleware, 'get_task_model_id', lambda model_id, *args, **kwargs: model_id)
+    if refs_runtime is not None:
+        async def runtime():
+            return refs_runtime
+
+        monkeypatch.setattr(middleware, '_runtime_externalized_refs_config', runtime)
+    if request_filter is not None:
+        async def process(**kwargs):
+            if kwargs.get('filter_type') == 'request' and kwargs.get('filter_functions'):
+                return await kwargs['filter_functions'][0](
+                    body=kwargs['form_data'],
+                    __metadata__=kwargs.get('extra_params', {}).get('__metadata__'),
+                ), {}
+            return kwargs['form_data'], {}
+
+        async def get_filters(*_args, **_kwargs):
+            return [request_filter]
+
+        monkeypatch.setattr(middleware, 'process_filter_functions', process)
+        monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+        monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+
+
+def _payload_leg_drain(monkeypatch, middleware, stored, tool_result=None, stub_execute=True):
+    async def get_message(_chat_id, _message_id):
+        return stored
+
+    async def get_events(_metadata):
+        return None, None
+
+    async def upsert(*_args, **_kwargs):
+        return stored
+
+    async def execute(*_args, **_kwargs):
+        return tool_result or {'tool_call_id': 'call-1', 'content': 'result'}
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr(middleware, 'get_event_emitter_and_caller', get_events)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
+    if stub_execute:
+        monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+
+
+def _seed_state_on_capture(monkeypatch, middleware, seed):
+    real = middleware._capture_pre_filter_tool_refs
+
+    async def wrapper(body, metadata, state, payload_tools, native=None):
+        # Seed once: pass 2 must observe the held that pass 1 left behind
+        # (rolled back or not), not a fresh reseed.
+        if 'summary_message_content' not in state:
+            for key, value in seed.items():
+                state[key] = value
+        return await real(body, metadata, state, payload_tools, native=native)
+
+    monkeypatch.setattr(middleware, '_capture_pre_filter_tool_refs', wrapper)
+
+
+def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None):
+    request = SimpleNamespace(
+        state=SimpleNamespace(direct=False),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)),
+    )
+    metadata = {
+        'chat_id': 'chat',
+        'params': params or {},
+        'features': {},
+    }
+    if message_id is not None:
+        metadata['message_id'] = message_id
+    if assistant_message_id is not None:
+        metadata['assistant_message_id'] = assistant_message_id
+    if seeded_metadata:
+        metadata.update(seeded_metadata)
+    form_data = {
+        'model': 'model',
+        'stream': True,
+        'messages': messages,
+        'metadata': metadata,
+    }
+    if form_tool_ids is not None:
+        form_data['tool_ids'] = form_tool_ids
+    model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': False}}}}
+    return middleware.process_chat_payload(request, form_data, None, metadata, model)
+
+
+def _approved_stored():
+    return {
+        'output': [
+            {
+                'type': 'function_call',
+                'call_id': 'call-1',
+                'name': 'lookup',
+                'arguments': '{}',
+                'status': 'queued',
+                'approved': True,
+            }
+        ]
+    }
+
+
+def test_payload_send_carries_filter_marker_and_canonical_stays_clean(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    calls = []
+
+    async def marker_filter(body, __metadata__=None):
+        calls.append(copy.deepcopy(body['messages']))
+        messages = body['messages']
+        messages[-1]['content'] = messages[-1].get('content', '') + '|MARK|'
+        return body
+
+    _payload_leg_patches(monkeypatch, middleware, request_filter=marker_filter, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    messages = [{'role': 'user', 'content': 'start'}]
+
+    send, _metadata, _events, state = asyncio.run(_run_payload_leg(middleware, copy.deepcopy(messages)))
+
+    assert send['messages'][-1]['content'] == 'start|MARK|'
+    assert state['canonical_body']['messages'] == messages
+    assert state['last_send_body'] is send
+    assert state['canonical_body'] is not send
+    assert len(calls) == 1
+
+
+def test_paused_rollback_restores_ref_apply_state(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    history = refs.make_ref_entry('history summary', kind='history')
+    assert history is not None
+    held = compaction.render_summary_message('summary text')['content']
+    sentinel_tools = {'pre': {'spec': {'name': 'pre'}}}
+    stored = {
+        'output': [
+            {
+                'type': 'function_call',
+                'call_id': 'call-1',
+                'name': 'lookup',
+                'arguments': '{}',
+                'status': 'queued',
+            }
+        ]
+    }
+
+    async def marker_filter(body, __metadata__=None):
+        # Touch only the opening user message: the held summary message must
+        # keep its content identity so apply can mint and rollback can undo.
+        first = body['messages'][0]
+        first['content'] = first.get('content', '') + '|MARK|'
+        return body
+
+    _payload_leg_patches(monkeypatch, middleware, request_filter=marker_filter, refs_runtime=(True, 2))
+    _payload_leg_drain(monkeypatch, middleware, stored)
+    _seed_state_on_capture(
+        monkeypatch,
+        middleware,
+        {'selected_history': history, 'summary_message_content': held},
+    )
+    messages = [
+        {'role': 'user', 'content': 'start'},
+        {'role': 'user', 'content': held},
+    ]
+
+    returned, metadata, _events, state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            messages,
+            params={'tool_approval_mode': 'ask'},
+            seeded_metadata={'tools': sentinel_tools},
+        )
+    )
+
+    assert state['paused'] is True
+    assert all('<history_ref>' not in message.get('content', '') for message in returned['messages'])
+    assert all('|MARK|' not in message.get('content', '') for message in returned['messages'])
+    assert state['summary_message_content'] is held
+    assert state['externalized_refs']['registry'] == {}
+    assert metadata['tools'] is sentinel_tools
+    assert 'canonical_body' not in state
+    assert 'last_send_body' not in state
+
+
+def test_resume_transforms_each_send_copy_once(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    seen = []
+
+    async def needle_filter(body, __metadata__=None):
+        first = body['messages'][0]
+        seen.append(first['content'])
+        first['content'] = first['content'].replace('NEEDLE', 'DONE', 1)
+        return body
+
+    _payload_leg_patches(monkeypatch, middleware, request_filter=needle_filter, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+
+    send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'NEEDLE NEEDLE'}])
+    )
+
+    assert seen == ['NEEDLE NEEDLE', 'NEEDLE NEEDLE']
+    assert send['messages'][0]['content'] == 'DONE NEEDLE'
+    assert state['canonical_body']['messages'][0]['content'] == 'NEEDLE NEEDLE'
+
+
+def test_approved_pass2_mint_reflects_into_canonical(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    history = refs.make_ref_entry('history summary', kind='history')
+    assert history is not None
+    held = compaction.render_summary_message('summary text')['content']
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    _seed_state_on_capture(
+        monkeypatch,
+        middleware,
+        {'selected_history': history, 'summary_message_content': held},
+    )
+    messages = [
+        {'role': 'user', 'content': 'question'},
+        {'role': 'user', 'content': held},
+    ]
+
+    send, _metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+
+    canonical_held = next(
+        message for message in state['canonical_body']['messages'] if '<auto_compaction_context>' in message['content']
+    )
+    assert '<history_ref>' in canonical_held['content']
+    assert canonical_held['content'] is state['summary_message_content']
+    assert '<history_ref>' in send['messages'][1]['content']
+    registry = state['externalized_refs']['registry']
+    assert refs.REF_EXEC_TOOL_NAME in registry
+
+
+def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'filtered tool output ' + 'x' * 200
+    calls = []
+
+    async def deleting_filter(body, __metadata__=None):
+        calls.append(len(body['messages']))
+        if len(calls) == 1:
+            return body
+        kept = [message for message in body['messages'] if message.get('role') != 'tool']
+        return {**body, 'messages': kept}
+
+    _payload_leg_patches(monkeypatch, middleware, request_filter=deleting_filter, refs_runtime=(True, 2))
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    messages = [
+        {'role': 'user', 'content': 'question'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+                {
+                    'id': 'old-call',
+                    'type': 'function',
+                    'function': {'name': 'lookup', 'arguments': '{}'},
+                }
+            ],
+        },
+        {'role': 'tool', 'tool_call_id': 'old-call', 'content': big},
+    ]
+
+    send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+
+    entry = refs.make_ref_entry(big, kind='tool')
+    assert entry is not None
+    registry = state['externalized_refs']['registry']
+    assert refs.REF_EXEC_TOOL_NAME not in registry
+    assert 'tools' not in metadata
+    assert all(message.get('role') != 'tool' for message in send['messages'])
+    assert state['canonical_body']['messages'][2]['content'] is big
+
+
+def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    history = refs.make_ref_entry('history summary', kind='history')
+    assert history is not None
+    held = compaction.render_summary_message('summary text')['content']
+    sentinel = {'sentinel': {'spec': {'name': 'sentinel'}}}
+    calls = []
+
+    async def sentinel_filter(body, __metadata__=None):
+        calls.append(1)
+        if len(calls) == 1:
+            __metadata__['tools'] = sentinel
+            return body
+        kept = [
+            message
+            for message in body['messages']
+            if message.get('role') != 'tool' and message.get('content') is not held
+        ]
+        return {**body, 'messages': kept}
+
+    _payload_leg_patches(monkeypatch, middleware, request_filter=sentinel_filter, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    _seed_state_on_capture(
+        monkeypatch,
+        middleware,
+        {'selected_history': history, 'summary_message_content': held},
+    )
+    messages = [
+        {'role': 'user', 'content': 'question'},
+        {'role': 'user', 'content': held},
+    ]
+
+    _send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+
+    assert metadata['tools'] == sentinel
+    assert refs.REF_EXEC_TOOL_NAME not in state['externalized_refs']['registry']
+    assert state['summary_message_content'] is held
+
+
+def test_projected_view_prevents_false_context_limit(monkeypatch):
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'tool output ' + 'x' * 500
+    messages = [
+        {'role': 'user', 'content': 'question'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+                {'id': 't1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}
+            ],
+        },
+        {'role': 'tool', 'tool_call_id': 't1', 'content': big},
+    ]
+    entry = refs.make_ref_entry(big, kind='tool')
+    assert entry is not None
+    projected_messages = [message for message in messages]
+    projected_messages[2] = {**projected_messages[2], 'content': entry.ref}
+
+    def estimate(body):
+        return sum(
+            len(message.get('content')) if isinstance(message.get('content'), str) else 0
+            for message in body['messages']
+        )
+
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 10_000,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'transient_patterns': (),
+            'soft_trigger_ratio': 0,
+        }
+    }
+    body = {'messages': messages}
+
+    result = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            body,
+            {},
+            'model',
+            {},
+            state,
+            projected_messages=projected_messages,
+        )
+    )
+
+    assert result is body
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            compaction.compact_transient_provider_payload(
+                None,
+                None,
+                {'messages': copy.deepcopy(messages)},
+                {},
+                'model',
+                {},
+                {'config': dict(state['config'])},
+                projected_messages=None,
+            )
+        )
+
+
+def test_round0_non_native_disables_continuation_capture():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    big = 'x' * 200
+    state = {
+        'config': {'externalized_refs_enable': True, 'externalized_refs_token_threshold': 1},
+        'externalized_refs': {'native': False},
+    }
+    body = {
+        'stream': True,
+        'messages': [
+            {'role': 'user', 'content': 'question'},
+            {'role': 'tool', 'tool_call_id': 't1', 'content': big},
+        ],
+    }
+    metadata = {'chat_id': 'chat', 'message_id': 'message', 'params': {}}
+
+    gated = asyncio.run(
+        middleware._capture_pre_filter_tool_refs(body, metadata, state, payload_tools=None, native=False)
+    )
+
+    assert gated is None
+    assert 'tool_ref_entries' not in state
+
+    unrestricted = asyncio.run(
+        middleware._capture_pre_filter_tool_refs(body, metadata, state, payload_tools=None)
+    )
+
+    assert unrestricted is not None and unrestricted is not body['messages']
+
+
+def test_gate_skipped_apply_with_lingering_history_is_safe():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    history = refs.make_ref_entry('history summary', kind='history')
+    assert history is not None
+    held = compaction.render_summary_message('summary text')['content']
+    registry = {}
+    state = {
+        'selected_history': history,
+        'summary_message_content': held,
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 2,
+            'registry': registry,
+            'metadata': {},
+        },
+    }
+    body = {'stream': False, 'messages': [{'role': 'user', 'content': held}]}
+
+    result = asyncio.run(middleware.apply_externalized_refs(body, state))
+
+    assert result is body
+    assert '<history_ref>' not in result['messages'][0]['content']
+    assert registry == {}
+
+
+def test_round1_install_failure_preserves_marker_and_held():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    history = refs.make_ref_entry('history summary', kind='history')
+    assert history is not None
+    held = compaction.render_summary_message('summary text')['content']
+    registry = {}
+    state = {
+        'selected_history': history,
+        'summary_message_content': held,
+        'externalized_refs': {
+            'enable': True,
+            'native': True,
+            'threshold': 2,
+            'registry': registry,
+            'metadata': {},
+        },
+    }
+    body = {'stream': True, 'messages': [{'role': 'user', 'content': held}]}
+
+    minted = asyncio.run(middleware.apply_externalized_refs(body, state))
+
+    assert minted is not body or minted['messages'][0]['content'] is not held
+    assert '<history_ref>' in minted['messages'][0]['content']
+    assert state['summary_message_content'] is minted['messages'][0]['content']
+    held_after_round0 = state['summary_message_content']
+
+    # Round 1: a same-name foreign tool occupies the registry, killing install.
+    registry[refs.REF_EXEC_TOOL_NAME] = {
+        'spec': {'name': refs.REF_EXEC_TOOL_NAME, 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': lambda: None,
+    }
+    body_round1 = {'stream': True, 'messages': [{'role': 'user', 'content': held_after_round0}]}
+
+    result = asyncio.run(middleware.apply_externalized_refs(body_round1, state))
+
+    assert result is body_round1
+    assert result['messages'][0]['content'] is held_after_round0
+    assert '<history_ref>' in result['messages'][0]['content']
+    assert state['summary_message_content'] is held_after_round0
+
+
+def test_send_copy_isolates_top_level_containers():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    body = {
+        'model': 'model',
+        'metadata': {'shared': True},
+        'tools': [{'function': {'spec': {'kept': [1]}}}],
+        'files': [{'data': {'blob': [2]}}],
+        'stream_options': {'include_usage': True, 'nested': {'items': [3]}},
+        'custom_params': {'params': {'deep': [4]}},
+        'messages': [{'role': 'user', 'content': 'original'}],
+    }
+
+    send = middleware._send_copy(body)
+
+    send['tools'][0]['function']['spec']['kept'].append(9)
+    send['files'][0]['data']['blob'].append(9)
+    send['stream_options']['nested']['items'].append(9)
+    send['custom_params']['params']['deep'].append(9)
+    send['messages'][0]['content'] = 'changed'
+
+    assert body['tools'][0]['function']['spec']['kept'] == [1]
+    assert body['files'][0]['data']['blob'] == [2]
+    assert body['stream_options']['nested']['items'] == [3]
+    assert body['custom_params']['params']['deep'] == [4]
+    assert body['messages'][0]['content'] == 'original'
+    assert send['metadata'] is body['metadata']
+
+
+def test_send_copy_keeps_metadata_shared():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    client = object()
+    metadata = {'mcp_clients': [client], 'tools': {}}
+
+    send = middleware._send_copy({'metadata': metadata, 'messages': []})
+
+    assert send['metadata'] is metadata
+    assert send['metadata']['mcp_clients'][0] is client
+
+
+def test_commit_walk_reflects_mint_by_content_identity():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    prev_held = 'held-before'
+    state = {'summary_message_content': 'held-after'}
+    canonical = {
+        'messages': [
+            {'role': 'assistant', 'content': 'unrelated'},
+            {'role': 'user', 'content': prev_held},
+        ]
+    }
+
+    middleware._commit_walk_held(canonical, prev_held, state)
+
+    assert canonical['messages'][1]['content'] is state['summary_message_content']
+    assert canonical['messages'][0]['content'] == 'unrelated'
+
+
+def test_commit_walk_restores_held_when_identity_not_unique(caplog):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    prev_held = 'held-before'
+    state = {'summary_message_content': 'held-after'}
+    canonical = {
+        'messages': [
+            {'role': 'user', 'content': prev_held},
+            {'role': 'user', 'content': prev_held},
+        ]
+    }
+
+    with caplog.at_level(logging.ERROR):
+        middleware._commit_walk_held(canonical, prev_held, state)
+
+    assert canonical['messages'][0]['content'] is prev_held
+    assert canonical['messages'][1]['content'] is prev_held
+    assert state['summary_message_content'] is prev_held
+    assert 'restored previous held reference' in caplog.text
+
+
+def test_commit_walk_restores_held_without_match(caplog):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    state = {'summary_message_content': 'held-after'}
+    canonical = {'messages': [{'role': 'user', 'content': 'unrelated'}]}
+
+    with caplog.at_level(logging.ERROR):
+        middleware._commit_walk_held(canonical, 'held-before', state)
+
+    assert canonical['messages'][0]['content'] == 'unrelated'
+    assert state['summary_message_content'] == 'held-before'
+    assert 'restored previous held reference' in caplog.text
+
+
+def test_rollback_spares_same_name_user_tool():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    user_tool = {
+        'spec': {'name': refs.REF_EXEC_TOOL_NAME, 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': lambda: None,
+    }
+    registry = {refs.REF_EXEC_TOOL_NAME: user_tool}
+    metadata = {'tools': {'reader': True}}
+    state = {
+        'summary_message_content': 'held-after',
+        'externalized_refs': {'enable': True, 'registry': registry, 'metadata': metadata},
+    }
+    snapshot = {'held': 'held-before', 'reader': middleware._ABSENT, 'tools': metadata['tools']}
+
+    middleware._rollback_ref_apply_state(state, snapshot)
+
+    assert registry[refs.REF_EXEC_TOOL_NAME] is user_tool
+    assert metadata['tools'] == {'reader': True}
+    assert state['summary_message_content'] == 'held-before'
+
+
+def test_rollback_restores_previous_owned_reader():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    previous = {'spec': refs.REF_EXEC_FUNCTION_SPEC, 'callable': object()}
+    registry = {refs.REF_EXEC_TOOL_NAME: {'spec': refs.REF_EXEC_FUNCTION_SPEC, 'callable': object()}}
+    state = {
+        'summary_message_content': 'held-after',
+        'externalized_refs': {'enable': True, 'registry': registry, 'metadata': {}},
+    }
+    snapshot = {'held': 'held-before', 'reader': previous, 'tools': {'kept': True}}
+
+    middleware._rollback_ref_apply_state(state, snapshot)
+
+    assert registry[refs.REF_EXEC_TOOL_NAME] is previous
+    assert state['externalized_refs']['metadata']['tools'] == {'kept': True}
+    assert state['summary_message_content'] == 'held-before'
+
+
+def _stream_leg_patches(monkeypatch, middleware, *, replies, tools, request_filter=None):
+    current = {'replies': list(replies), 'sent': [], 'filter_inputs': []}
+
+    def response(delta):
+        async def chunks():
+            yield f'data: {middleware.JSONCodec.dumps(delta)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    def tool_response(call_id, name):
+        return response(
+            {
+                'choices': [
+                    {
+                        'delta': {
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'id': call_id,
+                                    'type': 'function',
+                                    'function': {'name': name, 'arguments': '{}'},
+                                }
+                            ]
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ]
+            }
+        )
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def config_get(_key, default=None):
+        return default
+
+    async def rag(_template, context, prompt):
+        return f'RAG[{context}]PROMPT[{prompt}]'
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'FOLDED'
+
+    async def generate(_request, candidate, _user, **_kwargs):
+        current['sent'].append(copy.deepcopy(candidate))
+        return current['replies'].pop(0)
+
+    async def process_result(_request, _name, result, *_args):
+        return result, [], []
+
+    monkeypatch.setattr(middleware, 'generate_chat_completion', generate)
+    monkeypatch.setattr(middleware, 'process_tool_result', process_result)
+    monkeypatch.setattr(middleware, 'get_citation_source_from_tool_result', lambda tool_name, **_kwargs: [])
+    monkeypatch.setattr(middleware, 'rag_template', rag)
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
+    monkeypatch.setattr(middleware, 'get_system_oauth_token', noop)
+    monkeypatch.setattr(middleware, 'outlet_filter_handler', noop)
+    monkeypatch.setattr(middleware, 'background_tasks_handler', noop)
+    monkeypatch.setattr(middleware, 'clear_response_stream', noop)
+    monkeypatch.setattr(middleware, 'save_response_stream', noop)
+    monkeypatch.setattr(middleware, 'publish_chat_finished_event', noop)
+    async def upsert(*_args, **_kwargs):
+        return {}
+
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
+    async def title(_chat_id):
+        return ''
+
+    monkeypatch.setattr(middleware.Chats, 'get_chat_title_by_id', title)
+    monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_STATEFUL', False)
+    monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    socket_main = importlib.import_module('open_webui.socket.main')
+    monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
+    if request_filter is not None:
+        async def process(**kwargs):
+            if kwargs.get('filter_type') == 'request' and kwargs.get('filter_functions'):
+                current['filter_inputs'].append(copy.deepcopy(kwargs['form_data']['messages']))
+                return await kwargs['filter_functions'][0](body=kwargs['form_data']), {}
+            return kwargs['form_data'], {}
+
+        async def get_filters(*_args, **_kwargs):
+            return [request_filter]
+
+        monkeypatch.setattr(middleware, 'process_filter_functions', process)
+        monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+        monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+
+    current['tool_response'] = tool_response
+    current['text_response'] = lambda text: response(
+        {'choices': [{'delta': {'content': text}, 'finish_reason': 'stop'}]}
+    )
+    return current
+
+
+def _stream_leg_ctx(metadata, *, compaction_enabled, refs=None, estimate=None):
+    compaction_state = {
+        'config': {
+            'enable': compaction_enabled,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': refs is not None,
+            'externalized_refs_token_threshold': 2,
+        },
+        'checkpoint_messages': [
+            {'id': 'user', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': refs or {'enable': False},
+    }
+    form_data = {
+        'model': 'model',
+        'stream': True,
+        'messages': [{'role': 'user', 'content': 'start'}],
+        'metadata': metadata,
+    }
+    ctx = {
+        'request': SimpleNamespace(
+            state=SimpleNamespace(max_tool_call_iterations=5),
+            app=SimpleNamespace(state=SimpleNamespace(redis=None, MODELS={})),
+        ),
+        'form_data': form_data,
+        'user': SimpleNamespace(),
+        'model': {
+            'id': 'model',
+            'info': {'meta': {'capabilities': {'citations': False, 'file_context': False}}},
+        },
+        'metadata': metadata,
+        'events': [],
+        'tasks': {},
+        'event_emitter': lambda *a, **k: _noop_async(),
+        'event_caller': None,
+        'compaction_state': compaction_state,
+    }
+    ctx['compaction_state']['canonical_body'] = form_data
+    ctx['compaction_state']['last_send_body'] = form_data
+    return ctx
+
+
+async def _noop_async():
+    return None
+
+
+def _plain_tools(view_result='result-a', fetch_result='result-b'):
+    tools_module = importlib.import_module('open_webui.utils.tools')
+
+    def spec(name):
+        return {'name': name, 'parameters': {'type': 'object', 'properties': {}}}
+
+    async def view_file():
+        return view_result
+
+    async def fetch_url():
+        return fetch_result
+
+    return {
+        name: {'spec': spec(name), 'callable': callable_}
+        for name, callable_ in (
+            (
+                'view_file',
+                asyncio.run(
+                    tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})
+                ),
+            ),
+            (
+                'fetch_url',
+                asyncio.run(
+                    tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})
+                ),
+            ),
+        )
+    }
+
+
+def _marker_count(messages):
+    return sum(
+        message.get('content', '').count('|MARK|')
+        for message in messages
+        if isinstance(message.get('content'), str)
+    )
+
+
+def test_continuation_rounds_keep_canonical_clean_and_marker_once(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+
+    async def marker_filter(body):
+        messages = body['messages']
+        messages[-1]['content'] = messages[-1].get('content', '') + '|MARK|'
+        return body
+
+    tools = _plain_tools()
+    current = _stream_leg_patches(
+        monkeypatch,
+        middleware,
+        replies=[],
+        tools=tools,
+        request_filter=marker_filter,
+    )
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    assert len(current['sent']) == 2
+    for sent in current['sent']:
+        assert _marker_count(sent['messages']) == 1
+    assert len(current['filter_inputs']) == 2
+    for messages in current['filter_inputs']:
+        assert _marker_count(messages) == 0
+    assert _marker_count(ctx['compaction_state']['canonical_body']['messages']) == 0
+
+
+@pytest.mark.parametrize('advanced', [True, False])
+def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch, advanced):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'raw output ' + 'y' * 100
+    entry = refs.make_ref_entry(big, kind='tool')
+    assert entry is not None
+    seen = []
+
+    async def deleting_filter(body):
+        contents = [
+            message.get('content') for message in body['messages'] if isinstance(message.get('content'), str)
+        ]
+        seen.append(list(contents))
+        kept = [message for message in body['messages'] if message.get('role') != 'tool']
+        return {**body, 'messages': kept}
+
+    tools = _plain_tools(view_result=big, fetch_result='result-b')
+    current = _stream_leg_patches(
+        monkeypatch,
+        middleware,
+        replies=[],
+        tools=tools,
+        request_filter=deleting_filter,
+    )
+    current['replies'] = [current['text_response']('done')]
+
+    def estimate(body):
+        return (
+            20
+            if any(
+                isinstance(message.get('content'), str)
+                and message['content'].startswith('<auto_compaction_context>')
+                for message in body['messages']
+            )
+            else 120
+        )
+
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    registry = {}
+    state_refs = {
+        'enable': True,
+        'native': True,
+        'threshold': 2,
+        'registry': registry,
+        'metadata': metadata,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=advanced, refs=state_refs)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    assert seen and any(big in contents for contents in seen)
+    assert not any(entry.ref in contents for contents in seen)
+    if advanced:
+        assert ctx['compaction_state'].get('compacted') is True
+        assert refs.REF_EXEC_TOOL_NAME in registry
+        catalog = registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
+        assert entry.ref not in catalog
+    else:
+        assert refs.REF_EXEC_TOOL_NAME not in registry
+    for sent in current['sent']:
+        assert all(message.get('role') != 'tool' for message in sent['messages'])
+
+
+def test_zero_filter_continuation_bodies_match_fixed_shape(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    tools = _plain_tools()
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    first_round = [
+        {'role': 'user', 'content': 'start'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+                {
+                    'id': 'call-a',
+                    'type': 'function',
+                    'function': {'name': 'view_file', 'arguments': '{}'},
+                }
+            ],
+        },
+        {'role': 'tool', 'tool_call_id': 'call-a', 'content': 'result-a'},
+    ]
+    second_round = [
+        *first_round,
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+                {
+                    'id': 'call-b',
+                    'type': 'function',
+                    'function': {'name': 'fetch_url', 'arguments': '{}'},
+                }
+            ],
+        },
+        {'role': 'tool', 'tool_call_id': 'call-b', 'content': 'result-b'},
+    ]
+    assert len(current['sent']) == 2
+    assert current['sent'][0]['messages'] == first_round
+    assert current['sent'][1]['messages'] == second_round
+    for sent in current['sent']:
+        assert sent['model'] == 'model'
+        assert sent['stream'] is True
+        assert 'previous_response_id' not in sent
+        assert sent['metadata'] == metadata
+
+
+def test_tool_messages_param_sees_sent_view(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    seen_views = []
+
+    async def marker_filter(body):
+        messages = body['messages']
+        messages[-1]['content'] = messages[-1].get('content', '') + '|MARK|'
+        return body
+
+    tools_module = importlib.import_module('open_webui.utils.tools')
+
+    def spec(name):
+        return {'name': name, 'parameters': {'type': 'object', 'properties': {}}}
+
+    async def view_file():
+        return 'result-a'
+
+    async def fetch_url(__messages__=None):
+        if __messages__ is not None:
+            seen_views.append(__messages__)
+        return 'result-b'
+
+    tools = {
+        'view_file': {
+            'spec': spec('view_file'),
+            'callable': asyncio.run(
+                tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})
+            ),
+        },
+        'fetch_url': {
+            'spec': spec('fetch_url'),
+            'callable': asyncio.run(
+                tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})
+            ),
+        },
+    }
+    current = _stream_leg_patches(
+        monkeypatch,
+        middleware,
+        replies=[],
+        tools=tools,
+        request_filter=marker_filter,
+    )
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    assert seen_views
+    last_tool_contents = [
+        message.get('content')
+        for message in seen_views[-1]
+        if message.get('role') == 'tool' and isinstance(message.get('content'), str)
+    ]
+    assert 'result-a|MARK|' in last_tool_contents
+
+
+def _owned_reader_registry(refs, text):
+    registry = {}
+    body = {
+        'stream': True,
+        'messages': [{'role': 'tool', 'tool_call_id': 't0', 'content': text}],
+    }
+    installed = asyncio.run(
+        refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=5,
+            count_tokens=lambda value: max(1, len(value) // 10),
+        )
+    )
+    assert installed
+    return registry
+
+
+def test_stateful_continuation_reattaches_reader_schema():
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    registry = _owned_reader_registry(refs, 'r' * 100)
+    reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
+    catalog = reader.__externalized_ref_catalog__
+    entries_before = dict(catalog)
+    body = {
+        'stream': True,
+        'previous_response_id': 'resp_1',
+        'messages': [{'role': 'tool', 'tool_call_id': 't1', 'content': 'tiny'}],
+    }
+
+    result = asyncio.run(
+        refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=5,
+            count_tokens=lambda value: max(1, len(value) // 10),
+        )
+    )
+
+    assert result is True
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'] is reader
+    assert reader.__externalized_ref_catalog__ is catalog
+    assert catalog == entries_before
+    assert body['messages'][0]['content'] == 'tiny'
+    assert any(
+        isinstance(tool, dict) and (tool.get('function') or {}).get('name') == refs.REF_EXEC_TOOL_NAME
+        for tool in body['tools']
+    )
+
+
+def test_stateful_reattach_requires_native():
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    registry = _owned_reader_registry(refs, 'r' * 100)
+    body = {
+        'stream': True,
+        'previous_response_id': 'resp_1',
+        'messages': [{'role': 'tool', 'tool_call_id': 't1', 'content': 'tiny'}],
+    }
+
+    result = asyncio.run(
+        refs.externalize_refs(
+            body,
+            registry,
+            native=False,
+            threshold_tokens=5,
+            count_tokens=lambda value: max(1, len(value) // 10),
+        )
+    )
+
+    assert result is False
+    assert 'tools' not in body
+
+
+def test_stateful_reattach_requires_selectable_reader():
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    registry = _owned_reader_registry(refs, 'r' * 100)
+    body = {
+        'stream': True,
+        'tool_choice': 'none',
+        'previous_response_id': 'resp_1',
+        'messages': [{'role': 'tool', 'tool_call_id': 't1', 'content': 'tiny'}],
+    }
+
+    result = asyncio.run(
+        refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=5,
+            count_tokens=lambda value: max(1, len(value) // 10),
+        )
+    )
+
+    assert result is False
+    assert 'tools' not in body
+
+
+def test_stateful_reattach_rejects_foreign_reader_slot():
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    registry = {
+        refs.REF_EXEC_TOOL_NAME: {
+            'spec': {'name': refs.REF_EXEC_TOOL_NAME, 'parameters': {'type': 'object', 'properties': {}}},
+            'callable': lambda: None,
+        }
+    }
+    body = {
+        'stream': True,
+        'previous_response_id': 'resp_1',
+        'messages': [{'role': 'tool', 'tool_call_id': 't1', 'content': 'tiny'}],
+    }
+
+    result = asyncio.run(
+        refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=5,
+            count_tokens=lambda value: max(1, len(value) // 10),
+        )
+    )
+
+    assert result is False
+    assert 'tools' not in body
+
+
+def test_stateful_two_round_continuation_keeps_reader(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'stateful big output ' + 's' * 600
+    entry = refs.make_ref_entry(big, kind='tool')
+    assert entry is not None
+    tools = _plain_tools(view_result=big, fetch_result='small result')
+
+    def responses_round(call_id, name, response_id):
+        payload = {
+            'type': 'response.completed',
+            'response': {
+                'id': response_id,
+                'output': [
+                    {
+                        'type': 'function_call',
+                        'id': f'fc-{call_id}',
+                        'call_id': call_id,
+                        'name': name,
+                        'arguments': '{}',
+                        'status': 'completed',
+                    }
+                ],
+            },
+        }
+
+        async def chunks():
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    def final_completed():
+        payload = {'type': 'response.completed', 'response': {'id': 'resp-final', 'output': []}}
+
+        async def chunks():
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_STATEFUL', True)
+    current['replies'] = [
+        responses_round('call-b', 'fetch_url', 'resp-2'),
+        final_completed(),
+    ]
+    registry = dict(tools)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': registry,
+    }
+    state_refs = {
+        'enable': True,
+        'native': True,
+        'threshold': 100,
+        'registry': registry,
+        'metadata': metadata,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False, refs=state_refs)
+    # Only the large round-1 result may be classified; tiny results must stay raw.
+    ctx['compaction_state']['config']['externalized_refs_token_threshold'] = 10_000
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            responses_round('call-a', 'view_file', 'resp-1'),
+            ctx,
+        )
+    )
+
+    assert len(current['sent']) == 2
+    round1, round2 = current['sent']
+    assert round1.get('previous_response_id') == 'resp-1'
+    assert any(
+        message.get('role') == 'tool' and message.get('content') == entry.ref
+        for message in round1['messages']
+    )
+    assert (
+        len(
+            [
+                tool
+                for tool in round1.get('tools') or []
+                if (tool.get('function') or {}).get('name') == refs.REF_EXEC_TOOL_NAME
+            ]
+        )
+        == 1
+    )
+    reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
+    assert entry.ref in asyncio.run(reader('ls tool')).splitlines()
+    catalog = reader.__externalized_ref_catalog__
+    entries_after_round1 = dict(catalog)
+
+    assert round2.get('previous_response_id') == 'resp-2'
+    assert any(
+        message.get('role') == 'tool' and message.get('content') == 'small result'
+        for message in round2['messages']
+    )
+    assert (
+        len(
+            [
+                tool
+                for tool in round2.get('tools') or []
+                if (tool.get('function') or {}).get('name') == refs.REF_EXEC_TOOL_NAME
+            ]
+        )
+        == 1
+    )
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'] is reader
+    assert reader.__externalized_ref_catalog__ is catalog
+    assert catalog == entries_after_round1
+
+
+def test_payload_apply_before_drain_executes_reader(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'approved reader source ' + 'x' * 100
+    entry = refs.make_ref_entry(big, kind='tool')
+    assert entry is not None
+    stored = {
+        'output': [
+            {
+                'type': 'function_call',
+                'call_id': 'call-1',
+                'name': refs.REF_EXEC_TOOL_NAME,
+                'arguments': middleware.JSONCodec.dumps({'command': f'wc -c {entry.ref}'}),
+                'status': 'queued',
+                'approved': True,
+            }
+        ]
+    }
+
+    async def process_result(_request, _name, result, *_args):
+        return result, [], []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 2))
+    _payload_leg_drain(monkeypatch, middleware, stored, stub_execute=False)
+    monkeypatch.setattr(middleware, 'process_tool_result', process_result)
+    monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
+    messages = [
+        {'role': 'user', 'content': 'question'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [
+                {'id': 'old-call', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}
+            ],
+        },
+        {'role': 'tool', 'tool_call_id': 'old-call', 'content': big},
+    ]
+
+    send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+
+    expected = str(len(big.encode('utf-8')))
+    assert state['canonical_body']['messages'][-1]['content'] == expected
+    assert send['messages'][-1]['content'] == expected
+    reader = metadata['tools'][refs.REF_EXEC_TOOL_NAME]['callable']
+    assert reader.__externalized_ref_catalog__[entry.ref].text == big
+
+
+def test_round0_non_native_continuation_sends_no_refs(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'non native payload ' + 'n' * 200
+    tools = _plain_tools(view_result=big)
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [current['text_response']('done')]
+    registry = dict(tools)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': registry,
+    }
+    state_refs = {
+        'enable': True,
+        'native': False,
+        'threshold': 2,
+        'registry': registry,
+        'metadata': metadata,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False, refs=state_refs)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    sent = current['sent'][0]
+    assert any(
+        message.get('role') == 'tool' and message.get('content') is big for message in sent['messages']
+    )
+    assert not any(
+        isinstance(message.get('content'), str) and message.get('content').startswith('tool:')
+        for message in sent['messages']
+    )
+    assert not any(
+        isinstance(tool, dict) and (tool.get('function') or {}).get('name') == refs.REF_EXEC_TOOL_NAME
+        for tool in sent.get('tools') or []
+    )
+    seeded = ctx['compaction_state'].get('tool_ref_entries') or ()
+    assert all(getattr(item, 'text', None) is not big for item in seeded)
+
+
+def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    big = 'p' * 300
+    tools = _plain_tools(view_result=big)
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [current['text_response']('done')]
+
+    def estimate(body):
+        return sum(
+            len(message.get('content')) if isinstance(message.get('content'), str) else 0
+            for message in body['messages']
+        )
+
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    registry = dict(tools)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': registry,
+    }
+    state_refs = {
+        'enable': True,
+        'native': True,
+        'threshold': 10,
+        'registry': registry,
+        'metadata': metadata,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=True, refs=state_refs)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    sent = current['sent'][0]
+    assert len(sent['messages']) == 3
+    assert not any(
+        '<auto_compaction_context>' in message.get('content', '') for message in sent['messages']
+    )
+    tool_messages = [message for message in sent['messages'] if message.get('role') == 'tool']
+    assert len(tool_messages) == 1
+    assert tool_messages[0]['content'].startswith('tool:')
+
+
+def test_drain_gate_uses_assistant_message_id_with_message_fallback(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+
+    async def fail_get_message(*_args, **_kwargs):
+        raise AssertionError('drain must not read the DB without assistant_message_id')
+
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', fail_get_message)
+
+    _send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], assistant_message_id=None)
+    )
+
+    assert state.get('last_send_body') is not None
+
+    seen_ids = []
+
+    async def get_message(_chat_id, message_id):
+        seen_ids.append(message_id)
+        return _approved_stored()
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
+
+    _send2, _metadata2, _events2, state2 = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], message_id=None)
+    )
+
+    assert seen_ids == ['assistant']
+    assert state2['canonical_body']['messages'][-1]['role'] == 'tool'
+
+
+def test_same_name_user_tool_survives_approved_round_trip(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    user_tool = {
+        'spec': {'name': refs.REF_EXEC_TOOL_NAME, 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': lambda: None,
+    }
+
+    async def get_tools(*_args, **_kwargs):
+        return {refs.REF_EXEC_TOOL_NAME: user_tool}
+
+    monkeypatch.setattr(middleware, 'get_tools', get_tools)
+    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+
+    async def get_filters(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 2))
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+
+    _send, metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], form_tool_ids=['my-tool'])
+    )
+
+    registry = state['externalized_refs']['registry']
+    assert registry[refs.REF_EXEC_TOOL_NAME] is user_tool
+    assert metadata['tools'] is registry

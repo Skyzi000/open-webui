@@ -81,7 +81,7 @@ from open_webui.tasks import clear_response_stream, save_response_stream
 from open_webui.utils.access_control import has_connection_access, has_permission
 from open_webui.utils.access_control.files import get_owner_accessible_folder_files
 from open_webui.utils.access_control.folders import has_folder_access
-from open_webui.utils.ask_user import stage_ask_user_tool_call
+from open_webui.utils.ask_user import stage_ask_user_tool_calls
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
@@ -115,6 +115,7 @@ from open_webui.utils.files import (
 )
 from open_webui.utils.filter import (
     FilterContext,
+    get_filter_context,
     get_filter_functions,
     process_filter_functions,
 )
@@ -206,6 +207,12 @@ def _is_tool_result_error(value: Any) -> bool:
         )
 
     return False
+
+
+def normalize_messages_for_model(form_data: dict) -> dict:
+    form_data['messages'] = strip_empty_content_blocks(form_data.get('messages', []))
+    form_data['messages'] = merge_system_messages(form_data.get('messages', []))
+    return form_data
 
 
 async def publish_chat_finished_event(
@@ -300,12 +307,7 @@ def build_terminal_file_tool_result(
     if isinstance(tool_result, (list, tuple)) and tool_result and isinstance(tool_result[0], dict):
         tool_result = tool_result[0]
 
-    if (
-        tool_function_name != 'display_file'
-        or tool_function_params.get('inline') is not True
-        or not isinstance(tool_result, dict)
-        or tool_result.get('exists') is False
-    ):
+    if tool_function_name != 'display_file' or not isinstance(tool_result, dict) or tool_result.get('exists') is False:
         return None
 
     tool_id = (tool or {}).get('tool_id', '')
@@ -326,7 +328,7 @@ def build_terminal_file_tool_result(
         **tool_result,
         'type': 'file',
         'source': 'open_terminal',
-        'displayed': True,
+        **({'displayed': True} if tool_function_params.get('inline') is True else {}),
         'terminal_selector': terminal_selector,
         **({'terminal_id': terminal_id} if terminal_id else {}),
         **({'terminal_url': server_url} if server_url and not terminal_id else {}),
@@ -1806,6 +1808,12 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
     if not chat_id or not isinstance(chat_id, str) or not __event_emitter__:
         return form_data
 
+    is_channel_chat = chat_id.startswith('channel:')
+    image_metadata = {
+        'message_id': metadata.get('message_id', None),
+        **({'channel_id': chat_id.removeprefix('channel:')} if is_channel_chat else {'chat_id': chat_id}),
+    }
+
     if not is_saved_chat_id(chat_id):
         message_list = form_data.get('messages', [])
     else:
@@ -1850,10 +1858,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
             images = await image_edits(
                 request=request,
                 form_data=EditImageForm(**{'prompt': prompt, 'image': input_images}),
-                metadata={
-                    'chat_id': metadata.get('chat_id', None),
-                    'message_id': metadata.get('message_id', None),
-                },
+                metadata=image_metadata,
                 user=user,
             )
 
@@ -1871,7 +1876,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
                         'files': [
                             {
                                 'type': 'image',
-                                'url': image['url'],
+                                **image,
                             }
                             for image in images
                         ]
@@ -1961,10 +1966,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
             images = await image_generations(
                 request=request,
                 form_data=CreateImageForm(**{'prompt': prompt}),
-                metadata={
-                    'chat_id': metadata.get('chat_id', None),
-                    'message_id': metadata.get('message_id', None),
-                },
+                metadata=image_metadata,
                 user=user,
             )
 
@@ -1982,7 +1984,7 @@ async def chat_image_generation_handler(request: Request, form_data: dict, extra
                         'files': [
                             {
                                 'type': 'image',
-                                'url': image['url'],
+                                **image,
                             }
                             for image in images
                         ]
@@ -2418,7 +2420,7 @@ async def apply_externalized_refs(
     state: dict,
 ) -> dict:
     config = state.get('externalized_refs') or {}
-    applied = False
+    installed = False
     has_summary = False
     seed_entries = tuple(state.get('tool_ref_entries') or ())
     if config.get('enable') and can_externalize_refs(
@@ -2443,7 +2445,6 @@ async def apply_externalized_refs(
             )
             if projected_messages is not messages:
                 body = {**body, 'messages': projected_messages}
-                applied = True
 
         async def load_history():
             entry = await resolve_request_history(state.get('selected_history'))
@@ -2462,14 +2463,13 @@ async def apply_externalized_refs(
         )
         if installed:
             config['metadata']['tools'] = config['registry']
-        applied = applied or installed
 
     history_entry = state.get('selected_history')
     if history_entry is None:
         return body
     return set_summary_history_ref(
         body,
-        history_entry.ref if has_summary and applied and isinstance(history_entry, RefEntry) else None,
+        history_entry.ref if has_summary and installed and isinstance(history_entry, RefEntry) else None,
         state=state,
     )
 
@@ -2503,6 +2503,76 @@ async def _capture_pre_filter_tool_refs(
     return projected
 
 
+def _send_copy(body: dict) -> dict:
+    # custom_params may expand arbitrary containers onto the top level, so only
+    # a type-based copy is safe; metadata is Core's request-scoped control plane
+    # (mcp clients, callables) and must stay shared, never deep-copied.
+    return {
+        key: (
+            value if key == 'metadata' or not isinstance(value, (dict, list)) else copy.deepcopy(value)
+        )
+        for key, value in body.items()
+    }
+
+
+def _commit_walk_held(canonical: dict, prev_held: str | None, state: dict) -> None:
+    new_held = state.get('summary_message_content')
+    if new_held is prev_held:
+        return
+    messages = canonical.get('messages')
+    matches = [
+        message
+        for message in (messages if isinstance(messages, list) else [])
+        if isinstance(message, dict) and message.get('content') is prev_held
+    ]
+    if len(matches) == 1:
+        matches[0]['content'] = new_held
+        return
+    # Marker bytes are deterministic, so the next round's re-mint stays stable;
+    # restoring the previous held reference prevents a dangling identity.
+    state['summary_message_content'] = prev_held
+    log.error(
+        'compaction held summary content matched %d canonical messages; restored previous held reference',
+        len(matches),
+    )
+
+
+_ABSENT = object()
+
+
+def _snapshot_ref_apply_state(state: dict) -> dict:
+    ref_config = state.get('externalized_refs') or {}
+    registry = ref_config.get('registry')
+    metadata = ref_config.get('metadata')
+    return {
+        'held': state.get('summary_message_content'),
+        'reader': registry.get(REF_EXEC_TOOL_NAME, _ABSENT) if isinstance(registry, dict) else _ABSENT,
+        'tools': metadata.get('tools', _ABSENT) if isinstance(metadata, dict) else _ABSENT,
+    }
+
+
+def _rollback_ref_apply_state(state: dict, snapshot: dict) -> None:
+    ref_config = state.get('externalized_refs') or {}
+    registry = ref_config.get('registry')
+    if isinstance(registry, dict):
+        prev_reader = snapshot['reader']
+        if prev_reader is _ABSENT:
+            # A same-name user/MCP tool keeps the slot when no owned reader was
+            # installed; only remove what this pass actually added.
+            if is_owned_ref_reader(registry):
+                registry.pop(REF_EXEC_TOOL_NAME, None)
+        else:
+            registry[REF_EXEC_TOOL_NAME] = prev_reader
+    metadata = ref_config.get('metadata')
+    if isinstance(metadata, dict):
+        prev_tools = snapshot['tools']
+        if prev_tools is _ABSENT:
+            metadata.pop('tools', None)
+        else:
+            metadata['tools'] = prev_tools
+    state['summary_message_content'] = snapshot['held']
+
+
 def _drop_absorbed_request_files(body: dict, state: dict) -> dict:
     if not state.get('durable_compacted'):
         return body
@@ -2532,8 +2602,7 @@ async def _compact_final_provider_payload(
     checkpoint_message_start: int | None = None,
     projected_messages: list | None = None,
 ) -> dict:
-    prior_checkpoint = state.get('checkpoint_history')
-    candidate = await compact_transient_provider_payload(
+    return await compact_transient_provider_payload(
         request,
         user,
         body,
@@ -2546,9 +2615,6 @@ async def _compact_final_provider_payload(
         checkpoint_message_start=checkpoint_message_start,
         projected_messages=projected_messages,
     )
-    if state.get('checkpoint_history') is not prior_checkpoint:
-        candidate = await apply_externalized_refs(candidate, state)
-    return candidate
 
 
 def _stateful_continuation_body(body: dict, response_id: str, call_ids: set[str]) -> dict:
@@ -2599,7 +2665,8 @@ def sanitize_tool_pairs(messages: list[dict]) -> list[dict]:
     return sanitized
 
 
-SKILL_MENTION_RE = re.compile(r'<(?:\$([^|>]+)(?:\|[^>]*)?|/([^|>]+)\|[^>]*)>')
+# Ids are validated as [a-z0-9_-]+ on create; matching that keeps ordinary "<$..." text intact.
+SKILL_MENTION_RE = re.compile(r'<(?:\$([a-z0-9_-]+)(?:\|[^>]*)?|/([a-z0-9_-]+)\|[^>]*)>')
 
 
 def _get_text_parts(message: dict) -> list[str]:
@@ -2621,7 +2688,7 @@ def extract_skill_ids_from_messages(messages: list[dict]) -> set[str]:
     return ids
 
 
-SKILL_MENTION_STRIP_RE = re.compile(r'<(?:\$[^|>]+(?:\|([^>]*))?|/[^|>]+\|([^>]*))>')
+SKILL_MENTION_STRIP_RE = re.compile(r'<(?:\$[a-z0-9_-]+(?:\|([^>]*))?|/[a-z0-9_-]+\|([^>]*))>')
 
 
 def strip_skill_mentions(messages: list[dict]) -> None:
@@ -2836,7 +2903,7 @@ async def process_chat_payload(
         elif capability_usage:
             form_data['stream_options'] = {**(form_data.get('stream_options') or {}), 'include_usage': True}
 
-    # Captured before apply_params_to_form_data pops 'params'; feeds metadata['system_prompt'] below
+    # Captured before apply_params_to_form_data pops 'params'; populates metadata['system_prompt'] below
     model_system_prompt = (form_data.get('params') or {}).get('system')
     params_model_id = form_data.get('model')
 
@@ -3050,13 +3117,15 @@ async def process_chat_payload(
     except Exception as e:
         raise e
 
+    filter_functions = []
+    filter_context = get_filter_context(request) if ENABLE_PLUGINS else None
     if ENABLE_PLUGINS:
         try:
             filter_functions = await get_filter_functions(request, model, metadata.get('filter_ids', []))
 
             form_data, flags = await process_filter_functions(
                 request=request,
-                filter_context=None,
+                filter_context=filter_context,
                 filter_functions=filter_functions,
                 filter_type='inlet',
                 form_data=form_data,
@@ -3554,32 +3623,90 @@ async def process_chat_payload(
             }
         )
 
-    # Strip empty text content blocks from multimodal messages
-    # to prevent errors from providers like Gemini and Claude
-    form_data['messages'] = strip_empty_content_blocks(form_data.get('messages', []))
-
-    # Merge any duplicate system messages into a single message at position 0
-    # to prevent template parsing errors with strict chat templates (e.g. Qwen)
-    form_data['messages'] = merge_system_messages(form_data.get('messages', []))
-
-    form_data = await apply_externalized_refs(form_data, compaction_state)
-    paused, approved_messages = await drain_approved_tool_calls(request, form_data, user, model, metadata)
-    if paused:
-        compaction_state['paused'] = True
-        return form_data, metadata, events, compaction_state
-    if approved_messages:
-        form_data = await apply_externalized_refs(form_data, compaction_state)
-    form_data = await _compact_final_provider_payload(
+    canonical = normalize_messages_for_model(form_data)
+    snapshot = await _capture_pre_filter_tool_refs(
+        canonical,
+        metadata,
+        compaction_state,
+        payload_tools,
+        native=(compaction_state.get('externalized_refs') or {}).get('native'),
+    )
+    canonical = await _compact_final_provider_payload(
         request,
         user,
-        form_data,
+        canonical,
         metadata,
-        form_data.get('model'),
+        canonical.get('model'),
         compaction_models,
         compaction_state,
+        projected_messages=snapshot,
     )
+    send = _send_copy(canonical)
+    if ENABLE_PLUGINS:
+        try:
+            send, _ = await process_filter_functions(
+                request=request,
+                filter_context=filter_context,
+                filter_functions=filter_functions,
+                filter_type='request',
+                form_data=send,
+                extra_params=extra_params,
+            )
+        except Exception as e:
+            raise Exception(f'{e}')
 
-    return form_data, metadata, events, compaction_state
+    send = normalize_messages_for_model(send)
+    apply_snapshot = _snapshot_ref_apply_state(compaction_state)
+    send = await apply_externalized_refs(send, compaction_state)
+    paused, approved_messages = await drain_approved_tool_calls(request, send, user, model, metadata)
+    if paused:
+        _rollback_ref_apply_state(compaction_state, apply_snapshot)
+        compaction_state['paused'] = True
+        return canonical, metadata, events, compaction_state
+    if approved_messages:
+        _rollback_ref_apply_state(compaction_state, apply_snapshot)
+        canonical['messages'] = [*canonical['messages'], *approved_messages]
+        snapshot = await _capture_pre_filter_tool_refs(
+            canonical,
+            metadata,
+            compaction_state,
+            payload_tools,
+            native=(compaction_state.get('externalized_refs') or {}).get('native'),
+        )
+        canonical = await _compact_final_provider_payload(
+            request,
+            user,
+            canonical,
+            metadata,
+            canonical.get('model'),
+            compaction_models,
+            compaction_state,
+            projected_messages=snapshot,
+        )
+        send = _send_copy(canonical)
+        if ENABLE_PLUGINS:
+            try:
+                send, _ = await process_filter_functions(
+                    request=request,
+                    filter_context=filter_context,
+                    filter_functions=filter_functions,
+                    filter_type='request',
+                    form_data=send,
+                    extra_params=extra_params,
+                )
+            except Exception as e:
+                raise Exception(f'{e}')
+
+        send = normalize_messages_for_model(send)
+        prev_held = compaction_state.get('summary_message_content')
+        send = await apply_externalized_refs(send, compaction_state)
+        _commit_walk_held(canonical, prev_held, compaction_state)
+    else:
+        _commit_walk_held(canonical, apply_snapshot['held'], compaction_state)
+    compaction_state['canonical_body'] = canonical
+    compaction_state['last_send_body'] = send
+
+    return send, metadata, events, compaction_state
 
 
 async def get_event_emitter_and_caller(metadata):
@@ -3739,10 +3866,12 @@ async def _execute_ref_calls_before_approval(
 
 async def drain_approved_tool_calls(request, form_data, user, model, metadata) -> tuple[bool, list[dict]]:
     chat_id = metadata.get('chat_id')
-    message_id = metadata.get('message_id') or metadata.get('assistant_message_id')
-    if not is_saved_chat_id(chat_id) or not message_id:
+    assistant_message_id = metadata.get('assistant_message_id')
+    # Only a resume/continue payload re-enters an existing message; other paths mint a fresh id with nothing to drain.
+    if not is_saved_chat_id(chat_id) or not assistant_message_id:
         return False, []
 
+    message_id = metadata.get('message_id') or assistant_message_id
     message = await Chats.get_message_by_id_and_message_id(chat_id, message_id)
     output = message.get('output') if message else None
     if not isinstance(output, list):
@@ -4713,6 +4842,8 @@ async def streaming_chat_response_handler(response, ctx):
         '__oauth_token__': await get_system_oauth_token(request, user),
         '__request__': request,
         '__model__': model,
+        '__chat_id__': metadata.get('chat_id'),
+        '__message_id__': metadata.get('message_id'),
     }
 
     filter_functions = (
@@ -5768,7 +5899,12 @@ async def streaming_chat_response_handler(response, ctx):
                                                 reasoning_detail_items,
                                             )
                                             await save_current_response_stream()
-                                            data = None
+                                            # Providers such as OpenRouter send reasoning_details
+                                            # alongside the reasoning text: only drop the event when
+                                            # the details were all there was to report, otherwise the
+                                            # reasoning delta never reaches the client.
+                                            if not reasoning_content:
+                                                data = None
 
                                     if value:
                                         if (
@@ -6053,7 +6189,7 @@ async def streaming_chat_response_handler(response, ctx):
                 )
                 tool_call_sources = []  # Track citation sources from tool results
                 all_tool_call_sources = []  # Accumulated sources across all iterations
-                continuation_body = form_data
+                continuation_body = ctx['compaction_state']['canonical_body']
                 user_message = metadata.get('user_prompt') or get_last_user_message(continuation_body['messages'])
 
                 # Check if citations are enabled for this model
@@ -6077,12 +6213,14 @@ async def streaming_chat_response_handler(response, ctx):
                     tool_call_iterations += 1
 
                     response_tool_calls = tool_calls.pop(0)
-                    ask_user_stage = stage_ask_user_tool_call(response_tool_calls, output, output_id)
-                    if ask_user_stage:
-                        if ask_user_stage['error']:
-                            await event_emitter({'type': 'chat:completion', 'data': {'output': full_output()}})
-                            continue
-
+                    ask_user_staged, ask_user_error = stage_ask_user_tool_calls(response_tool_calls, output, output_id)
+                    if ask_user_error:
+                        response_tool_calls = [
+                            tool_call
+                            for tool_call in response_tool_calls
+                            if tool_call.get('function', {}).get('name') != 'ask_user'
+                        ]
+                    elif ask_user_staged:
                         if is_saved_chat_id(metadata.get('chat_id')) and metadata.get('message_id'):
                             await pause_for_tool_approval(
                                 metadata['chat_id'],
@@ -6114,13 +6252,14 @@ async def streaming_chat_response_handler(response, ctx):
 
                     tool_approval_mode = metadata.get('params', {}).get('tool_approval_mode', 'full')
                     if (
-                        tool_approval_mode == 'ask'
+                        response_tool_calls
+                        and tool_approval_mode == 'ask'
                         and is_saved_chat_id(metadata.get('chat_id'))
                         and metadata.get('message_id')
                     ):
                         response_tool_calls = await _execute_ref_calls_before_approval(
                             request,
-                            continuation_body,
+                            ctx['compaction_state']['last_send_body'],
                             user,
                             metadata,
                             event_caller,
@@ -6205,7 +6344,9 @@ async def streaming_chat_response_handler(response, ctx):
                                 function = await get_updated_tool_function(
                                     function=tool['callable'],
                                     extra_params={
-                                        '__messages__': continuation_body.get('messages', []),
+                                        '__messages__': ctx['compaction_state']['last_send_body'].get(
+                                            'messages', []
+                                        ),
                                         '__files__': metadata.get('files', []),
                                     },
                                 )
@@ -6321,17 +6462,6 @@ async def streaming_chat_response_handler(response, ctx):
                                 item['status'] = result_status_by_call_id.get(call_id, 'completed')
                                 item['arguments'] = tc.get('function', {}).get('arguments', '{}')
                                 break
-
-                    # Append a new empty message item for the next response
-                    output.append(
-                        {
-                            'type': 'message',
-                            'id': output_id('msg'),
-                            'status': 'in_progress',
-                            'role': 'assistant',
-                            'content': [{'type': 'output_text', 'text': ''}],
-                        }
-                    )
 
                     # Emit citation sources to the frontend for display
                     if citations_enabled:
@@ -6452,9 +6582,12 @@ async def streaming_chat_response_handler(response, ctx):
                             'checkpoint_message_start': len(continuation_body['messages']),
                         }
                         standalone_body.pop('previous_response_id', None)
-                        standalone_body = await apply_externalized_refs(
+                        snapshot = await _capture_pre_filter_tool_refs(
                             standalone_body,
+                            metadata,
                             ctx['compaction_state'],
+                            payload_tools=None,
+                            native=(ctx['compaction_state'].get('externalized_refs') or {}).get('native'),
                         )
                         prior_checkpoint = ctx['compaction_state'].get('checkpoint_history')
                         standalone_body = await _compact_final_provider_payload(
@@ -6466,32 +6599,44 @@ async def streaming_chat_response_handler(response, ctx):
                             ctx['compaction_state'].get('models') or {model_id: model},
                             ctx['compaction_state'],
                             **checkpoint,
+                            projected_messages=snapshot,
                         )
                         checkpoint_advanced = ctx['compaction_state'].get('checkpoint_history') is not prior_checkpoint
 
-                        send_body = standalone_body
+                        send_basis = standalone_body
                         if stateful and not checkpoint_advanced:
                             call_ids = {
                                 tool_call['id']
                                 for tool_call in response_tool_calls
                                 if isinstance(tool_call.get('id'), str)
                             }
-                            send_body = _stateful_continuation_body(
+                            send_basis = _stateful_continuation_body(
                                 standalone_body,
                                 last_response_id,
                                 call_ids,
                             )
-                        res, actual_body = await forward_continuation(send_body)
-                        next_body = (
-                            standalone_body
-                            if stateful and not checkpoint_advanced and actual_body.get('previous_response_id')
-                            else actual_body
-                        )
+                        send_body = _send_copy(send_basis)
+                        if filter_functions:
+                            send_body, _ = await process_filter_functions(
+                                request=request,
+                                filter_context=filter_context,
+                                filter_functions=filter_functions,
+                                filter_type='request',
+                                form_data=send_body,
+                                extra_params=extra_params,
+                            )
+
+                        send_body = normalize_messages_for_model(send_body)
+                        prev_held = ctx['compaction_state'].get('summary_message_content')
+                        send_body = await apply_externalized_refs(send_body, ctx['compaction_state'])
+                        _commit_walk_held(standalone_body, prev_held, ctx['compaction_state'])
+                        ctx['compaction_state']['last_send_body'] = send_body
+                        res, _ = await forward_continuation(send_body)
 
                         if isinstance(res, StreamingResponse):
-                            continuation_body = next_body
+                            continuation_body = standalone_body
                             start_next_response()
-                            await stream_body_handler(res, next_body)
+                            await stream_body_handler(res, send_body)
                         elif getattr(res, 'status_code', 200) >= 400:
                             await emit_message_error(get_message_error_content(get_response_error_detail(res)))
                             break
@@ -6660,7 +6805,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 reasoning_format=get_reasoning_format(model),
                                 flatten_tool_images=True,
                             )
-                            new_form_data = {
+                            standalone_body = {
                                 **continuation_body,
                                 'model': model_id,
                                 'stream': True,
@@ -6675,27 +6820,46 @@ async def streaming_chat_response_handler(response, ctx):
                                 'checkpoint_carrier': output[0] if output else None,
                                 'checkpoint_message_start': len(continuation_body['messages']),
                             }
-                            new_form_data = await apply_externalized_refs(
-                                new_form_data,
+                            snapshot = await _capture_pre_filter_tool_refs(
+                                standalone_body,
+                                metadata,
                                 ctx['compaction_state'],
+                                payload_tools=None,
+                                native=(ctx['compaction_state'].get('externalized_refs') or {}).get('native'),
                             )
-                            new_form_data = await _compact_final_provider_payload(
+                            standalone_body = await _compact_final_provider_payload(
                                 request,
                                 user,
-                                new_form_data,
+                                standalone_body,
                                 metadata,
                                 model_id,
                                 ctx['compaction_state'].get('models') or {model_id: model},
                                 ctx['compaction_state'],
                                 **checkpoint,
+                                projected_messages=snapshot,
                             )
+                            send_body = _send_copy(standalone_body)
+                            if filter_functions:
+                                send_body, _ = await process_filter_functions(
+                                    request=request,
+                                    filter_context=filter_context,
+                                    filter_functions=filter_functions,
+                                    filter_type='request',
+                                    form_data=send_body,
+                                    extra_params=extra_params,
+                                )
 
-                            res, new_form_data = await forward_continuation(new_form_data)
+                            send_body = normalize_messages_for_model(send_body)
+                            prev_held = ctx['compaction_state'].get('summary_message_content')
+                            send_body = await apply_externalized_refs(send_body, ctx['compaction_state'])
+                            _commit_walk_held(standalone_body, prev_held, ctx['compaction_state'])
+                            ctx['compaction_state']['last_send_body'] = send_body
+                            res, _ = await forward_continuation(send_body)
 
                             if isinstance(res, StreamingResponse):
-                                continuation_body = new_form_data
+                                continuation_body = standalone_body
                                 start_next_response()
-                                await stream_body_handler(res, new_form_data)
+                                await stream_body_handler(res, send_body)
                             elif getattr(res, 'status_code', 200) >= 400:
                                 await emit_message_error(get_message_error_content(get_response_error_detail(res)))
                                 break
