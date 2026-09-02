@@ -96,6 +96,7 @@ from open_webui.utils.context_compaction import (
     replay_cached_compaction_messages,
     replay_stored_compaction_checkpoint,
     resolve_request_history,
+    restore_nested_checkpoint_markers,
     set_summary_history_ref,
     start_completed_turn_compaction_prefetch,
 )
@@ -4599,6 +4600,7 @@ async def outlet_filter_handler(ctx):
                     outlet_message_id = message.get('id')
                     if outlet_message_id and outlet_message_id in messages_map:
                         original_message = messages_map[outlet_message_id]
+                        restore_nested_checkpoint_markers(message, original_message)
                         original_content = original_message.get('content') or get_output_text(
                             original_message.get('output')
                         )

@@ -27,6 +27,7 @@ from open_webui.socket.main import (
     get_event_emitter,
     sio,
 )
+from open_webui.utils.context_compaction import strip_compaction_marker_keys
 from open_webui.utils.filter import (
     get_filter_functions,
     process_filter_functions,
@@ -158,6 +159,11 @@ async def generate_chat_completion(
     log.debug('generate_chat_completion: %s', form_data)
     if BYPASS_MODEL_ACCESS_CONTROL:
         bypass_filter = True
+
+    # Keep compaction markers on canonical bodies; strip them at unified chat dispatch.
+    messages = form_data.get('messages')
+    if isinstance(messages, list):
+        form_data['messages'] = strip_compaction_marker_keys(messages)
 
     with chat_completion_bypass(bypass_filter, bypass_system_prompt):
         return await _generate_chat_completion(request, form_data, user, bypass_filter, bypass_system_prompt)

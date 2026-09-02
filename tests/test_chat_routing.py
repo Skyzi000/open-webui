@@ -61,6 +61,7 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
             'params_ref': metadata.get('params'),
             'options_ref': form_data.get('stream_options'),
             'system_prompt': metadata.get('system_prompt'),
+            'messages': copy.deepcopy(form_data.get('messages')),
         }
         if form_data.get('stream'):
             # chat.py's arena streaming wrapper reads body_iterator.
@@ -693,3 +694,44 @@ def test_chat_merge_keeps_state_authority_except_per_call_params(monkeypatch):
     asyncio.run(chat.generate_chat_completion(request, second_form, SimpleNamespace(role='admin')))
 
     assert captured['metadata']['params'] is state_params
+
+
+def test_generate_chat_completion_strips_markers_without_mutating_canonical_body(monkeypatch):
+    models_map = {
+        'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
+    }
+    model_infos = {
+        'primary-model': _EntryModelInfo({'function_calling': 'native', 'stream_response': True}),
+    }
+    original_build = main.build_chat_response_context
+    captured, request, user, _seen = _install_provider_sink_harness(monkeypatch, model_infos)
+    request.app.state.MODELS = models_map
+
+    async def build_ctx(request, form_data, user, model, metadata, *args, **kwargs):
+        ctx = await original_build(request, form_data, user, model, metadata, *args, **kwargs)
+        captured['ctx'] = ctx
+        return ctx
+
+    monkeypatch.setattr(main, 'build_chat_response_context', build_ctx)
+
+    marker_key = compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY
+    marked = {'role': 'user', 'content': 'please summarize', marker_key: True}
+    form_data = _base_form_data(
+        'primary-model',
+        [{'model_id': 'primary-model', 'message_id': 'm1'}],
+        messages=[marked],
+    )
+
+    _run_chat_completion(request, user, form_data)
+
+    assert 'm1' in captured
+    sink_messages = captured['m1']['messages']
+    assert sink_messages
+    assert all(marker_key not in message for message in sink_messages)
+    assert any(
+        message.get('role') == 'user' and message.get('content') == 'please summarize'
+        for message in sink_messages
+    )
+
+    canonical = captured['ctx']['compaction_state']['canonical_body']['messages']
+    assert any(message.get(marker_key) is True for message in canonical)

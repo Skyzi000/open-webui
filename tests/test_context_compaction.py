@@ -1607,7 +1607,8 @@ def test_manual_compaction_persists_only_core_checkpoint(monkeypatch):
     async def get_messages(_chat_id):
         return messages
 
-    async def generate_summary(*_args, **_kwargs):
+    async def generate_summary(*_args, **kwargs):
+        assert 'message_id' in kwargs
         return 'summary'
 
     saved_update = None
@@ -1756,7 +1757,8 @@ def _run_manual_compact(monkeypatch, messages, current_id):
     async def get_messages(_chat_id):
         return messages
 
-    async def generate_summary(*args, **_kwargs):
+    async def generate_summary(*args, **kwargs):
+        assert 'message_id' in kwargs
         captured['compacted'] = args[4]
         captured['recent'] = args[5]
         return 'summary'
@@ -2585,7 +2587,8 @@ def test_nested_compact_pins_summary_identity(monkeypatch):
 
 
 def test_boundary_compact_pins_summary_identity(monkeypatch):
-    async def generate_summary(*_args, **_kwargs):
+    async def generate_summary(*_args, **kwargs):
+        assert 'message_id' in kwargs
         return 'BOUNDARY'
 
     monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
@@ -2688,7 +2691,8 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     async def title(_chat_id):
         return ''
 
-    async def generate_summary(*_args, **_kwargs):
+    async def generate_summary(*_args, **kwargs):
+        assert 'message_id' in kwargs
         return 'FOLDED'
 
     async def save(_chat_id, _message_id, update, **_kwargs):
@@ -4417,3 +4421,443 @@ def test_same_name_user_tool_survives_approved_round_trip(monkeypatch):
     registry = state['externalized_refs']['registry']
     assert registry[refs.REF_EXEC_TOOL_NAME] is user_tool
     assert metadata['tools'] is registry
+
+
+def _run_summary_dispatch(monkeypatch, *, request_direct, direct_model_id, target_model_id, state_metadata, message_id):
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    captured = {}
+
+    async def fake_generate(request, form_data=None, user=None, **kwargs):
+        captured['metadata'] = copy.deepcopy(form_data['metadata'])
+        captured['metadata_ref'] = form_data['metadata']
+        captured['kwargs'] = dict(kwargs)
+        return {'choices': [{'message': {'content': 'summary'}}]}
+
+    async def get_many(*_keys):
+        return {'chat.context_compaction.model': target_model_id}
+
+    async def pt(prompt, _user):
+        return prompt
+
+    monkeypatch.setattr(chat_module, 'generate_chat_completion', fake_generate)
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(compaction, 'prompt_template', pt)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(
+            direct=request_direct,
+            model={'id': direct_model_id} if direct_model_id else None,
+            metadata=dict(state_metadata),
+        ),
+        scope={'type': 'http', 'state': {}},
+        receive=None,
+    )
+    models = {
+        'direct-model': {'id': 'direct-model', 'info': {'params': {'max_tokens': 500}}},
+        'server-model': {'id': 'server-model', 'info': {}},
+    }
+    summary = asyncio.run(
+        compaction._generate_summary(
+            request,
+            None,
+            'direct-model',
+            models,
+            [],
+            [],
+            None,
+            '',
+            (),
+            message_id=message_id,
+        )
+    )
+    assert summary == 'summary'
+    return captured, request
+
+
+def test_direct_summary_dispatch_carries_message_id(monkeypatch):
+    captured, request = _run_summary_dispatch(
+        monkeypatch,
+        request_direct=True,
+        direct_model_id='direct-model',
+        target_model_id='direct-model',
+        state_metadata={'chat_id': 'chat', 'session_id': 'sess-1', 'user_id': 'user-1'},
+        message_id='assistant-message',
+    )
+    socket_main = importlib.import_module('open_webui.socket.main')
+
+    event_call = asyncio.run(socket_main.get_event_call(captured['metadata']))
+
+    assert event_call is not None
+    assert captured['metadata']['message_id'] == 'assistant-message'
+    assert 'message_id' not in request.state.metadata
+    assert captured['metadata_ref'] is not request.state.metadata
+
+
+def test_direct_summary_dispatch_to_server_model_stays_emitter_inert(monkeypatch):
+    captured, request = _run_summary_dispatch(
+        monkeypatch,
+        request_direct=True,
+        direct_model_id='direct-model',
+        target_model_id='server-model',
+        state_metadata={
+            'chat_id': 'chat',
+            'session_id': 'sess-1',
+            'user_id': 'user-1',
+            'tools': {'legacy': {'spec': {'name': 'legacy'}}},
+            'files': [{'id': 'file-1'}],
+        },
+        message_id='assistant-message',
+    )
+
+    assert 'message_id' not in captured['metadata']
+    assert (
+        set(captured['metadata'])
+        - {'chat_id', 'session_id', 'user_id', 'tools', 'files'}
+        == {'task'}
+    )
+    assert captured['metadata']['task'] == 'context_compaction'
+    assert 'tools' not in captured['metadata']
+    assert 'files' not in captured['metadata']
+    assert 'message_id' not in request.state.metadata
+    assert captured['metadata_ref'] is not request.state.metadata
+
+
+def test_manual_compact_summary_strips_inherited_message_id(monkeypatch):
+    captured, request = _run_summary_dispatch(
+        monkeypatch,
+        request_direct=True,
+        direct_model_id='direct-model',
+        target_model_id='server-model',
+        state_metadata={
+            'chat_id': 'chat',
+            'session_id': 'sess-1',
+            'user_id': 'user-1',
+            'message_id': 'inherited-message',
+        },
+        message_id='assistant-message',
+    )
+
+    assert 'message_id' not in captured['metadata']
+    assert set(captured['metadata']) - {
+        'chat_id',
+        'session_id',
+        'user_id',
+        'message_id',
+    } == {'task'}
+    assert request.state.metadata['message_id'] == 'inherited-message'
+    assert captured['metadata_ref'] is not request.state.metadata
+
+
+def test_direct_summary_dispatch_metadata_key_delta(monkeypatch):
+    captured, _request = _run_summary_dispatch(
+        monkeypatch,
+        request_direct=True,
+        direct_model_id='direct-model',
+        target_model_id='direct-model',
+        state_metadata={'chat_id': 'chat', 'session_id': 'sess-1', 'user_id': 'user-1'},
+        message_id='assistant-message',
+    )
+
+    assert set(captured['metadata']) - {'chat_id', 'session_id', 'user_id'} == {'task', 'message_id'}
+    assert captured['metadata']['task'] == 'context_compaction'
+
+
+def test_durable_checkpoint_generation_receives_message_id(monkeypatch):
+    history = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'answer'},
+    ]
+    seen = {}
+
+    async def generate_summary(*_args, **kwargs):
+        seen.update(kwargs)
+        return 'summary'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+
+    summary, _meta, checkpoint_history, checkpoint_message_id = asyncio.run(
+        compaction._generate_checkpoint(
+            None,
+            None,
+            'model',
+            {'model': {'id': 'model', 'info': {}}},
+            {'chat_id': 'chat', 'message_id': 'assistant'},
+            {'previous_summary': None},
+            {'prompt_template': '', 'transient_patterns': ()},
+            [],
+            [],
+            checkpoint_history=(history, 1),
+        )
+    )
+
+    assert summary == 'summary'
+    assert checkpoint_message_id == 'a1'
+    assert checkpoint_history == (history, 1)
+    assert seen['message_id'] == 'assistant'
+
+
+def test_completed_turn_checkpoint_skips_nested_tip_guard():
+    messages = _tool_round_tip_messages()
+    tip = messages['a2']
+    tip['output'][1]['contextSummary'] = 'SUM'
+    branch = [messages['u1'], messages['a1'], messages['u2'], tip]
+    config = {'prompt_template': '', 'transient_patterns': ()}
+    writes = []
+
+    async def fail_summary(*_args, **_kwargs):
+        raise AssertionError('nested-tip guard must skip summary generation')
+
+    async def record_update(chat_id, message_id, summary, **_kwargs):
+        writes.append((chat_id, message_id, summary))
+        return True
+
+    original_summary = compaction._generate_summary
+    original_update = compaction.ChatMessages.update_context_summary
+    try:
+        compaction._generate_summary = fail_summary
+        compaction.ChatMessages.update_context_summary = record_update
+
+        result = asyncio.run(
+            compaction._completed_turn_checkpoint(
+                None,
+                None,
+                branch,
+                {'chat_id': 'chat', 'message_id': 'a2'},
+                'model',
+                {},
+                config,
+            )
+        )
+    finally:
+        compaction._generate_summary = original_summary
+        compaction.ChatMessages.update_context_summary = original_update
+
+    assert result is None
+    assert writes == []
+
+
+def test_completed_turn_checkpoint_generates_without_nested_tip():
+    messages = _tool_round_tip_messages()
+    branch = [messages['u1'], messages['a1'], messages['u2'], messages['a2']]
+    config = {'prompt_template': '', 'transient_patterns': ()}
+    writes = []
+    seen = {}
+
+    async def generate_summary(*_args, **kwargs):
+        seen.update(kwargs)
+        return 'summary'
+
+    async def record_update(chat_id, message_id, summary, **_kwargs):
+        writes.append((chat_id, message_id, summary))
+        return True
+
+    original_summary = compaction._generate_summary
+    original_update = compaction.ChatMessages.update_context_summary
+    try:
+        compaction._generate_summary = generate_summary
+        compaction.ChatMessages.update_context_summary = record_update
+
+        result = asyncio.run(
+            compaction._completed_turn_checkpoint(
+                None,
+                None,
+                branch,
+                {'chat_id': 'chat', 'message_id': 'a2'},
+                'model',
+                {},
+                config,
+            )
+        )
+    finally:
+        compaction._generate_summary = original_summary
+        compaction.ChatMessages.update_context_summary = original_update
+
+    assert result == 'summary'
+    assert writes == [('chat', 'a2', 'summary')]
+    assert seen['message_id'] == 'a2'
+
+
+def _run_outlet(monkeypatch, middleware, messages_map, outlet_filter):
+    emitted = []
+    saved = []
+
+    async def get_filters(*_args, **_kwargs):
+        return [outlet_filter]
+
+    async def process(**kwargs):
+        if kwargs.get('filter_type') == 'outlet' and kwargs.get('filter_functions'):
+            return await kwargs['filter_functions'][0](body=kwargs['form_data']), {}
+        return kwargs['form_data'], {}
+
+    async def pipeline(_request, outlet_data, _user, _models):
+        return outlet_data
+
+    async def get_messages(_chat_id):
+        return messages_map
+
+    async def upsert(_chat_id, _message_id, update, **_kwargs):
+        saved.append(copy.deepcopy(update))
+        return {}
+
+    async def emit(event):
+        emitted.append(copy.deepcopy(event))
+
+    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+    monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+    monkeypatch.setattr(middleware, 'process_filter_functions', process)
+    monkeypatch.setattr(middleware, 'process_pipeline_outlet_filter', pipeline)
+    monkeypatch.setattr(middleware, 'get_sorted_filters', lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
+
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={}, redis=None)),
+    )
+    ctx = {
+        'request': request,
+        'user': SimpleNamespace(),
+        'model': {'id': 'model'},
+        'metadata': {'chat_id': 'chat', 'message_id': 'a2', 'filter_ids': []},
+        'event_emitter': emit,
+        'event_caller': None,
+    }
+    asyncio.run(middleware.outlet_filter_handler(ctx))
+    return emitted, saved
+
+
+def _marked_tip_map():
+    messages = _tool_round_tip_messages()
+    messages['a2']['output'][1]['contextSummary'] = 'SUM'
+    return messages
+
+
+def _outlet_a2(emitted):
+    for event in emitted:
+        for message in event.get('data', {}).get('messages', []):
+            if message.get('id') == 'a2':
+                return message
+    return None
+
+
+def test_outlet_marker_restore_skips_untouched_output_persistence(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages_map = _marked_tip_map()
+
+    async def outlet_filter(body):
+        for message in body['messages']:
+            if message.get('id') == 'a2':
+                for item in message.get('output') or []:
+                    item.pop('contextSummary', None)
+                    item.pop('context_summary', None)
+                message['content'] = 'edited'
+        return body
+
+    emitted, saved = _run_outlet(monkeypatch, middleware, messages_map, outlet_filter)
+
+    assert len(saved) == 1
+    assert 'output' not in saved[0]
+    assert saved[0]['content'] == 'edited'
+    emitted_a2 = _outlet_a2(emitted)
+    assert any(item.get('contextSummary') == 'SUM' for item in emitted_a2['output'])
+
+
+def test_outlet_marker_only_change_never_persists(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages_map = _marked_tip_map()
+
+    async def outlet_filter(body):
+        for message in body['messages']:
+            if message.get('id') == 'a2':
+                for item in message.get('output') or []:
+                    item.pop('contextSummary', None)
+                    item.pop('context_summary', None)
+        return body
+
+    emitted, saved = _run_outlet(monkeypatch, middleware, messages_map, outlet_filter)
+
+    assert saved == []
+    emitted_a2 = _outlet_a2(emitted)
+    assert any(item.get('contextSummary') == 'SUM' for item in emitted_a2['output'])
+
+
+def test_outlet_inserted_output_item_blocks_restore(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages_map = _marked_tip_map()
+
+    async def outlet_filter(body):
+        for message in body['messages']:
+            if message.get('id') == 'a2':
+                for item in message.get('output') or []:
+                    item.pop('contextSummary', None)
+                    item.pop('context_summary', None)
+                message['output'].append({'type': 'message', 'role': 'assistant', 'content': []})
+        return body
+
+    emitted, saved = _run_outlet(monkeypatch, middleware, messages_map, outlet_filter)
+
+    assert saved and 'output' in saved[0]
+    assert all('contextSummary' not in item for item in saved[0]['output'])
+    emitted_a2 = _outlet_a2(emitted)
+    assert all('contextSummary' not in item for item in emitted_a2['output'])
+
+
+def test_outlet_swapped_message_items_block_restore(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    messages_map = {
+        'u1': {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'find evidence'},
+        'a1': {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'answer'},
+        'u2': {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'continue'},
+        'a2': {
+            'id': 'a2',
+            'parentId': 'u2',
+            'role': 'assistant',
+            'content': 'final',
+            'output': [
+                {
+                    'type': 'message',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'answer', 'annotations': []}],
+                    'contextSummary': 'SUM',
+                },
+                {
+                    'type': 'message',
+                    'role': 'assistant',
+                    'content': [
+                        {'type': 'output_text', 'text': ' continued', 'annotations': [], 'logprobs': None}
+                    ],
+                },
+            ],
+        },
+    }
+
+    async def outlet_filter(body):
+        for message in body['messages']:
+            if message.get('id') == 'a2':
+                output = message['output']
+                message['output'] = [output[1], output[0]]
+        return body
+
+    emitted, saved = _run_outlet(monkeypatch, middleware, messages_map, outlet_filter)
+
+    emitted_a2 = _outlet_a2(emitted)
+    assert 'contextSummary' not in emitted_a2['output'][0]
+    assert emitted_a2['output'][1].get('contextSummary') == 'SUM'
+    assert saved
+    assert 'contextSummary' not in saved[0]['output'][0]
+    assert saved[0]['output'][1].get('contextSummary') == 'SUM'
+
+
+def test_summary_generation_does_not_bypass_model_access(monkeypatch):
+    captured, _request = _run_summary_dispatch(
+        monkeypatch,
+        request_direct=False,
+        direct_model_id=None,
+        target_model_id='server-model',
+        state_metadata={'chat_id': 'chat', 'session_id': 'sess-1', 'user_id': 'user-1'},
+        message_id=None,
+    )
+
+    assert set(captured['kwargs']) - {'form_data', 'user'} == {'bypass_system_prompt'}
+    assert captured['kwargs']['bypass_system_prompt'] is True
+    assert 'bypass_filter' not in captured['kwargs']

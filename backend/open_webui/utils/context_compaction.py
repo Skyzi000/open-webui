@@ -309,6 +309,37 @@ def _checkpoint_positions(
     return positions
 
 
+def restore_nested_checkpoint_markers(
+    message: dict[str, Any],
+    baseline: dict[str, Any],
+) -> None:
+    """Restore nested checkpoint markers when outlet output is otherwise unchanged."""
+    output = message.get('output')
+    original = baseline.get('output')
+    if not isinstance(output, list) or not isinstance(original, list):
+        return
+
+    marker_keys = {'contextSummary', 'context_summary'}
+
+    def without_marker(item):
+        if not isinstance(item, dict):
+            return item
+        return {key: value for key, value in item.items() if key not in marker_keys}
+
+    if [without_marker(item) for item in output] != [
+        without_marker(item) for item in original
+    ]:
+        return
+
+    for _, output_index, summary in _checkpoint_positions([baseline]):
+        if output_index is None:
+            continue
+        item = output[output_index]
+        if isinstance(item, dict):
+            item = {key: value for key, value in item.items() if key not in marker_keys}
+            output[output_index] = {**item, 'contextSummary': summary}
+
+
 def _bind_history_loader(
     entry: RefEntry,
     messages: list[dict[str, Any]],
@@ -759,6 +790,11 @@ def _without_boundary_marker(
     ]
 
 
+def strip_compaction_marker_keys(messages: list[dict]) -> list[dict]:
+    """Drop compaction bookkeeping keys at provider dispatch."""
+    return _without_boundary_marker(messages)
+
+
 async def _generate_checkpoint(
     request,
     user,
@@ -806,6 +842,7 @@ async def _generate_checkpoint(
         previous_summary_meta=state.get('previous_summary_meta'),
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+        message_id=metadata.get('message_id'),
     )
     return summary, summary_meta, checkpoint_history, checkpoint_message_id
 
@@ -1203,6 +1240,7 @@ async def compact_transient_provider_payload(
                 previous_summary_meta=state.get('previous_summary_meta'),
                 externalized_refs_enable=config.get('externalized_refs_enable', False),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+                message_id=metadata.get('message_id'),
             )
             history, position, summary_meta = await _nested_checkpoint_history(
                 state,
@@ -1320,6 +1358,7 @@ async def compact_transient_provider_payload(
                 previous_summary_meta=state.get('previous_summary_meta'),
                 externalized_refs_enable=config.get('externalized_refs_enable', False),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+                message_id=metadata.get('message_id'),
             )
             # The held identity must track the candidate actually returned to
             # the provider; the projected copy below is estimation-only and its
@@ -1431,6 +1470,7 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         absorbed_files,
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+        message_id=current_id,
     )
     if not await ChatMessages.update_context_summary(chat.id, current_id, summary):
         raise RuntimeError('Context compaction checkpoint could not be saved')
@@ -1505,6 +1545,7 @@ async def _completed_turn_checkpoint(
         previous_summary_meta={},
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+        message_id=metadata['message_id'],
     )
     await _save_checkpoint(metadata['chat_id'], metadata['message_id'], summary)
     return summary
@@ -2029,6 +2070,7 @@ async def _generate_summary(
     previous_summary_meta: dict | None = None,
     externalized_refs_enable: bool = False,
     externalized_refs_token_threshold: int = 10000,
+    message_id: str | None = None,
 ) -> str:
     from open_webui.utils.chat import generate_chat_completion
 
@@ -2117,7 +2159,19 @@ async def _generate_summary(
     summary_metadata = dict(request.state.metadata) if hasattr(request.state, 'metadata') else {}
     summary_metadata.pop('tools', None)
     summary_metadata.pop('files', None)
+    summary_metadata.pop('message_id', None)
     summary_metadata['task'] = 'context_compaction'
+    # get_event_call needs message_id only when this summary dispatches to the
+    # direct model itself; any other target stays emitter-inert like Core task requests.
+    direct_model = getattr(request.state, 'model', None)
+    summary_metadata.update(
+        {'message_id': message_id}
+        if message_id
+        and getattr(request.state, 'direct', False)
+        and isinstance(direct_model, dict)
+        and task_model_id == direct_model.get('id')
+        else {}
+    )
     summary_scope = {
         **request.scope,
         'state': {**(request.scope.get('state') or {}), 'metadata': summary_metadata},
@@ -2137,7 +2191,7 @@ async def _generate_summary(
         summary_request,
         form_data=payload,
         user=user,
-        bypass_filter=True,
+        # Keep bypass_system_prompt: the summary request must not inherit the chat model's system prompt.
         bypass_system_prompt=True,
     )
     return await _response_text(response)
