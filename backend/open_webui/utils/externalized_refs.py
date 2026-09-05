@@ -12,6 +12,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Iterator
 from dataclasses import dataclass
 from itertools import chain, islice
+from operator import itemgetter
 from typing import Any
 
 import regex
@@ -25,6 +26,7 @@ from open_webui.tools.knowledge_fs import (
 )
 
 _monotonic = time.monotonic
+_char_offset = itemgetter(0)
 
 
 REF_EXEC_TOOL_NAME = 'auto_compact_ref_exec'
@@ -93,12 +95,26 @@ class _Stage:
 
 @dataclass(frozen=True, slots=True)
 class _Line:
-    text: str
+    # A view over ``source[start:end]``. Keeping the span unsliced lets a single
+    # huge line reach the response-budget check without being copied.
+    source: str
     has_newline: bool
     source_byte_start: int | None = None
     display_prefix: str = ''
     match_start: int | None = None
     match_end: int | None = None
+    start: int = 0
+    end: int | None = None
+    # Character-to-byte checkpoints for ``source`` when it is a ref body.
+    byte_index: tuple[tuple[int, int], ...] | None = None
+
+    @property
+    def end_offset(self) -> int:
+        return len(self.source) if self.end is None else self.end
+
+    @property
+    def text(self) -> str:
+        return self.source[self.start : self.end_offset]
 
     @property
     def presented(self) -> str:
@@ -661,37 +677,55 @@ def _iter_text_lines(
     *,
     source_offsets: bool = False,
     source_byte_start: int = 0,
+    byte_index: tuple[tuple[int, int], ...] | None = None,
 ) -> Iterator[_Line]:
     offset = 0
     byte_start = source_byte_start
     while offset < len(text):
         newline = text.find('\n', offset)
         end = len(text) if newline < 0 else newline
-        line = text[offset:end]
         yield _Line(
-            text=line,
+            source=text,
             has_newline=newline >= 0,
             source_byte_start=byte_start if source_offsets else None,
+            start=offset,
+            end=end,
+            byte_index=byte_index,
         )
-        byte_start += len(line.encode('utf-8')) + int(newline >= 0)
+        byte_start += _span_bytes(text, byte_index, offset, end) + int(newline >= 0)
         offset = end + int(newline >= 0)
 
 
 def _iter_source_lines(entry: RefEntry) -> Iterator[_Line]:
-    yield from _iter_text_lines(entry.text, source_offsets=True)
+    yield from _iter_text_lines(
+        entry.text, source_offsets=True, byte_index=entry.byte_index
+    )
 
 
 def _head(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
     yield from islice(lines, max(0, count))
 
 
-def _tail(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
-    if count <= 0:
-        return
+def _check_tail_count(count: int) -> None:
     if count > REF_EXEC_RESPONSE_MAX_BYTES:
         raise RefExecError(
             f'Error: tail line count exceeds the {REF_EXEC_RESPONSE_MAX_BYTES:,} line limit'
         )
+
+
+def _tail_lines(entry: RefEntry, count: int) -> Iterator[_Line]:
+    # Skip past the head _tail's deque would retain only to discard. Generator, so
+    # the limit is raised where _tail raises it: when the pipeline is first pulled.
+    if count <= 0:
+        return
+    _check_tail_count(count)
+    yield from islice(_iter_source_lines(entry), max(0, entry.line_count - count), None)
+
+
+def _tail(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
+    if count <= 0:
+        return
+    _check_tail_count(count)
     retained: deque[_Line] = deque(maxlen=count)
     retained.extend(lines)
     yield from retained
@@ -797,32 +831,47 @@ def _grep_spans(
 
 
 def _grep_matches(line: _Line, spans: Iterable[tuple[int, int]], ordinal: int, stage: _Stage) -> Iterator[_Line]:
-    value = line.presented
     prefix = f'{ordinal}:' if 'n' in stage.flags else ''
+    # Spans index ``line.presented``. Without an existing prefix that is the
+    # line's own span, so the view (and its provenance) carries straight over.
+    if line.display_prefix:
+        source, base, span_end, byte_index = line.presented, 0, None, None
+        source_byte_start = None
+    else:
+        source, base, span_end = line.source, line.start, line.end_offset
+        byte_index = line.byte_index
+        source_byte_start = line.source_byte_start
     if 'o' not in stage.flags:
         start, end = spans[0]
         yield _Line(
-            text=value,
+            source=source,
             has_newline=True,
-            source_byte_start=(line.source_byte_start if not line.display_prefix else None),
+            source_byte_start=source_byte_start,
             display_prefix=prefix,
             match_start=start,
             match_end=end,
+            start=base,
+            end=span_end,
+            byte_index=byte_index,
         )
         return
     previous_start = 0
-    source_byte_start = line.source_byte_start if not line.display_prefix else None
     for start, end in spans:
         if source_byte_start is not None:
-            source_byte_start += len(value[previous_start:start].encode('utf-8'))
+            source_byte_start += _span_bytes(
+                source, byte_index, base + previous_start, base + start
+            )
             previous_start = start
         yield _Line(
-            text=value[start:end],
+            source=source,
             has_newline=True,
             source_byte_start=source_byte_start,
             display_prefix=prefix,
             match_start=0,
             match_end=end - start,
+            start=base + start,
+            end=base + end,
+            byte_index=byte_index,
         )
 
 
@@ -869,6 +918,33 @@ def _wc(lines: Iterable[_Line], flag: str) -> Iterator[_Line]:
         word_count += _word_count(presented)
         byte_count += len(presented.encode('utf-8')) + int(line.has_newline)
     yield _Line(str({'l': line_count, 'w': word_count, 'c': byte_count}[flag]), False)
+
+
+def _span_bytes(
+    text: str,
+    byte_index: tuple[tuple[int, int], ...] | None,
+    start: int,
+    end: int,
+) -> int:
+    """UTF-8 byte length of ``text[start:end]``.
+
+    A span longer than ``REF_TEXT_INDEX_CHARS`` is measured from the checkpoints,
+    which encodes at most that many characters per endpoint instead of the whole
+    span. Shorter spans are cheaper to encode outright than to look up twice.
+    """
+
+    if byte_index is None or end - start <= REF_TEXT_INDEX_CHARS:
+        return len(text[start:end].encode('utf-8'))
+
+    def offset(char_offset: int) -> int:
+        position = max(
+            0,
+            bisect_right(byte_index, char_offset, key=_char_offset) - 1,
+        )
+        char_start, byte_start = byte_index[position]
+        return byte_start + len(text[char_start:char_offset].encode('utf-8'))
+
+    return offset(end) - offset(start)
 
 
 def _seek_source_byte(entry: RefEntry, requested: int) -> tuple[int, int]:
@@ -927,8 +1003,11 @@ def _truncate_rendered(
     text: str,
     marker: str,
     response_fits: Callable[[str], bool],
+    *,
+    oversized: bool = False,
 ) -> str:
-    if response_fits(text):
+    # ``oversized`` marks ``text`` as already clipped, so the marker is required even if it fits.
+    if not oversized and response_fits(text):
         return text
     result = marker if response_fits(marker) else ''
     low = 0
@@ -1001,6 +1080,21 @@ def _render_lines(
     for line in lines:
         separator = '' if preserve_source_newlines or not pieces else '\n'
         ending = '\n' if preserve_source_newlines and line.has_newline else ''
+        chars = len(separator) + len(line.display_prefix) + (line.end_offset - line.start) + len(ending)
+        if chars > REF_EXEC_RESPONSE_MAX_BYTES:
+            # UTF-8 is at least one byte per character, so this piece cannot fit
+            # and at most its first REF_EXEC_RESPONSE_MAX_BYTES characters can survive.
+            if not pieces and line.match_start is not None and line.match_end is not None:
+                return _grep_excerpt(line, response_fits)
+            head = separator + line.display_prefix + line.source[
+                line.start : min(line.start + REF_EXEC_RESPONSE_MAX_BYTES, line.end_offset)
+            ]
+            return _truncate_rendered(
+                ''.join(pieces) + head,
+                _truncated_marker('wc|grep|head|tail|sed'),
+                response_fits,
+                oversized=True,
+            )
         piece = separator + line.presented + ending
         size = len(piece.encode('utf-8'))
         if (
@@ -1022,13 +1116,16 @@ def _render_lines(
 
 
 def _grep_excerpt(line: _Line, response_fits: Callable[[str], bool]) -> str:
+    source = line.source
+    byte_index = line.byte_index
+    base = line.start
+    line_end = line.end_offset
     match_start = line.match_start or 0
     match_end = line.match_end or match_start
-    match = line.text[match_start:match_end]
-    match_bytes = len(match.encode('utf-8'))
+    match_bytes = _span_bytes(source, byte_index, base + match_start, base + match_end)
     prefix_bytes = len(line.display_prefix.encode('utf-8'))
-    before_match_bytes = len(line.text[:match_start].encode('utf-8'))
-    after_match_bytes = len(line.text[match_end:].encode('utf-8'))
+    before_match_bytes = _span_bytes(source, byte_index, base, base + match_start)
+    after_match_bytes = _span_bytes(source, byte_index, base + match_end, line_end)
 
     # At most four UTF-8 bytes per character on each side. Reserving 512 bytes
     # for provenance makes this bounded without repeatedly re-encoding the line.
@@ -1036,13 +1133,17 @@ def _grep_excerpt(line: _Line, response_fits: Callable[[str], bool]) -> str:
 
     def render(context_chars: int) -> str:
         left = max(0, match_start - context_chars)
-        right = min(len(line.text), match_end + context_chars)
-        excerpt = line.text[left:right]
+        right = min(line_end - base, match_end + context_chars)
+        excerpt = source[base + left : base + right]
         if line.source_byte_start is None:
             marker = _truncated_marker('wc|grep|head|tail|sed')
         else:
-            left_context_bytes = len(line.text[left:match_start].encode('utf-8'))
-            right_context_bytes = len(line.text[match_end:right].encode('utf-8'))
+            left_context_bytes = _span_bytes(
+                source, byte_index, base + left, base + match_start
+            )
+            right_context_bytes = _span_bytes(
+                source, byte_index, base + match_end, base + right
+            )
             match_byte_start = line.source_byte_start + before_match_bytes
             metadata = {
                 'match_byte_start': match_byte_start,
@@ -1288,9 +1389,14 @@ def _execute_reader(
                 response_fits,
             )
 
-    lines = _initial_lines(first, catalog)
     budget = MatchBudget()
     start = 0 if first.command in {'grep', 'head', 'tail', 'sed', 'wc'} else 1
+    lines: Iterable[_Line]
+    if entry is not None and first.command == 'tail' and first.count is not None:
+        lines = _tail_lines(entry, first.count)
+        start = 1
+    else:
+        lines = _initial_lines(first, catalog)
     for stage in stages[start:]:
         lines = _apply_stage(lines, stage, budget)
 
@@ -1316,11 +1422,14 @@ async def _load_catalog_refs(
             requests.append(None)
         if not first.flags or first.flags == frozenset({'tool'}):
             requests.append('tool:')
-    elif isinstance(first.ref, str) and first.ref not in catalog:
+    elif isinstance(first.ref, str) and _needs_body(catalog.get(first.ref)):
         requests.append(first.ref)
     if not requests:
         return
-    loader = next(
+    # A parked stub must be re-read through the loader that listed it; a newer
+    # selected history binds a different message lineage and cannot resolve it.
+    parked = catalog.get(first.ref or '')
+    loader = (parked.load_history if parked is not None else None) or next(
         (
             entry.load_history
             for entry in reversed(catalog.values())
@@ -1333,8 +1442,18 @@ async def _load_catalog_refs(
     for requested in requests:
         loaded = await loader(requested)
         for entry in loaded or ():
-            if isinstance(entry, RefEntry) and _valid_ref(entry.ref):
-                catalog.setdefault(entry.ref, entry)
+            if (
+                isinstance(entry, RefEntry)
+                and _valid_ref(entry.ref)
+                and _needs_body(catalog.get(entry.ref))
+            ):
+                catalog[entry.ref] = entry
+
+
+def _needs_body(entry: RefEntry | None) -> bool:
+    # A real entry with empty text measures zero bytes, so positive bytes with no
+    # text can only be a ref that `ls` parked as metadata.
+    return entry is None or (not entry.text and entry.utf8_bytes > 0)
 
 
 def _new_reader(

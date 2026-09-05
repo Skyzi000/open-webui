@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -248,13 +249,57 @@ def _canonical_messages(
     return [direct] if direct is not None else []
 
 
-def _canonical_history_text(messages: list[dict[str, Any]]) -> str:
-    records = [
+def _canonical_history_records(messages: list[dict[str, Any]]) -> list[str]:
+    return [
         json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
         for message in messages
         for item in _canonical_messages(message)
     ]
-    return '\n'.join(records)
+
+
+def _canonical_history_text(messages: list[dict[str, Any]]) -> str:
+    return '\n'.join(_canonical_history_records(messages))
+
+
+# Running measurement of a canonical history prefix: characters, UTF-8 bytes,
+# embedded newlines, record count, and the sha256 state after those records.
+# Folding it forward once lets every checkpoint prefix be measured without
+# rebuilding its text.
+_HistoryState = tuple[int, int, int, int, Any]
+
+
+def _extend_history_state(
+    state: _HistoryState,
+    records: list[str],
+) -> tuple[_HistoryState, str]:
+    """Fold canonical records into a prefix measurement, returning the text appended."""
+    if not records:
+        return state, ''
+    chars, utf8_bytes, newlines, count, digest = state
+    chunk = ('\n' if count else '') + '\n'.join(records)
+    encoded = chunk.encode('utf-8')
+    digest = digest.copy()
+    digest.update(encoded)
+    return (
+        chars + len(chunk),
+        utf8_bytes + len(encoded),
+        newlines + chunk.count('\n'),
+        count + len(records),
+        digest,
+    ), chunk
+
+
+def _history_prefix_stub(state: _HistoryState, load_history: Any) -> RefEntry:
+    """Ancestor metadata only; its body is cut from the selected text on demand."""
+    chars, utf8_bytes, newlines, _, digest = state
+    return RefEntry(
+        ref=f'history:{digest.hexdigest()}',
+        text='',
+        utf8_bytes=utf8_bytes,
+        line_count=newlines + (1 if chars else 0),
+        byte_index=((0, 0),),
+        load_history=load_history,
+    )
 
 
 def _canonical_history_entry(messages: list[dict[str, Any]]) -> RefEntry:
@@ -352,7 +397,8 @@ def _bind_history_loader(
         for message_index, output_index, _ in _checkpoint_positions(messages)
         if _history_position_key((message_index, output_index)) < selected
     )
-    resolved: dict[tuple[int, int | None], RefEntry | None] = {}
+    resolved: dict[tuple[int, int | None], tuple[RefEntry, int] | None] = {}
+    states_cache: list[list[_HistoryState]] = []
     canonical_tool_sources: dict[int, tuple[str, ...]] = {}
     measured_tools: dict[tuple[int, int], RefEntry | None] = {}
     source_messages = _history_prefix_messages(
@@ -361,14 +407,28 @@ def _bind_history_loader(
         selected_output_index,
     )
 
-    def ancestor_at(position: tuple[int, int | None]) -> RefEntry | None:
+    def history_states() -> list[_HistoryState]:
+        # Published whole so concurrent load_history calls never see a partial list.
+        if not states_cache:
+            states: list[_HistoryState] = [(0, 0, 0, 0, hashlib.sha256())]
+            for message in messages[:selected_index]:
+                state, _ = _extend_history_state(states[-1], _canonical_history_records([message]))
+                states.append(state)
+            states_cache.append(states)
+        return states_cache[0]
+
+    def ancestor_at(position: tuple[int, int | None]) -> tuple[RefEntry, int] | None:
         if position not in resolved:
-            ancestor = _canonical_history_entry(
-                _history_prefix_messages(messages, position[0], position[1])
-            )
+            message_index, output_index = position
+            base = history_states()[message_index]
+            carrier = _history_prefix_messages(messages, message_index, output_index)
+            records = _canonical_history_records(carrier[message_index:])
+            state, chunk = _extend_history_state(base, records)
+            # The shared prefix is part of the selected text by construction, so only
+            # the partial carrier's records still need the containment check.
             resolved[position] = (
-                replace(ancestor, load_history=load_ancestors)
-                if ancestor.text and entry.text.startswith(ancestor.text)
+                (_history_prefix_stub(state, load_ancestors), state[0])
+                if state[3] and entry.text.startswith(chunk, base[0])
                 else None
             )
         return resolved[position]
@@ -411,14 +471,14 @@ def _bind_history_loader(
                 return tool_entries(None if requested == 'tool:' else requested)
             entries = []
             for position in reversed(checkpoint_positions):
-                ancestor = ancestor_at(position)
-                if ancestor is None:
+                found = ancestor_at(position)
+                if found is None:
                     break
-                if requested is not None and ancestor.ref != requested:
-                    continue
-                if requested is not None:
-                    return (ancestor,)
-                entries.append(ancestor)
+                ancestor, chars = found
+                if requested is None:
+                    entries.append(ancestor)
+                elif ancestor.ref == requested:
+                    return (make_ref_entry(entry.text[:chars], kind='history', load_history=load_ancestors),)
             return tuple(entries)
 
         return await asyncio.to_thread(resolve)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib
 import json
 import os
 import re
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -124,6 +126,19 @@ async def test_tail_rejects_line_counts_above_response_budget(monkeypatch):
     result = await reader(f'tail -n {refs.REF_EXEC_RESPONSE_MAX_BYTES + 1} {ref}')
 
     assert result == 'Error: tail line count exceeds the 65,536 line limit'
+    assert (
+        await reader(f'cat {ref} | tail -n {refs.REF_EXEC_RESPONSE_MAX_BYTES + 1}')
+        == 'Error: tail line count exceeds the 65,536 line limit'
+    )
+
+
+@pytest.mark.asyncio
+async def test_oversized_tail_does_not_pre_empt_a_later_stage_error():
+    reader, ref = await _history_reader('one\ntwo\nthree\n')
+
+    command = f'tail -n {refs.REF_EXEC_RESPONSE_MAX_BYTES + 1} {ref} | grep -E "["'
+
+    assert await reader(command) == 'Error: Invalid regex: unterminated character set at position 1'
 
 
 @pytest.mark.parametrize(
@@ -610,3 +625,351 @@ async def test_current_core_tool_wrapper_returns_exact_wc_bytes():
 
     assert await function(command=f'wc -c {ref}') == str(len(source.encode('utf-8')))
     assert f'sha256={ref.split(":", 1)[1]}' in await function(command=f'stat {ref}')
+
+
+@pytest.mark.asyncio
+async def test_giant_single_line_commands_never_copy_the_source():
+    size = 4 * 1024 * 1024
+    # A trailing newline makes the line a strict sub-span of the source, so the
+    # rendered head is a real slice rather than the whole-string identity slice.
+    # grep is excluded there: it still materialises `presented` for the regex.
+    for source, templates in (
+        (
+            'a' * (size - 6) + 'NEEDLE',
+            ('head -n 1 {0}', 'tail -n 1 {0}', 'sed -n 1p {0}',
+             'grep NEEDLE {0}', 'grep -n NEEDLE {0}', 'grep -o NEEDLE {0}'),
+        ),
+        (
+            'a' * (size - 7) + 'NEEDLE\n',
+            ('head -n 1 {0}', 'tail -n 1 {0}', 'sed -n 1p {0}'),
+        ),
+    ):
+        await _assert_giant_line_is_not_copied(source, size, templates)
+
+
+async def _assert_giant_line_is_not_copied(source, size, templates):
+    _, _, reader, ref = await _project(source)
+    for command in (template.format(ref) for template in templates):
+        await reader(command)
+        tracemalloc.start()
+        tracemalloc.reset_peak()
+        result = await reader(command)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+        assert peak < size // 8, (command, peak)
+
+
+@pytest.mark.asyncio
+async def test_giant_single_line_head_is_truncated_with_a_marker():
+    source = 'a' * (4 * 1024 * 1024)
+    marker = refs._truncated_marker('wc|grep|head|tail|sed')
+    for text in (source, source + '\n'):
+        entry = refs.make_ref_entry(text, kind='tool')
+        catalog = {entry.ref: entry}
+        for command in (
+            f'head -n 1 {entry.ref}',
+            f'tail -n 1 {entry.ref}',
+            f'sed -n 1p {entry.ref}',
+        ):
+            stages = refs._parse_command(command)
+            # count_tokens=None makes any <=64 KiB response "fit", so a page that
+            # skipped the budget check would come back without its marker.
+            for count_tokens in (None, compaction.estimate_text_tokens):
+                result = refs._execute_reader(
+                    stages, catalog, TOKEN_THRESHOLD, count_tokens
+                )
+                assert result.endswith('</auto_compact_ref_truncated>'), command
+                assert result == text[: len(result) - len(marker)] + marker
+                assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_line_exactly_at_the_response_budget_is_not_truncated():
+    source = 'q' * refs.REF_EXEC_RESPONSE_MAX_BYTES
+    entry = refs.make_ref_entry(source, kind='tool')
+    catalog = {entry.ref: entry}
+    for command in (f'head -n 1 {entry.ref}', f'sed -n 1p {entry.ref}'):
+        stages = refs._parse_command(command)
+        assert refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None) == source
+
+
+@pytest.mark.asyncio
+async def test_grep_excerpt_offsets_cross_many_byte_index_checkpoints():
+    stride = refs.REF_TEXT_INDEX_CHARS
+    prefix = ('a' + 'é' + '漢' + '🙂') * stride
+    suffix = ('🙂' + 'b') * stride
+    source = prefix + 'NEEDLE' + suffix
+    assert len(prefix) == 4 * stride
+    _, _, reader, ref = await _project(source)
+
+    result = await reader(f'grep -n NEEDLE {ref}')
+    visible, encoded = result.rsplit('\n<auto_compact_ref_excerpt>', 1)
+    marker = json.loads(encoded.removesuffix('</auto_compact_ref_excerpt>'))
+    prefix_bytes = len(prefix.encode('utf-8'))
+    assert marker['match_byte_start'] == prefix_bytes
+    assert marker['match_byte_end'] == prefix_bytes + 6
+    assert marker['omitted_prefix_bytes'] == prefix_bytes - len(
+        visible.split('NEEDLE')[0].removeprefix('1:').encode('utf-8')
+    )
+    assert marker['omitted_suffix_bytes'] == len(suffix.encode('utf-8')) - len(
+        visible.split('NEEDLE')[1].encode('utf-8')
+    )
+
+
+@pytest.mark.asyncio
+async def test_grep_only_matching_tracks_source_bytes_across_multibyte_gaps():
+    gap = ('🙂' + 'é' + 'x') * refs.REF_TEXT_INDEX_CHARS
+    # The leading line puts the matched line at a non-zero source offset.
+    head = 'first line\n'
+    source = head + gap.join(('', 'NEEDLE', 'NEEDLE', 'NEEDLE'))
+    entry = refs.make_ref_entry(source, kind='tool')
+    stages = refs._parse_command(f'grep -o NEEDLE {entry.ref}')
+    lines = list(
+        refs._apply_stage(
+            refs._iter_source_lines(entry), stages[0], refs.MatchBudget()
+        )
+    )
+
+    gap_bytes = len(gap.encode('utf-8'))
+    head_bytes = len(head.encode('utf-8'))
+    assert [line.source_byte_start for line in lines] == [
+        head_bytes + gap_bytes,
+        head_bytes + 2 * gap_bytes + 6,
+        head_bytes + 3 * gap_bytes + 12,
+    ]
+    assert [line.text for line in lines] == ['NEEDLE'] * 3
+
+
+@pytest.mark.asyncio
+async def test_grep_excerpt_never_reaches_past_its_own_line():
+    # The trailing 'b' run is shorter than the excerpt context margin, so the
+    # right edge is clamped by the line, not by the context budget.
+    source = 'a' * 100_000 + 'NEEDLE' + 'b' * 10 + '\nSECOND LINE\n'
+    _, _, reader, ref = await _project(source)
+
+    result = await reader(f'grep -n NEEDLE {ref}')
+    visible, encoded = result.rsplit('\n<auto_compact_ref_excerpt>', 1)
+    marker = json.loads(encoded.removesuffix('</auto_compact_ref_excerpt>'))
+    assert 'SECOND' not in result
+    assert '\n' not in visible
+    assert visible.endswith('NEEDLE' + 'b' * 10)
+    assert marker['match_byte_start'] == 100_000
+    assert marker['omitted_prefix_bytes'] > 0
+    assert marker['omitted_suffix_bytes'] == 0
+
+
+@pytest.mark.asyncio
+async def test_history_ancestor_body_survives_being_listed_first():
+    messages = [
+        {'role': 'user', 'content': 'first question'},
+        {'role': 'assistant', 'content': 'first answer', 'contextSummary': 'one'},
+        {'role': 'user', 'content': 'second question'},
+        {'role': 'assistant', 'content': 'second answer', 'contextSummary': 'two'},
+        {'role': 'user', 'content': 'third question'},
+        {'role': 'assistant', 'content': 'third answer', 'contextSummary': 'three'},
+    ]
+    selected = await compaction.resolve_request_history((messages, 5))
+    assert selected is not None
+    body = {'model': 'test', 'stream': True, 'messages': [{'role': 'user', 'content': 'continue'}]}
+    registry = {}
+
+    async def load_selected():
+        return selected
+
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=10 ** 9,
+        count_tokens=lambda _text: 0,
+        history_loader=load_selected,
+    )
+    reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
+    listed = (await reader('ls history')).splitlines()
+    assert listed[0] == selected.ref and len(listed) == 3
+
+    for ref, prefix_end in zip(listed[1:], (3, 1)):
+        want = compaction._canonical_history_entry(messages[:prefix_end])
+        assert ref == want.ref
+        assert await reader(f'cat {ref}') == want.text
+        assert await reader(f'wc -c {ref}') == str(want.utf8_bytes)
+        assert await reader(f'wc -l {ref}') == str(want.line_count)
+        assert await reader(f'wc -w {ref}') == str(len(want.text.split()))
+        assert (await reader(f'stat {ref}')).endswith(
+            f'utf8_bytes={want.utf8_bytes} lines={want.line_count} '
+            f'chars={len(want.text)} sha256={want.ref.split(":", 1)[1]}'
+        )
+
+
+@pytest.mark.asyncio
+async def test_listed_history_ancestor_body_is_fetched_once_on_first_read():
+    listed = refs.make_ref_entry('older history', kind='history')
+    assert listed is not None
+    stub = compaction.replace(listed, text='')
+    loads = []
+
+    async def load_history(requested):
+        loads.append(requested)
+        return (stub,) if requested is None else (listed,)
+
+    selected = refs.make_ref_entry('selected history', kind='history', load_history=load_history)
+    assert selected is not None
+    body = {'model': 'test', 'stream': True, 'messages': [{'role': 'user', 'content': 'continue'}]}
+    registry = {}
+
+    async def load_selected():
+        return selected
+
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=1000,
+        count_tokens=lambda _text: 1,
+        history_loader=load_selected,
+    )
+    reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
+    assert (await reader('ls history')).splitlines() == [selected.ref, listed.ref]
+    # `ls` parked metadata only, so the first read of any kind fetches the body.
+    assert await reader(f'wc -c {listed.ref}') == str(listed.utf8_bytes)
+    assert loads == [None, listed.ref]
+    # Every later read, `cat` included, is served from the cached body.
+    assert await reader(f'cat {listed.ref}') == listed.text
+    assert await reader(f'cat {listed.ref}') == listed.text
+    assert loads == [None, listed.ref]
+
+
+def test_short_line_spans_never_reach_for_the_byte_index(monkeypatch):
+    entry = refs.make_ref_entry('line\n' * 5_000, kind='tool')
+    assert entry is not None and entry.byte_index
+    lookups = []
+    bisect_right = refs.bisect_right
+
+    def counted(*args, **kwargs):
+        lookups.append(args[1])
+        return bisect_right(*args, **kwargs)
+
+    monkeypatch.setattr(refs, 'bisect_right', counted)
+    lines = list(refs._iter_source_lines(entry))
+
+    assert [line.text for line in lines] == ['line'] * 5_000
+    assert [line.source_byte_start for line in lines] == [5 * index for index in range(5_000)]
+    # Spans this short cost less to encode outright than two checkpoint lookups.
+    assert lookups == []
+
+
+@pytest.mark.asyncio
+async def test_parked_history_stubs_reload_through_the_loader_that_listed_them():
+    ancestors = tuple(
+        refs.make_ref_entry(f'ancestor {index} body', kind='history') for index in range(2)
+    )
+
+    async def load_a(requested):
+        if requested is None:
+            # `ls` parks metadata-only stubs that carry their own loader back.
+            return tuple(
+                compaction.replace(item, text='', load_history=load_a) for item in ancestors
+            )
+        return tuple(item for item in ancestors if item.ref == requested)
+
+    async def load_b(_requested):
+        # A later selected history binds a different lineage and resolves nothing.
+        return ()
+
+    body = {'model': 'test-model', 'stream': True, 'messages': [{'role': 'user', 'content': 'go'}]}
+    registry = {}
+
+    async def install(text, loader):
+        selected = refs.make_ref_entry(text, kind='history', load_history=loader)
+
+        async def load_selected():
+            return selected
+
+        assert await refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=TOKEN_THRESHOLD,
+            count_tokens=compaction.estimate_text_tokens,
+            history_loader=load_selected,
+        )
+        return registry[refs.REF_EXEC_TOOL_NAME]['callable']
+
+    reader = await install('round one selected history', load_a)
+    assert (await reader('ls history')).splitlines()[1:] == [item.ref for item in ancestors]
+
+    assert await install('round two selected history', load_b) is reader
+    for ancestor in ancestors:
+        assert await reader(f'cat {ancestor.ref}') == ancestor.text
+        stat = await reader(f'stat {ancestor.ref}')
+        assert f'utf8_bytes={ancestor.utf8_bytes} ' in stat
+        assert f'chars={ancestor.utf8_bytes} ' in stat
+
+
+def test_tail_line_windows_match_the_source_tail():
+    for text in ('l1\nl2\nl3\nl4\n', 'l1\nl2\nl3\nl4'):
+        entry = refs.make_ref_entry(text, kind='tool')
+        assert entry is not None and entry.line_count == 4
+        catalog = {entry.ref: entry}
+        source_lines = text.rstrip('\n').split('\n')
+        for count in (0, 1, 3, 4, 7):
+            stages = refs._parse_command(f'tail -n {count} {entry.ref}')
+            expected = '\n'.join(source_lines[-count:]) if count else ''
+            assert refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None) == expected
+
+
+def test_tail_of_the_whole_source_does_not_retain_a_line_per_source_line():
+    entry = refs.make_ref_entry(('t' * 511 + '\n') * 20_000, kind='tool')
+    assert entry is not None and entry.line_count == 20_000
+    catalog = {entry.ref: entry}
+    stages = refs._parse_command(f'tail -n 20000 {entry.ref}')
+    warm = refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None)
+
+    gc.collect()
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    result = refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None)
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert result == warm
+    assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+    # Retaining one _Line per source line costs >4 MiB here, a whole-line copy
+    # each (HEAD) costs >13 MiB.
+    assert peak < 2 * 1024 * 1024, peak
+
+
+def test_tail_window_keeps_absolute_source_offsets_for_a_giant_line():
+    giant = '漢' * 30_000
+    source = 'NEEDLE decoy\n' + giant + 'NEEDLE' + giant + '\nlast line\n'
+    entry = refs.make_ref_entry(source, kind='tool')
+    assert entry is not None and entry.line_count == 3
+    stages = refs._parse_command(f'tail -n 2 {entry.ref} | grep NEEDLE')
+
+    result = refs._execute_reader(stages, {entry.ref: entry}, TOKEN_THRESHOLD, None)
+
+    # The decoy sits outside the tail window; only the giant line survives.
+    assert 'decoy' not in result
+    _, encoded = result.rsplit('\n<auto_compact_ref_excerpt>', 1)
+    marker = json.loads(encoded.removesuffix('</auto_compact_ref_excerpt>'))
+    assert marker == {
+        'match_byte_start': 90_013,
+        'match_byte_end': 90_019,
+        'omitted_prefix_bytes': 65_619,
+        'omitted_suffix_bytes': 65_619,
+    }
+
+
+def test_tail_of_nothing_never_pulls_the_source(monkeypatch):
+    entry = refs.make_ref_entry('l1\nl2\nl3\n', kind='tool')
+    assert entry is not None
+    catalog = {entry.ref: entry}
+
+    def untouchable(_entry):
+        raise AssertionError('tail -n 0 pulled the source')
+        yield  # a generator like the real one, so only a pull can fail
+
+    monkeypatch.setattr(refs, '_iter_source_lines', untouchable)
+    stages = refs._parse_command(f'tail -n 0 {entry.ref}')
+    assert refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None) == ''

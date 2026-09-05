@@ -1,10 +1,13 @@
 import asyncio
 import copy
+import gc
 import importlib
 import json
 import logging
 import os
 import re
+import threading
+import tracemalloc
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1490,10 +1493,10 @@ def test_responses_history_uses_core_projection_for_unknown_shapes():
     ]
 
 
-def test_history_ancestor_resolution_is_incremental_and_cached(monkeypatch):
+def test_history_ancestor_resolution_lists_metadata_and_serves_bodies_on_demand():
     messages = [
         {'role': 'user', 'content': 'root'},
-        {'role': 'user', 'content': 'checkpoint one', 'contextSummary': 'one'},
+        {'role': 'user', 'content': 'checkpoint 壱', 'contextSummary': 'one'},
         {'role': 'assistant', 'content': 'middle'},
         {'role': 'user', 'content': 'checkpoint two', 'contextSummary': 'two'},
         {'role': 'assistant', 'content': 'recent'},
@@ -1504,29 +1507,161 @@ def test_history_ancestor_resolution_is_incremental_and_cached(monkeypatch):
     far = compaction._canonical_history_entry(messages[:1])
     assert selected is not None and selected.load_history is not None
 
-    calls = []
-    make_entry = compaction.make_ref_entry
-
-    def counted(text, **kwargs):
-        calls.append(text)
-        return make_entry(text, **kwargs)
-
-    monkeypatch.setattr(compaction, 'make_ref_entry', counted)
     assert asyncio.run(selected.load_history(f'history:{"f" * 64}')) == ()
-    assert calls == [near.text, far.text]
 
     assert asyncio.run(selected.load_history(near.ref)) == (
         compaction.replace(near, load_history=selected.load_history),
     )
-    assert calls == [near.text, far.text]
 
     loaded_far = asyncio.run(selected.load_history(far.ref))
-    assert [entry.ref for entry in loaded_far] == [far.ref]
-    assert calls == [near.text, far.text]
+    assert loaded_far == (compaction.replace(far, load_history=selected.load_history),)
 
     listed = asyncio.run(selected.load_history(None))
     assert [entry.ref for entry in listed] == [near.ref, far.ref]
-    assert calls == [near.text, far.text]
+    # Listing reports measurements only; bodies are cut from the selected text.
+    assert [entry.text for entry in listed] == ['', '']
+    assert [entry.utf8_bytes for entry in listed] == [near.utf8_bytes, far.utf8_bytes]
+    assert [entry.line_count for entry in listed] == [near.line_count, far.line_count]
+
+
+def _nested_checkpoint_chat():
+    body = 'x' * 600
+    messages = []
+    for index in range(10):
+        if index % 2 == 0:
+            messages.append({'role': 'user', 'content': f'u{index} {body}'})
+            continue
+        message = {
+            'role': 'assistant',
+            'content': f'a{index} {body}',
+            'contextSummary': f's{index}',
+        }
+        if index in (3, 7):
+            message['output'] = [
+                {'type': 'message', 'content': [{'type': 'output_text', 'text': f'o{index} {body}'}]},
+                {
+                    'type': 'function_call',
+                    'call_id': f'k{index}',
+                    'name': 'lookup',
+                    'arguments': '{}',
+                    'status': 'completed',
+                    'contextSummary': f'n{index}-1',
+                },
+                {
+                    'type': 'function_call_output',
+                    'call_id': f'k{index}',
+                    'output': [{'type': 'input_text', 'text': f'r{index} {body}'}],
+                    'contextSummary': f'n{index}-2',
+                },
+                {
+                    'type': 'message',
+                    'content': [{'type': 'output_text', 'text': f'p{index} {body}'}],
+                    'contextSummary': f'n{index}-3',
+                },
+            ]
+        messages.append(message)
+    return messages
+
+
+def _canonical_ancestors(messages, selected_index, selected_output_index):
+    """Ancestor walk rebuilt from full canonical prefix texts."""
+    selected = compaction._canonical_history_entry(
+        compaction._history_prefix_messages(messages, selected_index, selected_output_index)
+    )
+    limit = compaction._history_position_key((selected_index, selected_output_index))
+    positions = [
+        (message_index, output_index)
+        for message_index, output_index, _ in compaction._checkpoint_positions(messages)
+        if compaction._history_position_key((message_index, output_index)) < limit
+    ]
+    expected = []
+    for position in reversed(positions):
+        ancestor = compaction._canonical_history_entry(
+            compaction._history_prefix_messages(messages, *position)
+        )
+        if not (ancestor.text and selected.text.startswith(ancestor.text)):
+            break
+        expected.append(ancestor)
+    return len(positions), tuple(expected)
+
+
+def test_history_listing_matches_canonical_prefixes_with_nested_checkpoints():
+    messages = _nested_checkpoint_chat()
+    selected_index, selected_output_index, _ = compaction._checkpoint_positions(messages)[-1]
+    entry = compaction._history_entry_at_position(messages, selected_index, selected_output_index)
+    assert entry is not None and entry.load_history is not None
+    candidates, expected = _canonical_ancestors(messages, selected_index, selected_output_index)
+    # A nested position that is not a prefix truncates the walk before the older ones.
+    assert 0 < len(expected) < candidates
+
+    listed = asyncio.run(entry.load_history(None))
+    assert [item.ref for item in listed] == [item.ref for item in expected]
+    for item, want in zip(listed, expected):
+        assert (item.utf8_bytes, item.line_count) == (want.utf8_bytes, want.line_count)
+        assert asyncio.run(entry.load_history(item.ref)) == (
+            compaction.replace(want, load_history=entry.load_history),
+        )
+
+
+def test_history_listing_peak_memory_stays_below_one_prefix():
+    body = 'x' * 4096
+    messages = []
+    for index in range(96):
+        if index % 2 == 0:
+            messages.append({'role': 'user', 'content': f'u{index} {body}'})
+        else:
+            messages.append(
+                {'role': 'assistant', 'content': f'a{index} {body}', 'contextSummary': f's{index}'}
+            )
+    entry = compaction._history_entry_at(messages, len(messages) - 1)
+    assert entry is not None and entry.load_history is not None
+
+    gc.collect()
+    tracemalloc.start()
+    try:
+        base = tracemalloc.get_traced_memory()[0]
+        listed = asyncio.run(entry.load_history(None))
+        peak = tracemalloc.get_traced_memory()[1] - base
+    finally:
+        tracemalloc.stop()
+
+    assert len(listed) == 47
+    # Rebuilding every prefix would cost roughly len(listed) / 2 whole prefixes.
+    assert peak < entry.utf8_bytes
+
+
+def test_concurrent_history_listings_never_read_a_partial_prefix_cache(monkeypatch):
+    messages = _nested_checkpoint_chat()
+    fresh = compaction._history_entry_at(messages, len(messages) - 1)
+    assert fresh is not None and fresh.load_history is not None
+    expected = [item.ref for item in asyncio.run(fresh.load_history(None))]
+    assert expected
+
+    entry = compaction._history_entry_at(messages, len(messages) - 1)
+    assert entry is not None and entry.load_history is not None
+    records = compaction._canonical_history_records
+    parked = threading.Event()
+    release = threading.Event()
+
+    def stalled(items):
+        # The first resolver parks inside its prefix walk while the second runs to
+        # completion; the second must build its own list, not read a partial one.
+        if not parked.is_set():
+            parked.set()
+            assert release.wait(5)
+        return records(items)
+
+    monkeypatch.setattr(compaction, '_canonical_history_records', stalled)
+
+    async def race():
+        first = asyncio.ensure_future(entry.load_history(None))
+        assert await asyncio.to_thread(parked.wait, 5)
+        second = await entry.load_history(None)
+        release.set()
+        return await first, second
+
+    first, second = asyncio.run(race())
+    assert [item.ref for item in first] == [item.ref for item in second] == expected
 
 
 def test_non_string_code_interpreter_result_round_trips_checkpoint():
