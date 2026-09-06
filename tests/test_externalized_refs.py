@@ -36,6 +36,25 @@ def _body(content: str, **overrides):
     return body
 
 
+def _preview_ref(content: str) -> str:
+    match = re.search(r'tool:[0-9a-f]{64}', content)
+    assert match is not None, content
+    return match.group(0)
+
+
+def _preview_parts(content: str) -> tuple[str, str, str]:
+    """Split a projected preview into (prefix, next command, suffix)."""
+    open_tag = '\n<auto_compact_ref_truncated>'
+    close_tag = '</auto_compact_ref_truncated>'
+    marker_start = content.find(open_tag)
+    marker_end = content.find(close_tag, marker_start)
+    assert 0 <= marker_start < marker_end, content
+    encoded = content[marker_start + len(open_tag) : marker_end]
+    command = json.loads(encoded)['next']
+    suffix = content[marker_end + len(close_tag) + 1 :]
+    return content[:marker_start], command, suffix
+
+
 async def _project(content: str, *, registry=None, body=None):
     registry = {} if registry is None else registry
     body = _body(content) if body is None else body
@@ -48,7 +67,7 @@ async def _project(content: str, *, registry=None, body=None):
     )
     assert active is True
     reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
-    ref = body['messages'][1]['content']
+    ref = _preview_ref(body['messages'][1]['content'])
     return body, registry, reader, ref
 
 
@@ -167,14 +186,14 @@ async def test_catalog_unions_on_reentry_without_replacing_reader():
         second_body,
         registry,
         native=True,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
     assert registry[refs.REF_EXEC_TOOL_NAME]['callable'] is reader
-    second_ref = second_body['messages'][1]['content']
+    second_ref = _preview_ref(second_body['messages'][1]['content'])
     assert (await reader('ls tool')).splitlines() == [first_ref, second_ref]
-    assert await reader(f'wc -c {first_ref}') == str(len(first_source))
-    assert await reader(f'wc -c {second_ref}') == str(len(second_source))
+    assert await reader(f'wc -c {first_ref}') == str(len(first_source.encode('utf-8')))
+    assert await reader(f'wc -c {second_ref}') == str(len(second_source.encode('utf-8')))
 
 
 @pytest.mark.asyncio
@@ -185,14 +204,17 @@ async def test_summary_projection_keeps_raw_messages_and_needs_no_reader():
 
     projected = await refs.project_tool_refs(
         messages,
-        threshold_tokens=1,
-        count_tokens=lambda _text: 1,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
     )
 
     assert messages == before
     assert projected[0] is messages[0]
     assert projected[1] is not messages[1]
-    assert re.fullmatch(r'tool:[0-9a-f]{64}', projected[1]['content'])
+    content = projected[1]['content']
+    assert content != source
+    assert '<auto_compact_ref_truncated>' in content
+    assert compaction.estimate_text_tokens(content) < TOKEN_THRESHOLD
 
 
 @pytest.mark.asyncio
@@ -208,7 +230,8 @@ async def test_captured_tool_entry_is_admitted_without_rehashing(monkeypatch):
         count_tokens=count_tokens,
     )
     assert len(entries) == 1
-    assert projected[1]['content'] == entries[0].ref
+    assert _preview_ref(projected[1]['content']) == entries[0].ref
+    assert projected[1]['content'] != source
 
     def unexpected_hash():
         raise AssertionError('captured source must reuse its immutable entry')
@@ -225,7 +248,7 @@ async def test_captured_tool_entry_is_admitted_without_rehashing(monkeypatch):
         seed_entries=entries,
     )
     reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
-    assert body['messages'][1]['content'] == entries[0].ref
+    assert _preview_ref(body['messages'][1]['content']) == entries[0].ref
     assert await reader(f'wc -c {entries[0].ref}') == str(len(source.encode('utf-8')))
 
 
@@ -257,7 +280,9 @@ async def test_reader_output_is_below_threshold_and_not_reexternalized():
         count_tokens=compaction.estimate_text_tokens,
     )
     assert continuation['messages'][0]['content'] == page
-    assert continuation['messages'][1]['content'].startswith('tool:')
+    projected = continuation['messages'][1]['content']
+    assert '<auto_compact_ref_truncated>' in projected
+    assert compaction.estimate_text_tokens(projected) < TOKEN_THRESHOLD
 
 
 @pytest.mark.asyncio
@@ -314,7 +339,7 @@ async def test_copy_on_write_and_sibling_catalog_isolation():
         threshold_tokens=TOKEN_THRESHOLD,
         count_tokens=compaction.estimate_text_tokens,
     )
-    extra_ref = extra['messages'][1]['content']
+    extra_ref = _preview_ref(extra['messages'][1]['content'])
     assert extra_ref in await first_reader('ls tool')
     assert extra_ref not in await second_reader('ls tool')
 
@@ -412,7 +437,7 @@ async def test_continuation_hashes_only_new_raw_tool_output(monkeypatch):
         return real_sha256()
 
     def count_tokens(text):
-        return 1 if re.fullmatch(r'tool:[0-9a-f]{64}', text) else 2
+        return len(text) // 4
 
     class RawText(str):
         def __hash__(self):
@@ -420,33 +445,35 @@ async def test_continuation_hashes_only_new_raw_tool_output(monkeypatch):
 
     monkeypatch.setattr(refs.hashlib, 'sha256', tracked_hash)
     registry = {}
-    first = _body('first raw output')
+    first = _body('first raw output ' * 600)
     assert await refs.externalize_refs(
         first,
         registry,
         native=True,
-        threshold_tokens=2,
+        threshold_tokens=1000,
         count_tokens=count_tokens,
     )
-    first_ref = first['messages'][1]['content']
+    first_content = first['messages'][1]['content']
+    first_ref = _preview_ref(first_content)
     continuation = {
         'model': 'test',
         'stream': True,
         'messages': [
-            {'role': 'tool', 'tool_call_id': 'call-1', 'content': first_ref},
-            {'role': 'tool', 'tool_call_id': 'call-2', 'content': RawText('second raw output')},
+            {'role': 'tool', 'tool_call_id': 'call-1', 'content': first_content},
+            {'role': 'tool', 'tool_call_id': 'call-2', 'content': RawText('second raw output ' * 600)},
         ],
     }
     assert await refs.externalize_refs(
         continuation,
         registry,
         native=True,
-        threshold_tokens=2,
+        threshold_tokens=1000,
         count_tokens=count_tokens,
     )
 
-    assert continuation['messages'][0]['content'] == first_ref
-    assert continuation['messages'][1]['content'].startswith('tool:')
+    assert continuation['messages'][0]['content'] == first_content
+    assert '<auto_compact_ref_truncated>' in continuation['messages'][1]['content']
+    assert _preview_ref(continuation['messages'][1]['content']) != first_ref
     assert calls == 2
 
 
@@ -973,3 +1000,240 @@ def test_tail_of_nothing_never_pulls_the_source(monkeypatch):
     monkeypatch.setattr(refs, '_iter_source_lines', untouchable)
     stages = refs._parse_command(f'tail -n 0 {entry.ref}')
     assert refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, None) == ''
+
+
+def _rebuilt_preview(source: str, ref: str, prefix: str, suffix: str) -> str:
+    prefix_bytes = len(prefix.encode('utf-8'))
+    omitted_bytes = (
+        len(source.encode('utf-8')) - prefix_bytes - len(suffix.encode('utf-8'))
+    )
+    command = f'tail -c +{prefix_bytes + 1} {ref} | head -c {omitted_bytes}'
+    return prefix + refs._truncated_marker(command) + '\n' + suffix
+
+
+@pytest.mark.asyncio
+async def test_preview_keeps_head_and_tail_around_the_marker():
+    source = 'head of the result\n' + 'middle line\n' * 900 + 'tail of the result\n'
+    body, registry, reader, ref = await _project(source)
+
+    content = body['messages'][1]['content']
+    prefix, command, suffix = _preview_parts(content)
+    assert command.startswith(f'tail -c +{len(prefix.encode("utf-8")) + 1} {ref} | head -c ')
+    assert prefix == source[: len(prefix)]
+    assert suffix == source[len(source) - len(suffix) :]
+    assert prefix.startswith('head of the result\n')
+    assert suffix.endswith('tail of the result\n')
+    omitted = int(command.rsplit(' ', 1)[1])
+    assert omitted == len(source.encode('utf-8')) - len(prefix.encode('utf-8')) - len(suffix.encode('utf-8'))
+    assert abs(len(prefix.encode('utf-8')) - len(suffix.encode('utf-8'))) <= 4
+    assert compaction.estimate_text_tokens(content) < TOKEN_THRESHOLD
+    assert len(content.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_preview_boundary_below_at_and_above_threshold():
+    def count_tokens(text):
+        return len(text) // 4
+
+    for size, externalized in ((3996, False), (4000, True), (4004, True)):
+        body = _body('x' * size)
+        registry = {}
+        active = await refs.externalize_refs(
+            body,
+            registry,
+            native=True,
+            threshold_tokens=1000,
+            count_tokens=count_tokens,
+        )
+        assert active is externalized, size
+        if externalized:
+            content = body['messages'][1]['content']
+            assert count_tokens(content) < 1000
+            assert '<auto_compact_ref_truncated>' in content
+        else:
+            assert body['messages'][1]['content'] == 'x' * size
+
+
+@pytest.mark.asyncio
+async def test_preview_is_per_side_maximal_for_a_monotone_counter():
+    source = 'word ' * 8000
+    counter = lambda text: len(text.encode('utf-8'))  # noqa: E731
+
+    body = _body(source)
+    registry = {}
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=10_000,
+        count_tokens=counter,
+    )
+    content = body['messages'][1]['content']
+    ref = _preview_ref(content)
+    # counter == bytes, so tokens < 10_000 means exactly byte cap 9_999.
+    assert len(content.encode('utf-8')) == 9_999
+    prefix, _command, suffix = _preview_parts(content)
+    for extended in (
+        _rebuilt_preview(source, ref, prefix + source[len(prefix)], suffix),
+        _rebuilt_preview(source, ref, prefix, source[len(source) - len(suffix) - 1] + suffix),
+    ):
+        assert len(extended.encode('utf-8')) > 9_999
+
+
+@pytest.mark.asyncio
+async def test_preview_byte_cap_binds_before_tokens():
+    source = 'a' * 200_000
+    body = _body(source)
+    registry = {}
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=1_000_000,
+        count_tokens=lambda _text: 1,
+    )
+    content = body['messages'][1]['content']
+    assert len(content.encode('utf-8')) == refs.REF_EXEC_RESPONSE_MAX_BYTES
+    ref = _preview_ref(content)
+    prefix, _command, suffix = _preview_parts(content)
+    for extended in (
+        _rebuilt_preview(source, ref, prefix + source[len(prefix)], suffix),
+        _rebuilt_preview(source, ref, prefix, source[len(source) - len(suffix) - 1] + suffix),
+    ):
+        assert len(extended.encode('utf-8')) > refs.REF_EXEC_RESPONSE_MAX_BYTES
+
+
+@pytest.mark.asyncio
+async def test_preview_uses_95_percent_of_the_real_token_budget():
+    source = 'Realistic english sentences with several words each.\n' * 700
+    body, registry, reader, ref = await _project(source)
+
+    content = body['messages'][1]['content']
+    tokens = compaction.estimate_text_tokens(content)
+    assert len(content.encode('utf-8')) < refs.REF_EXEC_RESPONSE_MAX_BYTES
+    assert TOKEN_THRESHOLD * 0.95 <= tokens < TOKEN_THRESHOLD
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'source',
+    [
+        '日本語の長いテキスト行を含む結果。\n' * 1200,
+        '🙂🚀漢字αβγ' * 3000,
+        'single giant line ' + 'z' * 100_000,
+    ],
+)
+async def test_multibyte_and_single_line_previews_stay_capped(source):
+    body, registry, reader, ref = await _project(source)
+    content = body['messages'][1]['content']
+
+    assert compaction.estimate_text_tokens(content) < TOKEN_THRESHOLD
+    assert len(content.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
+    assert await reader(f'wc -c {ref}') == str(len(source.encode('utf-8')))
+
+
+@pytest.mark.asyncio
+async def test_preview_next_command_restores_the_exact_middle_across_pages():
+    source = ('x' * 70 + '\n') * 1200
+    body, registry, reader, ref = await _project(source)
+    content = body['messages'][1]['content']
+    prefix, command, suffix = _preview_parts(content)
+
+    middle, pages = await _read_pages(reader, command)
+    assert len(pages) >= 2
+
+    rebuilt = (prefix + middle + suffix).encode('utf-8')
+    assert rebuilt == source.encode('utf-8')
+    assert '\n<auto_compact_ref_truncated>' not in middle
+    assert await reader(f'cat {ref}') != source
+
+
+@pytest.mark.asyncio
+async def test_preview_ref_is_the_hash_of_the_full_source():
+    import hashlib
+
+    source = 'hash check payload ' * 800
+    body, registry, reader, ref = await _project(source)
+
+    assert ref == 'tool:' + hashlib.sha256(source.encode('utf-8')).hexdigest()
+    assert await reader(f'wc -c {ref}') == str(len(source.encode('utf-8')))
+    assert (await reader('ls tool')).splitlines() == [ref]
+
+
+@pytest.mark.asyncio
+async def test_preview_render_is_reused_and_byte_stable():
+    source = 'reuse payload ' * 1000
+    render_calls = []
+    original = refs._render_ref_preview
+
+    def tracked(entry, **kwargs):
+        render_calls.append(entry.ref)
+        return original(entry, **kwargs)
+
+    refs._render_ref_preview = tracked
+    try:
+        cache = {}
+        messages = _body(source)['messages']
+        first, entries = await refs.capture_tool_ref_projections(
+            messages,
+            threshold_tokens=TOKEN_THRESHOLD,
+            count_tokens=compaction.estimate_text_tokens,
+            render_cache=cache,
+        )
+        second, second_entries = await refs.capture_tool_ref_projections(
+            messages,
+            threshold_tokens=TOKEN_THRESHOLD,
+            count_tokens=compaction.estimate_text_tokens,
+            seed_entries=entries,
+            render_cache=cache,
+        )
+    finally:
+        refs._render_ref_preview = original
+
+    assert render_calls == [entries[0].ref]
+    assert second[1]['content'] == first[1]['content']
+    assert [entry.ref for entry in second_entries] == [entry.ref for entry in entries]
+
+    threshold_changed, _ = await refs.capture_tool_ref_projections(
+        messages,
+        threshold_tokens=500,
+        count_tokens=compaction.estimate_text_tokens,
+        seed_entries=entries,
+        render_cache=cache,
+    )
+    changed = threshold_changed[1]['content']
+    assert changed != first[1]['content']
+    assert compaction.estimate_text_tokens(changed) < 500
+
+
+@pytest.mark.asyncio
+async def test_uncountable_preview_is_not_adopted_or_cached():
+    source = 'y' * 200_000
+    cache = {}
+
+    def failing(_text):
+        raise OSError('counter down')
+
+    body = _body(source)
+    registry = {}
+    assert not await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=failing,
+        render_cache=cache,
+    )
+    assert body['messages'][1]['content'] == source
+    assert registry == {}
+
+    assert await refs.externalize_refs(
+        body,
+        registry,
+        native=True,
+        threshold_tokens=TOKEN_THRESHOLD,
+        count_tokens=compaction.estimate_text_tokens,
+        render_cache=cache,
+    )
+    assert body['messages'][1]['content'] != source
+    assert len(cache) == 1

@@ -45,7 +45,10 @@ REF_EXEC_FUNCTION_SPEC: dict[str, Any] = {
         'wc -l|-w|-c REF; cat REF; head [-n N|-N|-c N] REF; '
         'tail [-n N|-N|-c N|-c +N] REF; sed -n Np|M,Np|M,$p REF; '
         'grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN REF. '
-        'grep/head/tail/sed/wc can be piped.'
+        'grep/head/tail/sed/wc can be piped. '
+        'Truncated tool results and reader pages embed a <auto_compact_ref_truncated> '
+        'marker whose next command reads the omitted span; follow it across pages '
+        'when the span is large.'
     ),
     'parameters': {
         'type': 'object',
@@ -163,6 +166,26 @@ def _measure_text(
     )
 
 
+def _token_count_or_none(
+    text: str,
+    *,
+    count_tokens: Callable[[str], int | None] | None,
+) -> int | None:
+    """Token count from the request counter, or None when counting is unavailable.
+
+    This is the shared size evaluation behind externalization eligibility, the
+    preview budget, and the reader response budget. A None result means the
+    count is unknown; callers must not treat it as evidence of fitting a budget.
+    """
+
+    if count_tokens is None:
+        return None
+    try:
+        return count_tokens(text)
+    except Exception:
+        return None
+
+
 def _is_externalization_eligible(
     text: str,
     *,
@@ -178,12 +201,7 @@ def _is_externalization_eligible(
         except UnicodeEncodeError:
             return False
         if encoded_size <= REF_EXEC_RESPONSE_MAX_BYTES:
-            if count_tokens is None:
-                return False
-            try:
-                tokens = count_tokens(text)
-            except Exception:
-                return False
+            tokens = _token_count_or_none(text, count_tokens=count_tokens)
             if tokens is None or tokens < threshold_tokens:
                 return False
     return True
@@ -288,7 +306,8 @@ async def _capture_projections(
     count_tokens: Callable[[str], int | None] | None,
     existing_refs: Iterable[str] = (),
     seed_entries: Iterable[RefEntry] = (),
-) -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
+    render_cache: dict[tuple[str, int, Any], str] | None = None,
+) -> tuple[tuple[int, dict[str, Any], RefEntry, str], ...]:
     existing = set(existing_refs)
     seeds_by_text_id = {id(entry.text): entry for entry in seed_entries}
     candidates = [
@@ -300,28 +319,42 @@ async def _capture_projections(
         and (len(source) not in (69, 72) or source not in existing)
     ]
 
-    def classify() -> tuple[tuple[int, dict[str, Any], RefEntry], ...]:
-        projected: list[tuple[int, dict[str, Any], RefEntry]] = []
+    def classify() -> tuple[tuple[int, dict[str, Any], RefEntry, str], ...]:
+        projected: list[tuple[int, dict[str, Any], RefEntry, str]] = []
         classified_by_text_id: dict[int, RefEntry | None] = {}
+        cache: dict[tuple[str, int, Any], str] = {} if render_cache is None else render_cache
         for index, message, source, seed in candidates:
             if seed is not None and source is seed.text:
-                projected.append((index, message, seed))
-                continue
-            source_id = id(source)
-            if source_id not in classified_by_text_id:
-                classified_by_text_id[source_id] = (
-                    make_ref_entry(source, kind='tool')
-                    if _is_externalization_eligible(
-                        source,
-                        threshold_tokens=threshold_tokens,
-                        count_tokens=count_tokens,
+                entry = seed
+            else:
+                source_id = id(source)
+                if source_id not in classified_by_text_id:
+                    classified_by_text_id[source_id] = (
+                        make_ref_entry(source, kind='tool')
+                        if _is_externalization_eligible(
+                            source,
+                            threshold_tokens=threshold_tokens,
+                            count_tokens=count_tokens,
+                        )
+                        else None
                     )
-                    else None
-                )
-            entry = classified_by_text_id[source_id]
+                entry = classified_by_text_id[source_id]
             if entry is None:
                 continue
-            projected.append((index, message, entry))
+            cache_key = (entry.ref, threshold_tokens, count_tokens)
+            preview = cache.get(cache_key)
+            if preview is None:
+                preview = _render_ref_preview(
+                    entry,
+                    threshold_tokens=threshold_tokens,
+                    count_tokens=count_tokens,
+                )
+                if preview is None:
+                    # No verifiable preview means the result stays raw; the
+                    # failure is not cached so a working counter can retry.
+                    continue
+                cache[cache_key] = preview
+            projected.append((index, message, entry, preview))
         return tuple(projected)
 
     return await asyncio.to_thread(classify)
@@ -329,24 +362,24 @@ async def _capture_projections(
 
 def _projections_are_current(
     messages: list[Any],
-    projections: tuple[tuple[int, dict[str, Any], RefEntry], ...],
+    projections: tuple[tuple[int, dict[str, Any], RefEntry, str], ...],
 ) -> bool:
     return all(
         index < len(messages) and messages[index] is message and message.get('content') is entry.text
-        for index, message, entry in projections
+        for index, message, entry, _preview in projections
     )
 
 
 def _apply_projections(
     messages: list[Any],
-    projections: tuple[tuple[int, dict[str, Any], RefEntry], ...],
+    projections: tuple[tuple[int, dict[str, Any], RefEntry, str], ...],
 ) -> list[Any]:
     if not projections:
         return messages
     projected_messages = list(messages)
-    for index, original, entry in projections:
+    for index, original, _entry, preview in projections:
         message = dict(original)
-        message['content'] = entry.ref
+        message['content'] = preview
         projected_messages[index] = message
     return projected_messages
 
@@ -357,6 +390,7 @@ async def capture_tool_ref_projections(
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None = None,
     seed_entries: Iterable[RefEntry] = (),
+    render_cache: dict[tuple[str, int, Any], str] | None = None,
 ) -> tuple[list[Any], tuple[RefEntry, ...]]:
     """Project eligible tool text and return the exact entries for later catalog admission."""
     seeds = tuple(
@@ -380,13 +414,14 @@ async def capture_tool_ref_projections(
             ),
         ),
         seed_entries=seeds,
+        render_cache=render_cache,
     )
     if not _projections_are_current(messages, projections):
         return messages, ()
     entries: dict[str, RefEntry] = {}
     for entry in seeds:
         entries.setdefault(entry.ref, entry)
-    for _, _, entry in projections:
+    for _, _, entry, _preview in projections:
         entries.setdefault(entry.ref, entry)
     return _apply_projections(messages, projections), tuple(entries.values())
 
@@ -396,12 +431,14 @@ async def project_tool_refs(
     *,
     threshold_tokens: int,
     count_tokens: Callable[[str], int | None] | None = None,
+    render_cache: dict[tuple[str, int, Any], str] | None = None,
 ) -> list[Any]:
-    """Replace eligible tool text with content-addressed refs without installing a reader."""
+    """Replace eligible tool text with capped previews without installing a reader."""
     projected, _ = await capture_tool_ref_projections(
         messages,
         threshold_tokens=threshold_tokens,
         count_tokens=count_tokens,
+        render_cache=render_cache,
     )
     return projected
 
@@ -415,6 +452,7 @@ async def externalize_refs(
     count_tokens: Callable[[str], int | None] | None = None,
     history_loader: Callable[[], Awaitable[RefEntry | None]] | None = None,
     seed_entries: Iterable[RefEntry] = (),
+    render_cache: dict[tuple[str, int, Any], str] | None = None,
 ) -> bool:
     """Install or extend one Core-owned reader and project eligible tool messages.
 
@@ -438,11 +476,20 @@ async def externalize_refs(
         messages,
         threshold_tokens=threshold_tokens,
         count_tokens=count_tokens,
-        existing_refs=(
-            *(reader.__externalized_ref_catalog__ if reader is not None else ()),
-            *(entry.ref for entry in seeds),
+        existing_refs=chain(
+            (reader.__externalized_ref_catalog__ if reader is not None else ()),
+            (entry.ref for entry in seeds),
+            (
+                source
+                for message in messages
+                if isinstance(message, dict)
+                and message.get('role') == 'tool'
+                and isinstance((source := message.get('content')), str)
+                and _valid_ref(source)
+            ),
         ),
         seed_entries=seeds,
+        render_cache=render_cache,
     )
     history_entry = await history_loader() if history_loader is not None else None
     if history_entry is not None and (
@@ -469,7 +516,7 @@ async def externalize_refs(
 
     for entry in seeds:
         catalog.setdefault(entry.ref, entry)
-    for _, _, entry in projections:
+    for _, _, entry, _preview in projections:
         catalog.setdefault(entry.ref, entry)
     if history_entry is not None:
         catalog.setdefault(history_entry.ref, history_entry)
@@ -976,9 +1023,134 @@ def _utf8_prefix_end(text: str, start: int, max_bytes: int) -> tuple[int, int]:
     return low, len(text[start:low].encode('utf-8'))
 
 
+def _utf8_suffix_start(entry: RefEntry, max_bytes: int) -> int:
+    """Char offset where the remaining suffix spans at most ``max_bytes`` UTF-8 bytes."""
+    if max_bytes <= 0:
+        return len(entry.text)
+    char_offset, _byte_offset = _seek_source_byte(entry, entry.utf8_bytes - max_bytes)
+    return char_offset
+
+
 def _truncated_marker(next_command: str) -> str:
     payload = json.dumps({'next': next_command}, ensure_ascii=True, sort_keys=True, separators=(',', ':'))
     return f'\n<auto_compact_ref_truncated>{payload}</auto_compact_ref_truncated>'
+
+
+# Single-char polish attempts per side after the retained-size search. Monotone
+# counters converge in a couple of rounds; the cap only bounds adversarial ones.
+_PREVIEW_POLISH_MAX_ROUNDS = 8
+
+
+def _preview_at(entry: RefEntry, prefix_end: int, suffix_start: int) -> str | None:
+    text = entry.text
+    if not 0 <= prefix_end <= suffix_start <= len(text):
+        return None
+    prefix_bytes = _span_bytes(text, entry.byte_index, 0, prefix_end)
+    suffix_bytes = _span_bytes(text, entry.byte_index, suffix_start, len(text))
+    omitted_bytes = entry.utf8_bytes - prefix_bytes - suffix_bytes
+    if omitted_bytes <= 0:
+        return None
+    command = f'tail -c +{prefix_bytes + 1} {entry.ref} | head -c {omitted_bytes}'
+    return text[:prefix_end] + _truncated_marker(command) + '\n' + text[suffix_start:]
+
+
+def _preview_fits(
+    candidate: str,
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
+) -> bool:
+    try:
+        encoded_size = len(candidate.encode('utf-8'))
+    except UnicodeEncodeError:
+        return False
+    if encoded_size > REF_EXEC_RESPONSE_MAX_BYTES:
+        return False
+    tokens = _token_count_or_none(candidate, count_tokens=count_tokens)
+    return tokens is not None and tokens < threshold_tokens
+
+
+def _preview_at_retained(entry: RefEntry, retained_bytes: int) -> tuple[str | None, int, int]:
+    prefix_end, prefix_bytes = _utf8_prefix_end(entry.text, 0, retained_bytes // 2)
+    suffix_start = _utf8_suffix_start(entry, retained_bytes - prefix_bytes)
+    return _preview_at(entry, prefix_end, suffix_start), prefix_end, suffix_start
+
+
+def _polish_preview(
+    entry: RefEntry,
+    best: str,
+    prefix_end: int,
+    suffix_start: int,
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
+) -> str:
+    for _ in range(_PREVIEW_POLISH_MAX_ROUNDS):
+        grew = False
+        for ends in ((prefix_end + 1, suffix_start), (prefix_end, suffix_start - 1)):
+            candidate = _preview_at(entry, *ends)
+            if candidate is not None and _preview_fits(
+                candidate,
+                threshold_tokens=threshold_tokens,
+                count_tokens=count_tokens,
+            ):
+                best, (prefix_end, suffix_start) = candidate, ends
+                grew = True
+        if not grew:
+            break
+    return best
+
+
+def _render_ref_preview(
+    entry: RefEntry,
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
+) -> str | None:
+    """Render the largest preview of ``entry`` that fits both response caps.
+
+    The preview keeps the head and tail of the source around one truncation
+    marker whose next command restores the omitted middle byte-exactly; roughly
+    half of the retained bytes stay on each side. Byte boundaries come from the
+    entry's checkpoints, and only preview-sized candidates are ever tokenized.
+    Returns None when no candidate can be verified against the token budget;
+    an uncountable candidate is never adopted.
+    """
+
+    if entry.utf8_bytes < 2:
+        return None
+
+    def fits(candidate: str) -> bool:
+        return _preview_fits(candidate, threshold_tokens=threshold_tokens, count_tokens=count_tokens)
+
+    # The marker varies only with the digit counts of N and M, both bounded by
+    # the source size, so this overhead is an upper bound for every candidate.
+    marker_overhead = len(
+        _truncated_marker(f'tail -c +{entry.utf8_bytes + 1} {entry.ref} | head -c {entry.utf8_bytes}')
+    ) + 1
+    high = min(entry.utf8_bytes - 1, REF_EXEC_RESPONSE_MAX_BYTES - marker_overhead)
+    best: str | None = None
+    best_prefix_end = 0
+    best_suffix_start = len(entry.text)
+    low = 0
+    while low <= high:
+        retained = (low + high) // 2
+        candidate, prefix_end, suffix_start = _preview_at_retained(entry, retained)
+        if candidate is not None and fits(candidate):
+            best, best_prefix_end, best_suffix_start = candidate, prefix_end, suffix_start
+            low = retained + 1
+        else:
+            high = retained - 1
+    if best is None:
+        return None
+    return _polish_preview(
+        entry,
+        best,
+        best_prefix_end,
+        best_suffix_start,
+        threshold_tokens=threshold_tokens,
+        count_tokens=count_tokens,
+    )
 
 
 def _byte_range_marker(
@@ -1464,6 +1636,9 @@ def _new_reader(
 ) -> Callable[[str], Any]:
     async def reader(command: str = '') -> str:
         """Read request-local externalized content with bounded text commands.
+
+        Truncation markers embed a next command that reads the omitted span;
+        follow it across pages when the span is large.
 
         :param command: Use ls, stat, wc, cat, head, tail, sed, grep, or a bounded pipeline.
         """

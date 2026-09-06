@@ -731,12 +731,18 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
         await refs.externalize_refs(
             {
                 'stream': True,
-                'messages': [{'role': 'tool', 'tool_call_id': 'call', 'content': 'large result'}],
+                'messages': [
+                    {
+                        'role': 'tool',
+                        'tool_call_id': 'call',
+                        'content': 'large result ' * 100,
+                    }
+                ],
             },
             registry,
             native=True,
-            threshold_tokens=1,
-            count_tokens=lambda _text: 2,
+            threshold_tokens=500,
+            count_tokens=lambda value: len(value),
         )
         remaining = await middleware._execute_ref_calls_before_approval(
             None,
@@ -780,7 +786,7 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
 def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    source = 'approved reader source'
+    source = 'approved reader source ' * 600
     stored = {}
 
     async def get_message(_chat_id, _message_id):
@@ -809,7 +815,7 @@ def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypat
         state = {
             'externalized_refs': {
                 'enable': True,
-                'threshold': 2,
+                'threshold': 1000,
                 'native': True,
                 'registry': registry,
                 'metadata': metadata,
@@ -823,7 +829,8 @@ def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypat
             ],
         }
         body = await middleware.apply_externalized_refs(body, state)
-        ref = body['messages'][1]['content']
+        projected = body['messages'][1]['content']
+        ref = re.search(r'tool:[0-9a-f]{64}', projected).group(0)
         stored['output'] = [
             {
                 'type': 'function_call',
@@ -2238,7 +2245,10 @@ def test_tool_only_refs_do_not_rewrite_user_content():
     result = asyncio.run(middleware.apply_externalized_refs(body, state))
 
     assert result['messages'][0]['content'] == content
-    assert result['messages'][1]['content'].startswith('tool:')
+    projected = result['messages'][1]['content']
+    assert projected != 'large result ' * 1000
+    assert '<auto_compact_ref_truncated>' in projected
+    assert re.search(r'tool:[0-9a-f]{64}', projected)
 
 
 def test_post_filter_payload_controls_ref_catalog():
@@ -3289,7 +3299,7 @@ def test_approved_pass2_mint_reflects_into_canonical(monkeypatch):
 def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    big = 'filtered tool output ' + 'x' * 200
+    big = 'filtered tool output ' * 600
     calls = []
 
     async def deleting_filter(body, __metadata__=None):
@@ -3299,7 +3309,7 @@ def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
         kept = [message for message in body['messages'] if message.get('role') != 'tool']
         return {**body, 'messages': kept}
 
-    _payload_leg_patches(monkeypatch, middleware, request_filter=deleting_filter, refs_runtime=(True, 2))
+    _payload_leg_patches(monkeypatch, middleware, request_filter=deleting_filter, refs_runtime=(True, 1000))
     _payload_leg_drain(monkeypatch, middleware, _approved_stored())
     messages = [
         {'role': 'user', 'content': 'question'},
@@ -3439,9 +3449,9 @@ def test_projected_view_prevents_false_context_limit(monkeypatch):
 
 def test_round0_non_native_disables_continuation_capture():
     middleware = importlib.import_module('open_webui.utils.middleware')
-    big = 'x' * 200
+    big = 'capture payload line\n' * 400
     state = {
-        'config': {'externalized_refs_enable': True, 'externalized_refs_token_threshold': 1},
+        'config': {'externalized_refs_enable': True, 'externalized_refs_token_threshold': 1000},
         'externalized_refs': {'native': False},
     }
     body = {
@@ -3772,7 +3782,7 @@ def _stream_leg_ctx(metadata, *, compaction_enabled, refs=None, estimate=None):
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
             'externalized_refs_enable': refs is not None,
-            'externalized_refs_token_threshold': 2,
+            'externalized_refs_token_threshold': 1000,
         },
         'checkpoint_messages': [
             {'id': 'user', 'role': 'user', 'content': 'start'},
@@ -3901,7 +3911,7 @@ def test_continuation_rounds_keep_canonical_clean_and_marker_once(monkeypatch):
 def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch, advanced):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    big = 'raw output ' + 'y' * 100
+    big = 'raw output with several words per line\n' * 300
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
     seen = []
@@ -3947,7 +3957,7 @@ def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch,
     state_refs = {
         'enable': True,
         'native': True,
-        'threshold': 2,
+        'threshold': 1000,
         'registry': registry,
         'metadata': metadata,
     }
@@ -4120,8 +4130,8 @@ def _owned_reader_registry(refs, text):
             body,
             registry,
             native=True,
-            threshold_tokens=5,
-            count_tokens=lambda value: max(1, len(value) // 10),
+            threshold_tokens=100,
+            count_tokens=lambda value: max(1, len(value) // 20),
         )
     )
     assert installed
@@ -4130,7 +4140,7 @@ def _owned_reader_registry(refs, text):
 
 def test_stateful_continuation_reattaches_reader_schema():
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    registry = _owned_reader_registry(refs, 'r' * 100)
+    registry = _owned_reader_registry(refs, 'r' * 2400)
     reader = registry[refs.REF_EXEC_TOOL_NAME]['callable']
     catalog = reader.__externalized_ref_catalog__
     entries_before = dict(catalog)
@@ -4163,7 +4173,7 @@ def test_stateful_continuation_reattaches_reader_schema():
 
 def test_stateful_reattach_requires_native():
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    registry = _owned_reader_registry(refs, 'r' * 100)
+    registry = _owned_reader_registry(refs, 'r' * 2400)
     body = {
         'stream': True,
         'previous_response_id': 'resp_1',
@@ -4186,7 +4196,7 @@ def test_stateful_reattach_requires_native():
 
 def test_stateful_reattach_requires_selectable_reader():
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    registry = _owned_reader_registry(refs, 'r' * 100)
+    registry = _owned_reader_registry(refs, 'r' * 2400)
     body = {
         'stream': True,
         'tool_choice': 'none',
@@ -4313,7 +4323,10 @@ def test_stateful_two_round_continuation_keeps_reader(monkeypatch):
     round1, round2 = current['sent']
     assert round1.get('previous_response_id') == 'resp-1'
     assert any(
-        message.get('role') == 'tool' and message.get('content') == entry.ref
+        message.get('role') == 'tool'
+        and isinstance(message.get('content'), str)
+        and '<auto_compact_ref_truncated>' in message['content']
+        and entry.ref in message['content']
         for message in round1['messages']
     )
     assert (
@@ -4354,7 +4367,7 @@ def test_stateful_two_round_continuation_keeps_reader(monkeypatch):
 def test_payload_apply_before_drain_executes_reader(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    big = 'approved reader source ' + 'x' * 100
+    big = 'approved reader source ' * 600
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
     stored = {
@@ -4376,7 +4389,7 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
     async def noop(*_args, **_kwargs):
         return None
 
-    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 2))
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
     _payload_leg_drain(monkeypatch, middleware, stored, stub_execute=False)
     monkeypatch.setattr(middleware, 'process_tool_result', process_result)
     monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
@@ -4404,7 +4417,7 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
 def test_round0_non_native_continuation_sends_no_refs(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
-    big = 'non native payload ' + 'n' * 200
+    big = 'non native payload line\n' * 400
     tools = _plain_tools(view_result=big)
     current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
     current['replies'] = [current['text_response']('done')]
@@ -4419,7 +4432,7 @@ def test_round0_non_native_continuation_sends_no_refs(monkeypatch):
     state_refs = {
         'enable': True,
         'native': False,
-        'threshold': 2,
+        'threshold': 1000,
         'registry': registry,
         'metadata': metadata,
     }
@@ -4450,16 +4463,34 @@ def test_round0_non_native_continuation_sends_no_refs(monkeypatch):
 
 def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
-    big = 'p' * 300
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'projected payload line\n' * 350
     tools = _plain_tools(view_result=big)
     current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
     current['replies'] = [current['text_response']('done')]
 
-    def estimate(body):
+    def content_chars(messages):
         return sum(
             len(message.get('content')) if isinstance(message.get('content'), str) else 0
-            for message in body['messages']
+            for message in messages
         )
+
+    projected, _entries = asyncio.run(
+        refs.capture_tool_ref_projections(
+            [{'role': 'tool', 'tool_call_id': 'call-a', 'content': big}],
+            threshold_tokens=1000,
+            count_tokens=compaction.estimate_text_tokens,
+        )
+    )
+    overhead = len('start')  # the leading user message carried by every round
+    # The compaction threshold must sit strictly between the preview the model
+    # actually receives and the raw result, so dropping the projected snapshot
+    # (or an oversized preview) trips compaction again.
+    compaction_limit = (overhead + content_chars(projected) + overhead + content_chars([{'content': big}])) // 2
+    assert overhead + content_chars(projected) < compaction_limit < overhead + len(big)
+
+    def estimate(body):
+        return content_chars(body['messages'])
 
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
     registry = dict(tools)
@@ -4473,11 +4504,13 @@ def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
     state_refs = {
         'enable': True,
         'native': True,
-        'threshold': 10,
+        'threshold': 1000,
         'registry': registry,
         'metadata': metadata,
     }
     ctx = _stream_leg_ctx(metadata, compaction_enabled=True, refs=state_refs)
+    ctx['compaction_state']['config']['token_threshold'] = compaction_limit
+    ctx['compaction_state']['config']['token_cap'] = compaction_limit
 
     asyncio.run(
         middleware.streaming_chat_response_handler(
@@ -4493,7 +4526,8 @@ def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
     )
     tool_messages = [message for message in sent['messages'] if message.get('role') == 'tool']
     assert len(tool_messages) == 1
-    assert tool_messages[0]['content'].startswith('tool:')
+    assert tool_messages[0]['content'] == projected[0]['content']
+    assert refs.REF_EXEC_TOOL_NAME in registry
 
 
 def test_drain_gate_uses_assistant_message_id_with_message_fallback(monkeypatch):

@@ -2424,28 +2424,19 @@ async def apply_externalized_refs(
     installed = False
     has_summary = False
     seed_entries = tuple(state.get('tool_ref_entries') or ())
+    admitted_seed_entries: tuple[RefEntry, ...] = ()
     if config.get('enable') and can_externalize_refs(
         body,
         native=config.get('native') is True,
         registry=config['registry'],
     ):
         messages = body.get('messages')
-        admitted_seed_entries: tuple[RefEntry, ...] = ()
-        captured_entries: tuple[RefEntry, ...] = ()
         if isinstance(messages, list):
             admitted_seed_entries, has_summary = _post_filter_ref_state(
                 messages,
                 seed_entries,
                 state.get('summary_message_content'),
             )
-            projected_messages, captured_entries = await capture_tool_ref_projections(
-                messages,
-                threshold_tokens=config['threshold'],
-                count_tokens=estimate_text_tokens,
-                seed_entries=admitted_seed_entries,
-            )
-            if projected_messages is not messages:
-                body = {**body, 'messages': projected_messages}
 
         async def load_history():
             entry = await resolve_request_history(state.get('selected_history'))
@@ -2460,7 +2451,8 @@ async def apply_externalized_refs(
             threshold_tokens=config['threshold'],
             count_tokens=estimate_text_tokens,
             history_loader=load_history if has_summary else None,
-            seed_entries=(*admitted_seed_entries, *captured_entries),
+            seed_entries=admitted_seed_entries,
+            render_cache=state.setdefault('ref_preview_cache', {}),
         )
         if installed:
             config['metadata']['tools'] = config['registry']
@@ -2498,6 +2490,7 @@ async def _capture_pre_filter_tool_refs(
         threshold_tokens=config['externalized_refs_token_threshold'],
         count_tokens=estimate_text_tokens,
         seed_entries=state.get('tool_ref_entries') or (),
+        render_cache=state.setdefault('ref_preview_cache', {}),
     )
     if entries:
         state['tool_ref_entries'] = entries
