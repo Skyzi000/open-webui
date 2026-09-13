@@ -90,6 +90,7 @@ from open_webui.utils.context_compaction import (
     CONTEXT_COMPACTION_USAGE_ANCHOR_KEY,
     compact_provider_payload,
     compact_transient_provider_payload,
+    context_compaction_adoption_record,
     estimate_text_tokens,
     get_last_persistent_user_message,
     prepare_compaction_messages,
@@ -4730,6 +4731,14 @@ async def non_streaming_chat_response_handler(response, ctx):
                             }
                         )
 
+                    adoption_record = context_compaction_adoption_record(
+                        ctx.get('compaction_state'),
+                        [],
+                        (ctx.get('compaction_state') or {}).get('checkpoint_messages'),
+                    )
+                    if adoption_record is not None:
+                        response_output = [adoption_record, *response_output]
+
                     await event_emitter(
                         {
                             'type': 'chat:completion',
@@ -5183,6 +5192,20 @@ async def streaming_chat_response_handler(response, ctx):
                 content_parts = []
             elif existing_output:
                 output = existing_output
+            elif metadata.get('assistant_message_id') and initial_content:
+                # Content-only continuation: fix the previous text in
+                # prior_output so adoption records land between it and the
+                # new leg, matching structured-output continuation order.
+                prior_output = [
+                    {
+                        'type': 'message',
+                        'id': output_id('msg'),
+                        'status': 'in_progress',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': initial_content}],
+                    }
+                ]
+                output = []
             else:
                 # Only create an initial message item if there is content to initialize with
                 if initial_content:
@@ -5220,6 +5243,24 @@ async def streaming_chat_response_handler(response, ctx):
                         prior_output.pop()
                 output = []
                 response_usage = None
+
+            async def append_adoption_record():
+                record = context_compaction_adoption_record(
+                    ctx.get('compaction_state'),
+                    prior_output,
+                    (ctx.get('compaction_state') or {}).get('checkpoint_messages'),
+                )
+                if record is None:
+                    return
+                prior_output.append(record)
+                await event_emitter(
+                    {
+                        'type': 'chat:completion',
+                        'data': {
+                            'output': full_output(),
+                        },
+                    }
+                )
 
             def get_message_error_content(error):
                 if isinstance(error, HTTPException):
@@ -6171,6 +6212,7 @@ async def streaming_chat_response_handler(response, ctx):
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
 
                 try:
+                    await append_adoption_record()
                     await stream_body_handler(response, form_data)
                 finally:
                     if response.background:
@@ -6631,6 +6673,7 @@ async def streaming_chat_response_handler(response, ctx):
                         if isinstance(res, StreamingResponse):
                             continuation_body = standalone_body
                             start_next_response()
+                            await append_adoption_record()
                             await stream_body_handler(res, send_body)
                         elif getattr(res, 'status_code', 200) >= 400:
                             await emit_message_error(get_message_error_content(get_response_error_detail(res)))
@@ -6854,6 +6897,7 @@ async def streaming_chat_response_handler(response, ctx):
                             if isinstance(res, StreamingResponse):
                                 continuation_body = standalone_body
                                 start_next_response()
+                                await append_adoption_record()
                                 await stream_body_handler(res, send_body)
                             elif getattr(res, 'status_code', 200) >= 400:
                                 await emit_message_error(get_message_error_content(get_response_error_detail(res)))

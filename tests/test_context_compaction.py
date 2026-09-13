@@ -4772,6 +4772,7 @@ def test_completed_turn_checkpoint_skips_nested_tip_guard():
     branch = [messages['u1'], messages['a1'], messages['u2'], tip]
     config = {'prompt_template': '', 'transient_patterns': ()}
     writes = []
+    socket_main = importlib.import_module('open_webui.socket.main')
 
     async def fail_summary(*_args, **_kwargs):
         raise AssertionError('nested-tip guard must skip summary generation')
@@ -4780,11 +4781,16 @@ def test_completed_turn_checkpoint_skips_nested_tip_guard():
         writes.append((chat_id, message_id, summary))
         return True
 
+    async def noop(*_args, **_kwargs):
+        return None
+
     original_summary = compaction._generate_summary
     original_update = compaction.ChatMessages.update_context_summary
+    original_emitter = socket_main.get_event_emitter
     try:
         compaction._generate_summary = fail_summary
         compaction.ChatMessages.update_context_summary = record_update
+        socket_main.get_event_emitter = noop
 
         result = asyncio.run(
             compaction._completed_turn_checkpoint(
@@ -4800,6 +4806,7 @@ def test_completed_turn_checkpoint_skips_nested_tip_guard():
     finally:
         compaction._generate_summary = original_summary
         compaction.ChatMessages.update_context_summary = original_update
+        socket_main.get_event_emitter = original_emitter
 
     assert result is None
     assert writes == []
@@ -4811,6 +4818,7 @@ def test_completed_turn_checkpoint_generates_without_nested_tip():
     config = {'prompt_template': '', 'transient_patterns': ()}
     writes = []
     seen = {}
+    socket_main = importlib.import_module('open_webui.socket.main')
 
     async def generate_summary(*_args, **kwargs):
         seen.update(kwargs)
@@ -4820,11 +4828,16 @@ def test_completed_turn_checkpoint_generates_without_nested_tip():
         writes.append((chat_id, message_id, summary))
         return True
 
+    async def noop(*_args, **_kwargs):
+        return None
+
     original_summary = compaction._generate_summary
     original_update = compaction.ChatMessages.update_context_summary
+    original_emitter = socket_main.get_event_emitter
     try:
         compaction._generate_summary = generate_summary
         compaction.ChatMessages.update_context_summary = record_update
+        socket_main.get_event_emitter = noop
 
         result = asyncio.run(
             compaction._completed_turn_checkpoint(
@@ -4840,6 +4853,7 @@ def test_completed_turn_checkpoint_generates_without_nested_tip():
     finally:
         compaction._generate_summary = original_summary
         compaction.ChatMessages.update_context_summary = original_update
+        socket_main.get_event_emitter = original_emitter
 
     assert result == 'summary'
     assert writes == [('chat', 'a2', 'summary')]
@@ -5030,3 +5044,909 @@ def test_summary_generation_does_not_bypass_model_access(monkeypatch):
     assert set(captured['kwargs']) - {'form_data', 'user'} == {'bypass_system_prompt'}
     assert captured['kwargs']['bypass_system_prompt'] is True
     assert 'bypass_filter' not in captured['kwargs']
+
+
+def _adoption_item(summary, item_id='cc_1'):
+    return {
+        'type': compaction.CONTEXT_COMPACTION_OUTPUT_TYPE,
+        'id': item_id,
+        'compaction_summary': summary,
+    }
+
+
+def test_adoption_output_item_is_invisible_to_provider_conversion():
+    misc = importlib.import_module('open_webui.utils.misc')
+
+    def tool_pair(call_id, name, result, image=None):
+        call = {
+            'type': 'function_call',
+            'id': call_id,
+            'call_id': call_id,
+            'name': name,
+            'arguments': '{}',
+            'status': 'completed',
+        }
+        parts = [{'type': 'input_text', 'text': result}]
+        if image is not None:
+            parts.append({'type': 'input_image', 'image_url': image})
+        return [
+            call,
+            {'type': 'function_call_output', 'id': f'{call_id}-out', 'call_id': call_id, 'output': parts},
+        ]
+
+    # The record must sit directly between the two batches: any other item
+    # (e.g. code_interpreter) would flush batch A itself and mask a regression
+    # where the record introduces an extra flush.
+    for image in (None, 'data:image/png;base64,AAA'):
+        batch_a = tool_pair('call-a', 'first', 'result-a', image)
+        batch_b = tool_pair('call-b', 'second', 'result-b')
+        base = [*batch_a, *batch_b]
+        with_record = [*batch_a, _adoption_item('SUMMARY'), *batch_b]
+        for flatten in (True, False):
+            assert misc.convert_output_to_messages(base, flatten_tool_images=flatten) == (
+                misc.convert_output_to_messages(with_record, flatten_tool_images=flatten)
+            )
+
+
+def test_code_interpreter_survives_adoption_output_item():
+    misc = importlib.import_module('open_webui.utils.misc')
+
+    converted = misc.convert_output_to_messages(
+        [
+            _adoption_item('SUMMARY'),
+            {
+                'type': 'open_webui:code_interpreter',
+                'id': 'ci_1',
+                'code': 'print(1)',
+                'output': {'stdout': '1'},
+            },
+        ],
+        raw=True,
+    )
+    assert any('<code_interpreter>' in message.get('content', '') for message in converted)
+
+
+def test_adoption_record_decision_uses_compaction_state_only():
+    held_state = {
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>...</auto_compaction_context>',
+    }
+
+    assert compaction.context_compaction_adoption_record({'summary': 'S1'}, []) is None
+    unheld = dict(held_state)
+    unheld.pop('summary_message_content')
+    assert compaction.context_compaction_adoption_record(unheld, []) is None
+    empty_held = dict(held_state)
+    empty_held['summary_message_content'] = ''
+    assert compaction.context_compaction_adoption_record(empty_held, []) is None
+
+    record = compaction.context_compaction_adoption_record(held_state, [])
+    assert record['type'] == compaction.CONTEXT_COMPACTION_OUTPUT_TYPE
+    assert record['compaction_summary'] == 'S1'
+    assert isinstance(record['id'], str) and record['id']
+
+    assert compaction.context_compaction_adoption_record(held_state, [_adoption_item('S1')]) is None
+    switched = compaction.context_compaction_adoption_record(held_state, [_adoption_item('S0')])
+    assert switched['compaction_summary'] == 'S1'
+
+    branch = [
+        {'id': 'a1', 'role': 'assistant', 'content': '', 'output': [_adoption_item('S0', 'cc_0')]},
+        {'id': 'u1', 'role': 'user', 'content': 'next'},
+    ]
+    assert compaction.context_compaction_adoption_record(held_state, [], branch) is not None
+    same_branch = copy.deepcopy(branch)
+    same_branch[0]['output'][0]['compaction_summary'] = 'S1'
+    assert compaction.context_compaction_adoption_record(held_state, [], same_branch) is None
+
+    fallback_state = {
+        'previous_summary': 'S2',
+        'summary_message_content': 'held',
+    }
+    fallback = compaction.context_compaction_adoption_record(fallback_state, [], [])
+    assert fallback['compaction_summary'] == 'S2'
+
+
+def test_prefetch_finalize_notifies_phase_and_boundary(monkeypatch):
+    events = []
+
+    async def emitter(event):
+        events.append(event['data'])
+
+    async def save_checkpoint(*_args):
+        return True
+
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+
+    async def generation_ok():
+        return 'SUM', {}, ([{'id': 'u2'}], 2), 'u2'
+
+    async def run_ok():
+        return await compaction._finalize_prefetch_checkpoint(asyncio.ensure_future(generation_ok()), 'chat', emitter)
+
+    result = asyncio.run(run_ok())
+    assert result[0] == 'SUM'
+    assert events == [
+        {
+            'action': 'context_compaction',
+            'description': 'Summary ready',
+            'done': True,
+            'phase': 'prefetch',
+            'message_id': 'u2',
+            'summary': 'SUM',
+        }
+    ]
+
+    events.clear()
+
+    async def save_fails(*_args):
+        raise RuntimeError('nope')
+
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_fails)
+
+    async def generation_sum():
+        return 'SUM', {}, ([{'id': 'u2'}], 2), 'u2'
+
+    async def run_fail():
+        await compaction._finalize_prefetch_checkpoint(asyncio.ensure_future(generation_sum()), 'chat', emitter)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_fail())
+    assert events == [
+        {
+            'action': 'context_compaction',
+            'description': 'Context compaction failed',
+            'done': True,
+            'error': True,
+            'phase': 'prefetch',
+        }
+    ]
+
+
+def test_completed_turn_prefetch_notifies_only_when_generating(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+    events = []
+
+    async def emitter(event):
+        events.append(event['data'])
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'TURN-SUMMARY'
+
+    async def save_checkpoint(*_args):
+        return True
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', get_event_emitter)
+
+    metadata = {'chat_id': 'chat', 'message_id': 'assistant'}
+    config = _compaction_config()
+
+    async def run_guard_empty():
+        return await compaction._completed_turn_checkpoint(None, None, [], metadata, 'model', {}, config)
+
+    assert asyncio.run(run_guard_empty()) is None
+    assert events == []
+
+    messages = [
+        {'id': 'user', 'role': 'user', 'content': 'start'},
+        {'id': 'assistant', 'role': 'assistant', 'content': ''},
+    ]
+
+    async def run_success():
+        return await compaction._completed_turn_checkpoint(
+            None, None, copy.deepcopy(messages), metadata, 'model', {}, config
+        )
+
+    assert asyncio.run(run_success()) == 'TURN-SUMMARY'
+    assert events[0]['done'] is False and events[0]['phase'] == 'prefetch'
+    assert events[1] == {
+        'action': 'context_compaction',
+        'description': 'Summary ready',
+        'done': True,
+        'phase': 'prefetch',
+        'message_id': 'assistant',
+        'summary': 'TURN-SUMMARY',
+    }
+
+    events.clear()
+
+    async def generate_fails(*_args, **_kwargs):
+        raise RuntimeError('model down')
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_fails)
+
+    async def run_failure():
+        await compaction._completed_turn_checkpoint(None, None, copy.deepcopy(messages), metadata, 'model', {}, config)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(run_failure())
+    assert events[-1]['done'] is True and events[-1]['error'] is True and events[-1]['phase'] == 'prefetch'
+
+
+def test_blocking_compaction_success_carries_boundary(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+    events = []
+
+    async def emitter(event):
+        events.append(event['data'])
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    history = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'answer'},
+        {'id': 'u2', 'role': 'user', 'content': 'new', compaction._BOUNDARY_KEY: True},
+    ]
+
+    async def generate_checkpoint(*_args, **_kwargs):
+        return 'BLOCK-SUM', {}, (history, 2), 'u2'
+
+    async def save_checkpoint(*_args):
+        return True
+
+    monkeypatch.setattr(compaction, '_generate_checkpoint', generate_checkpoint)
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', get_event_emitter)
+
+    state = {
+        'active_offset': 0,
+        'checkpoint_messages': history,
+        'checkpoint_history': (history, 2),
+        'config': _compaction_config(),
+    }
+    metadata = {'chat_id': 'chat', 'message_id': 'assistant'}
+
+    compacted = asyncio.run(
+        compaction.compact_provider_payload(
+            None, None, {'messages': copy.deepcopy(history)}, metadata, 'model', {}, state
+        )
+    )
+    assert compacted['messages'][0]['content'].startswith('<auto_compaction_context>')
+    assert events == [
+        {
+            'action': 'context_compaction',
+            'description': 'Compacting context',
+            'done': False,
+        },
+        {
+            'action': 'context_compaction',
+            'description': 'Context compacted',
+            'done': True,
+            'message_id': 'u2',
+            'summary': 'BLOCK-SUM',
+        },
+    ]
+
+
+def _adoption_stream_harness(monkeypatch, middleware, *, summaries, existing_message=None):  # noqa: C901
+    current = {'sent': [], 'emitted': [], 'saved': [], 'summaries': list(summaries)}
+    estimate_calls = {'n': 0}
+
+    def response(delta):
+        async def chunks():
+            yield f'data: {middleware.JSONCodec.dumps(delta)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    def tool_response(call_id, name):
+        return response(
+            {
+                'choices': [
+                    {
+                        'delta': {
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'id': call_id,
+                                    'type': 'function',
+                                    'function': {'name': name, 'arguments': '{}'},
+                                }
+                            ]
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ]
+            }
+        )
+
+    async def generate_summary(*_args, **_kwargs):
+        assert current['summaries'], 'summary generator exhausted'
+        return current['summaries'].pop(0)
+
+    async def generate(_request, candidate, _user, **_kwargs):
+        current['sent'].append(copy.deepcopy(candidate))
+        return current['replies'].pop(0)
+
+    async def emitter(event):
+        current['emitted'].append(copy.deepcopy(event))
+
+    async def process_result(_request, _name, result, *_args):
+        return result, [], []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def config_get(_key, default=None):
+        return default
+
+    async def save(_chat_id, _message_id, update, **_kwargs):
+        current['saved'].append(copy.deepcopy(update))
+        return update
+
+    async def get_message(_chat_id, _message_id):
+        return copy.deepcopy(existing_message) if existing_message is not None else None
+
+    def estimate(_body, **_kwargs):
+        # Odd calls estimate the un-compacted body (over threshold), even calls
+        # the nested candidate (under threshold), so every continuation compacts.
+        estimate_calls['n'] += 1
+        return 120 if estimate_calls['n'] % 2 == 1 else 20
+
+    async def view_file():
+        return 'result-a'
+
+    async def fetch_url():
+        return 'result-b'
+
+    tools = {
+        name: {
+            'spec': {'name': name, 'parameters': {'type': 'object', 'properties': {}}},
+            'callable': function,
+        }
+        for name, function in (('view_file', view_file), ('fetch_url', fetch_url))
+    }
+
+    monkeypatch.setattr(middleware, 'generate_chat_completion', generate)
+    monkeypatch.setattr(middleware, 'process_tool_result', process_result)
+    monkeypatch.setattr(middleware, 'get_citation_source_from_tool_result', lambda tool_name, **_kwargs: [])
+    monkeypatch.setattr(middleware, 'rag_template', lambda _t, _c, _p: 'RAG')
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
+    monkeypatch.setattr(middleware, 'get_system_oauth_token', noop)
+    monkeypatch.setattr(middleware, 'outlet_filter_handler', noop)
+    monkeypatch.setattr(middleware, 'background_tasks_handler', noop)
+    monkeypatch.setattr(middleware, 'clear_response_stream', noop)
+    monkeypatch.setattr(middleware, 'save_response_stream', noop)
+    monkeypatch.setattr(middleware, 'publish_chat_finished_event', noop)
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr(middleware.Chats, 'get_chat_title_by_id', noop)
+    monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_STATEFUL', False)
+    monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    socket_main = importlib.import_module('open_webui.socket.main')
+    monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
+
+    current['tool_response'] = tool_response
+    current['text_response'] = lambda text: response(
+        {'choices': [{'delta': {'content': text}, 'finish_reason': 'stop'}]}
+    )
+    current['emitter'] = emitter
+    return current, tools
+
+
+def _adoption_stream_ctx(tools, metadata, state=None):
+    compaction_state = state or {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+            'externalized_refs_token_threshold': 10_000,
+        },
+        'checkpoint_messages': [
+            {'id': 'user', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+    }
+    form_data = {
+        'model': 'model',
+        'stream': True,
+        'messages': [{'role': 'user', 'content': 'start'}],
+        'metadata': metadata,
+    }
+    ctx = {
+        'request': SimpleNamespace(
+            state=SimpleNamespace(max_tool_call_iterations=5),
+            app=SimpleNamespace(state=SimpleNamespace(redis=None, MODELS={})),
+        ),
+        'form_data': form_data,
+        'user': SimpleNamespace(role='admin'),
+        'model': {
+            'id': 'model',
+            'info': {'meta': {'capabilities': {'citations': False, 'file_context': False}}},
+        },
+        'metadata': metadata,
+        'events': [],
+        'tasks': {},
+        'event_emitter': None,
+        'event_caller': None,
+        'compaction_state': compaction_state,
+    }
+    ctx['compaction_state']['canonical_body'] = form_data
+    ctx['compaction_state']['last_send_body'] = form_data
+    return ctx
+
+
+def _adoption_shape(output):
+    return [
+        (
+            item.get('type'),
+            item.get('call_id') or item.get('name'),
+            item.get('compaction_summary'),
+            item.get('contextSummary'),
+        )
+        for item in output
+    ]
+
+
+def test_tool_loop_records_each_adopted_summary_position(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(
+        monkeypatch,
+        middleware,
+        summaries=['S1', 'S2', 'S2'],
+    )
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['tool_response']('call-c', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    final = current['saved'][-1]
+    assert _adoption_shape(final['output']) == [
+        ('function_call', 'call-a', None, 'S1'),
+        ('function_call_output', 'call-a', None, None),
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None),
+        ('function_call', 'call-b', None, 'S2'),
+        ('function_call_output', 'call-b', None, None),
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S2', None),
+        ('function_call', 'call-c', None, 'S2'),
+        ('function_call_output', 'call-c', None, None),
+        ('message', None, None, None),
+    ]
+
+    # The first adoption record must ride an existing full-output notification
+    # out to the UI before the next leg streams anything.
+    marker_emits = [
+        event['data']['output']
+        for event in current['emitted']
+        if event.get('type') == 'chat:completion'
+        and isinstance(event.get('data', {}).get('output'), list)
+        and _adoption_shape(event['data']['output'])
+        == [
+            ('function_call', 'call-a', None, 'S1'),
+            ('function_call_output', 'call-a', None, None),
+            (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None),
+        ]
+    ]
+    assert marker_emits
+
+
+def test_first_send_dedupes_against_branch_and_continues_existing_output(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    branch_messages = [
+        {'id': 'u0', 'role': 'user', 'content': 'start'},
+        {
+            'id': 'a0',
+            'role': 'assistant',
+            'content': '',
+            'output': [_adoption_item('S1', 'cc_0')],
+        },
+    ]
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': branch_messages,
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>S1</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['text_response']('done'), ctx))
+
+    assert _adoption_shape(current['saved'][-1]['output']) == [('message', None, None, None)]
+
+    current2, tools2 = _adoption_stream_harness(
+        monkeypatch,
+        middleware,
+        summaries=[],
+        existing_message={
+            'id': 'assistant',
+            'role': 'assistant',
+            'content': 'existing',
+            'output': [
+                {
+                    'type': 'message',
+                    'id': 'msg_0',
+                    'status': 'completed',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'existing'}],
+                }
+            ],
+        },
+    )
+    current2['replies'] = [current2['text_response']('more')]
+    metadata2 = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'assistant_message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools2,
+    }
+    state2 = {
+        'config': dict(state['config']),
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': 'existing'},
+        ],
+        'summary': 'S2',
+        'summary_message_content': '<auto_compaction_context>S2</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx2 = _adoption_stream_ctx(tools2, metadata2, state=state2)
+    ctx2['event_emitter'] = current2['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current2['text_response']('more'), ctx2))
+
+    assert _adoption_shape(current2['saved'][-1]['output']) == [
+        ('message', None, None, None),
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S2', None),
+        ('message', None, None, None),
+    ]
+    continuing_emits = [
+        event['data']['output']
+        for event in current2['emitted']
+        if event.get('type') == 'chat:completion'
+        and isinstance(event.get('data', {}).get('output'), list)
+        and _adoption_shape(event['data']['output'])
+        == [
+            ('message', None, None, None),
+            (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S2', None),
+        ]
+    ]
+    assert continuing_emits
+
+
+def test_continuation_dedupes_against_branch_adoption_record(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 1000,
+            'token_cap': 1000,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': [
+            {'id': 'u0', 'role': 'user', 'content': 'start'},
+            {
+                'id': 'a0',
+                'role': 'assistant',
+                'content': '',
+                'output': [_adoption_item('S', 'cc_0')],
+            },
+            {'id': 'u1', 'role': 'user', 'content': 'next'},
+        ],
+        'summary': 'S',
+        'summary_message_content': '<auto_compaction_context>S</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    assert current['summaries'] == []
+    saved_records = [
+        item
+        for update in current['saved']
+        for item in update.get('output', [])
+        if item.get('type') == compaction.CONTEXT_COMPACTION_OUTPUT_TYPE
+    ]
+    assert saved_records == []
+    emitted_records = [
+        item
+        for event in current['emitted']
+        if event.get('type') == 'chat:completion'
+        for item in event.get('data', {}).get('output') or []
+        if isinstance(item, dict) and item.get('type') == compaction.CONTEXT_COMPACTION_OUTPUT_TYPE
+    ]
+    assert emitted_records == []
+
+
+def test_content_only_continuation_places_adoption_after_previous_text(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(
+        monkeypatch,
+        middleware,
+        summaries=[],
+        existing_message={'id': 'assistant', 'role': 'assistant', 'content': 'OLD'},
+    )
+    current['replies'] = [current['text_response']('MORE')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'assistant_message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 1000,
+            'token_cap': 1000,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': 'OLD'},
+        ],
+        'summary': 'S',
+        'summary_message_content': '<auto_compaction_context>S</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['text_response']('MORE'), ctx))
+
+    final = current['saved'][-1]
+    assert _adoption_shape(final['output']) == [
+        ('message', None, None, None),
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S', None),
+        ('message', None, None, None),
+    ]
+    assert final['output'][0]['content'][0]['text'] == 'OLD'
+    assert final['output'][2]['content'][0]['text'] == 'MORE'
+
+
+def test_approval_pause_records_no_continuation_adoption(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = []
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'ask'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>S1</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    paused_outputs = []
+
+    async def pause(_chat_id, _message_id, output, _form_data, _metadata):
+        paused_outputs.append(copy.deepcopy(output))
+
+    monkeypatch.setattr(middleware, 'pause_for_tool_approval', pause)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    assert paused_outputs
+    shape = _adoption_shape(paused_outputs[0])
+    assert shape[0] == (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None)
+    assert [item for item in shape if item[0] == compaction.CONTEXT_COMPACTION_OUTPUT_TYPE] == [
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None)
+    ]
+
+
+def test_cancelled_stream_keeps_adoption_record(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = []
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>S1</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+
+    async def cancelling_emitter(event):
+        if event.get('type') == 'response:completion':
+            raise asyncio.CancelledError()
+
+    ctx['event_emitter'] = cancelling_emitter
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            middleware.streaming_chat_response_handler(
+                current['text_response']('done'),
+                ctx,
+            )
+        )
+
+    cancelled_saves = [update for update in current['saved'] if update.get('done') is True and 'output' in update]
+    assert cancelled_saves
+    for update in cancelled_saves:
+        assert _adoption_shape(update['output'])[0] == (
+            compaction.CONTEXT_COMPACTION_OUTPUT_TYPE,
+            None,
+            'S1',
+            None,
+        )
+
+
+def test_non_stream_response_prepends_adoption_record(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    emitted = []
+    saved = []
+
+    async def emitter(event):
+        emitted.append(copy.deepcopy(event))
+
+    async def save(_chat_id, _message_id, update, **_kwargs):
+        saved.append(copy.deepcopy(update))
+        return update
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(middleware, 'outlet_filter_handler', noop)
+    monkeypatch.setattr(middleware, 'background_tasks_handler', noop)
+    monkeypatch.setattr(middleware, 'publish_chat_finished_event', noop)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(middleware.Chats, 'get_chat_title_by_id', noop)
+
+    metadata = {'chat_id': 'chat', 'message_id': 'assistant'}
+    state = {
+        'config': {'enable': False},
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>S1</auto_compaction_context>',
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+    }
+    ctx = {
+        'request': SimpleNamespace(),
+        'form_data': {},
+        'user': SimpleNamespace(role='admin'),
+        'metadata': metadata,
+        'events': [],
+        'event_emitter': emitter,
+        'model': {'id': 'model'},
+        'compaction_state': state,
+    }
+
+    response = {'choices': [{'message': {'content': 'done'}}], 'usage': {}}
+    result = asyncio.run(middleware.non_streaming_chat_response_handler(response, ctx))
+
+    assert _adoption_shape(saved[-1]['output']) == [
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None),
+        ('message', None, None, None),
+    ]
+    done_emits = [
+        event['data']['output']
+        for event in emitted
+        if event.get('type') == 'chat:completion' and event.get('data', {}).get('done')
+    ]
+    assert done_emits and _adoption_shape(done_emits[-1]) == [
+        (compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, None, 'S1', None),
+        ('message', None, None, None),
+    ]
+    message_item = saved[-1]['output'][-1]
+    assert message_item['content'][0]['text'] == 'done'
+    assert result['choices'][0]['message']['content'] == 'done'
+
+    state['summary'] = 'S1'
+    state['checkpoint_messages'][1]['output'] = [_adoption_item('S1', 'cc_0')]
+    saved.clear()
+    asyncio.run(middleware.non_streaming_chat_response_handler(copy.deepcopy(response), ctx))
+    assert _adoption_shape(saved[-1]['output']) == [('message', None, None, None)]

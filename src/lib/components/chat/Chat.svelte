@@ -415,7 +415,7 @@
 	let generating = false;
 	let dragged = false;
 	let generationController = null;
-	let contextCompactionToastId = null;
+	let contextCompactionToastId: string | number | null = null;
 
 	let chat = null;
 	let tags = [];
@@ -1213,11 +1213,24 @@
 		}
 
 		if (status?.done) {
+			const summaryTarget = (
+				history.messages as Record<string, { contextSummary?: string }>
+			)[status?.message_id];
+			if (typeof status?.summary === 'string' && summaryTarget) {
+				summaryTarget.contextSummary = status.summary;
+				history = history;
+			}
+
 			if (contextCompactionToastId !== null) {
 				if (status?.error) {
 					toast.error($i18n.t('Context compaction failed'), {
 						id: contextCompactionToastId,
 						duration: 3000
+					});
+				} else if (status?.phase === 'prefetch') {
+					toast.success($i18n.t('Summary ready'), {
+						id: contextCompactionToastId,
+						duration: 1800
 					});
 				} else {
 					toast.success($i18n.t('Context compacted'), {
@@ -1231,9 +1244,14 @@
 		}
 
 		if (contextCompactionToastId === null) {
-			contextCompactionToastId = toast.loading($i18n.t('Compacting context'), {
-				duration: Infinity
-			});
+			contextCompactionToastId = toast.loading(
+				status?.phase === 'prefetch'
+					? $i18n.t('Generating summary in advance')
+					: $i18n.t('Compacting context'),
+				{
+					duration: Infinity
+				}
+			);
 		}
 	};
 

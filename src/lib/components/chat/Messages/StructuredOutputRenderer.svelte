@@ -1,6 +1,7 @@
 <script lang="ts">
 	import Collapsible from '$lib/components/common/Collapsible.svelte';
 	import ToolCallDisplay from '$lib/components/common/ToolCallDisplay.svelte';
+	import ContextCompactionDivider from './ContextCompactionDivider.svelte';
 	import TerminalOutputFile from './TerminalOutputFile.svelte';
 	import { resolveChatMessageToolCall } from '$lib/apis/chats';
 	import { settings } from '$lib/stores';
@@ -162,6 +163,8 @@
 				{/each}
 			</div>
 		</ConsecutiveDetailsGroup>
+	{:else if displayItem.type === 'context_compaction'}
+		<ContextCompactionDivider variant={displayItem.variant} summary={displayItem.summary} />
 	{:else if displayItem.type === 'file'}
 		{#if displayItem.item?.displayed || $settings?.terminalFileDisplay === 'inline'}
 			<TerminalOutputFile item={displayItem.item} {chatId} />

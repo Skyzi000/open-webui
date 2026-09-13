@@ -53,6 +53,7 @@
 	import Citations from './Citations.svelte';
 	import CodeExecutions from './CodeExecutions.svelte';
 	import ContentRenderer from './ContentRenderer.svelte';
+	import ContextCompactionDivider from './ContextCompactionDivider.svelte';
 	import { KokoroWorker } from '$lib/workers/KokoroWorker';
 	import FileItem from '$lib/components/common/FileItem.svelte';
 	import FollowUps from './ResponseMessage/FollowUps.svelte';
@@ -72,6 +73,8 @@
 		files?: { type: string; url: string }[];
 		timestamp: number;
 		role: string;
+		contextSummary?: string;
+		context_summary?: string;
 		statusHistory?: {
 			done: boolean;
 			action: string;
@@ -191,6 +194,10 @@
 	$: visibleResponseContent =
 		getOutputText(message.output) || removeAllDetails(message.content ?? '');
 	$: hasResponseContent = Boolean((message.content ?? '').trim() || message.output?.length);
+	$: messageContextSummary = (() => {
+		const value = message?.contextSummary ?? message?.context_summary;
+		return typeof value === 'string' && value.trim() ? value : '';
+	})();
 
 	let edit = false;
 	let editedContent = '';
@@ -815,12 +822,15 @@
 							</div>
 						{/if}
 
-						<div
-							bind:this={contentContainerElement}
-							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
-							id="response-content-container"
-						>
-							{#if hasResponseContent && message.error !== true}
+					<div
+						bind:this={contentContainerElement}
+						class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
+						id="response-content-container"
+					>
+						{#if messageContextSummary}
+							<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
+						{/if}
+						{#if hasResponseContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->
 								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
 								<ContentRenderer

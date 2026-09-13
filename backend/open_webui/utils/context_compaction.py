@@ -60,6 +60,7 @@ _MEDIA_PART_TYPES = {'file', 'image', 'image_url', 'input_audio', 'input_file', 
 _BOUNDARY_KEY = '_open_webui_context_compaction_boundary'
 CONTEXT_COMPACTION_USAGE_ANCHOR_KEY = '_open_webui_context_compaction_usage_anchor'
 CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY = '_open_webui_context_compaction_transient'
+CONTEXT_COMPACTION_OUTPUT_TYPE = 'open_webui:context_compaction'
 _DEFAULT_EXCERPT_BYTES = 512
 _DEFAULT_EXCERPT_COUNT = 32
 _HISTORY_REF_XML_SUFFIX_RE = re.compile(
@@ -383,6 +384,61 @@ def restore_nested_checkpoint_markers(
         if isinstance(item, dict):
             item = {key: value for key, value in item.items() if key not in marker_keys}
             output[output_index] = {**item, 'contextSummary': summary}
+
+
+def context_compaction_adoption_summary(state: Any) -> str | None:
+    """Summary text in force for the outgoing dispatch; None when none was applied."""
+    if not isinstance(state, dict):
+        return None
+    if not isinstance(state.get('summary_message_content'), str) or not state['summary_message_content']:
+        return None
+    summary = state.get('summary') or state.get('previous_summary')
+    if not isinstance(summary, str):
+        return None
+    summary = summary.strip()
+    return summary or None
+
+
+def _latest_adoption_summary(output: Any) -> str | None:
+    if not isinstance(output, list):
+        return None
+    for item in reversed(output):
+        if isinstance(item, dict) and item.get('type') == CONTEXT_COMPACTION_OUTPUT_TYPE:
+            # A corrupt record must not suppress a fresh one; '' never equals a valid summary.
+            summary = item.get('compaction_summary')
+            return summary if isinstance(summary, str) else ''
+    return None
+
+
+def latest_branch_adoption_summary(messages: Any) -> str | None:
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        summary = _latest_adoption_summary(message.get('output'))
+        if summary is not None:
+            return summary
+    return None
+
+
+def context_compaction_adoption_record(state: Any, output: Any, branch_messages: Any = None) -> dict | None:
+    """Adoption record to show before the outputs of the dispatch that succeeded."""
+    summary = context_compaction_adoption_summary(state)
+    if summary is None:
+        return None
+    latest = _latest_adoption_summary(output)
+    if latest is None and branch_messages is not None:
+        latest = latest_branch_adoption_summary(branch_messages)
+    if isinstance(latest, str) and latest.strip() == summary:
+        return None
+    from open_webui.utils.middleware import output_id
+
+    return {
+        'type': CONTEXT_COMPACTION_OUTPUT_TYPE,
+        'id': output_id('cc'),
+        'compaction_summary': summary,
+    }
 
 
 def _bind_history_loader(
@@ -915,9 +971,28 @@ async def _save_checkpoint(chat_id: str, checkpoint_message_id: str, summary: st
 async def _finalize_prefetch_checkpoint(
     generation: asyncio.Task,
     chat_id: str,
+    event_emitter=None,
 ) -> tuple[str, dict[str, Any], tuple[list[dict[str, Any]], int], str]:
-    summary, summary_meta, checkpoint_history, checkpoint_message_id = await generation
-    await _save_checkpoint(chat_id, checkpoint_message_id, summary)
+    try:
+        summary, summary_meta, checkpoint_history, checkpoint_message_id = await generation
+        await _save_checkpoint(chat_id, checkpoint_message_id, summary)
+    except BaseException:
+        await _emit_compaction_status(
+            event_emitter,
+            'Context compaction failed',
+            True,
+            error=True,
+            phase='prefetch',
+        )
+        raise
+    await _emit_compaction_status(
+        event_emitter,
+        'Summary ready',
+        True,
+        phase='prefetch',
+        message_id=checkpoint_message_id,
+        summary=summary,
+    )
     return summary, summary_meta, checkpoint_history, checkpoint_message_id
 
 
@@ -930,7 +1005,16 @@ def _prefetch_done(task: asyncio.Task) -> None:
         log.exception('Context compaction prefetch failed')
 
 
-async def _emit_compaction_status(event_emitter, description: str, done: bool, *, error: bool = False) -> None:
+async def _emit_compaction_status(
+    event_emitter,
+    description: str,
+    done: bool,
+    *,
+    error: bool = False,
+    phase: str | None = None,
+    message_id: str | None = None,
+    summary: str | None = None,
+) -> None:
     if not event_emitter:
         return
     data = {
@@ -940,6 +1024,12 @@ async def _emit_compaction_status(event_emitter, description: str, done: bool, *
     }
     if error:
         data['error'] = True
+    if phase is not None:
+        data['phase'] = phase
+    if message_id is not None:
+        data['message_id'] = message_id
+    if summary is not None:
+        data['summary'] = summary
     await event_emitter({'type': 'context_compaction', 'data': data})
 
 
@@ -1017,6 +1107,17 @@ async def compact_provider_payload(
         ):
             # ponytail: duplicate cross-worker prefetches are harmless; add Redis
             # dedup only if measured summary cost warrants the coordination.
+            event_emitter = None
+            if metadata.get('chat_id') and metadata.get('message_id'):
+                from open_webui.socket.main import get_event_emitter
+
+                event_emitter = await get_event_emitter(metadata)
+            await _emit_compaction_status(
+                event_emitter,
+                'Generating summary in advance',
+                False,
+                phase='prefetch',
+            )
             generation = asyncio.create_task(
                 _generate_checkpoint(
                     request,
@@ -1031,7 +1132,7 @@ async def compact_provider_payload(
                 )
             )
             task = asyncio.create_task(
-                _finalize_prefetch_checkpoint(generation, metadata['chat_id'])
+                _finalize_prefetch_checkpoint(generation, metadata['chat_id'], event_emitter)
             )
             task.add_done_callback(_prefetch_done)
             state['prefetch_task'] = task
@@ -1144,7 +1245,13 @@ async def compact_provider_payload(
     except Exception:
         await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
         raise
-    await _emit_compaction_status(event_emitter, 'Context compacted', True)
+    await _emit_compaction_status(
+        event_emitter,
+        'Context compacted',
+        True,
+        message_id=checkpoint_message_id,
+        summary=summary,
+    )
     return compacted_body
 
 
@@ -1586,28 +1693,57 @@ async def _completed_turn_checkpoint(
     if not compacted_source:
         return None
     recent_source = active[-1:]
-    model = models.get(model_id, {})
-    compacted_messages, recent_messages = await asyncio.gather(
-        _completed_turn_provider_messages(compacted_source, user, model),
-        _completed_turn_provider_messages(recent_source, user, model),
+    event_emitter = None
+    if metadata.get('chat_id') and metadata.get('message_id'):
+        from open_webui.socket.main import get_event_emitter
+
+        event_emitter = await get_event_emitter(metadata)
+    await _emit_compaction_status(
+        event_emitter,
+        'Generating summary in advance',
+        False,
+        phase='prefetch',
     )
-    summary = await _generate_summary(
-        request,
-        user,
-        model_id,
-        models,
-        compacted_messages,
-        recent_messages,
-        previous_summary,
-        config['prompt_template'],
-        config['transient_patterns'],
-        _absorbed_files(compacted_source, recent_source),
-        previous_summary_meta={},
-        externalized_refs_enable=config.get('externalized_refs_enable', False),
-        externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+    try:
+        model = models.get(model_id, {})
+        compacted_messages, recent_messages = await asyncio.gather(
+            _completed_turn_provider_messages(compacted_source, user, model),
+            _completed_turn_provider_messages(recent_source, user, model),
+        )
+        summary = await _generate_summary(
+            request,
+            user,
+            model_id,
+            models,
+            compacted_messages,
+            recent_messages,
+            previous_summary,
+            config['prompt_template'],
+            config['transient_patterns'],
+            _absorbed_files(compacted_source, recent_source),
+            previous_summary_meta={},
+            externalized_refs_enable=config.get('externalized_refs_enable', False),
+            externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+            message_id=metadata['message_id'],
+        )
+        await _save_checkpoint(metadata['chat_id'], metadata['message_id'], summary)
+    except BaseException:
+        await _emit_compaction_status(
+            event_emitter,
+            'Context compaction failed',
+            True,
+            error=True,
+            phase='prefetch',
+        )
+        raise
+    await _emit_compaction_status(
+        event_emitter,
+        'Summary ready',
+        True,
+        phase='prefetch',
         message_id=metadata['message_id'],
+        summary=summary,
     )
-    await _save_checkpoint(metadata['chat_id'], metadata['message_id'], summary)
     return summary
 
 

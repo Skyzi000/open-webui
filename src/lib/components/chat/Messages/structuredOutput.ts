@@ -62,6 +62,12 @@ export type OutputDisplayItem =
 			type: 'file';
 			id: string;
 			item: Record<string, unknown>;
+	  }
+	| {
+			type: 'context_compaction';
+			id: string;
+			summary: string;
+			variant: 'checkpoint' | 'adoption';
 	  };
 
 type ResponseStreamEvent = {
@@ -374,6 +380,31 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 
 	output.forEach((item, index) => {
 		if (!item) {
+			return;
+		}
+
+		const checkpointSummary = item.contextSummary ?? item.context_summary;
+		if (typeof checkpointSummary === 'string' && checkpointSummary.trim()) {
+			flushDetails();
+			displayItems.push({
+				type: 'context_compaction',
+				id: `checkpoint-${item.id ?? index}`,
+				summary: checkpointSummary,
+				variant: 'checkpoint'
+			});
+		}
+
+		if (item.type === 'open_webui:context_compaction') {
+			const adoptionSummary = item.compaction_summary;
+			if (typeof adoptionSummary === 'string' && adoptionSummary.trim()) {
+				flushDetails();
+				displayItems.push({
+					type: 'context_compaction',
+					id: `adoption-${item.id ?? index}`,
+					summary: adoptionSummary,
+					variant: 'adoption'
+				});
+			}
 			return;
 		}
 

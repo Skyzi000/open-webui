@@ -20,6 +20,7 @@
 	import Image from '$lib/components/common/Image.svelte';
 	import DeleteConfirmDialog from '$lib/components/common/ConfirmDialog.svelte';
 	import SubagentResultRow from './SubagentResultRow.svelte';
+	import ContextCompactionDivider from './ContextCompactionDivider.svelte';
 
 	const i18n = getContext('i18n');
 	export let user;
@@ -67,6 +68,10 @@
 			}
 		}
 	}
+	$: messageContextSummary = (() => {
+		const value = message?.contextSummary ?? message?.context_summary;
+		return typeof value === 'string' && value.trim() ? value : '';
+	})();
 	const copyToClipboard = async (text) => {
 		const res = await _copyToClipboard(text);
 		if (res) {
@@ -170,9 +175,13 @@
 			</div>
 		{/if}
 
-		<div class="chat-{message.role} w-full min-w-full">
-			{#if edit !== true}
-				{#if message.files}
+	<div class="chat-{message.role} w-full min-w-full">
+		{#if messageContextSummary}
+			<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
+		{/if}
+
+		{#if edit !== true}
+			{#if message.files}
 					<div
 						class="mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap"
 						dir={$settings?.chatDirection ?? 'auto'}
