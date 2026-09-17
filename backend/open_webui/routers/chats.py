@@ -39,8 +39,8 @@ from open_webui.tasks import get_response_streams_by_chat_id, has_active_tasks, 
 from open_webui.utils.access_control import filter_allowed_access_grants, has_permission
 from open_webui.utils.access_control.folders import has_folder_write_access
 from open_webui.utils.auth import bearer_security, get_admin_user, get_current_user, get_verified_user
-from open_webui.utils.chat_fork import build_fork_history
-from open_webui.utils.context_compaction import compact_chat_branch, get_chat_context_usage
+from open_webui.utils.chat_fork import build_fork_history, carry_fork_context_usage
+from open_webui.utils.context_compaction import compact_chat_branch
 from open_webui.utils.misc import get_message_list
 from open_webui.utils.models import check_model_access, get_all_models
 from pydantic import BaseModel, Field, field_validator
@@ -69,24 +69,28 @@ def overlay_response_streams(chat_data: dict, response_streams: list[dict]) -> d
     if not response_streams:
         return chat_data
 
+    def overlay_message(message: dict, stream: dict) -> None:
+        message['content'] = stream.get('content', '')
+        message['output'] = stream.get('output') or []
+        message['done'] = False
+        snapshot = stream.get('context_usage')
+        if isinstance(snapshot, dict):
+            message['context_usage'] = dict(snapshot)
+
     messages = chat_data.get('chat', {}).get('history', {}).get('messages')
     if isinstance(messages, dict):
         for stream in response_streams:
             message_id = stream.get('message_id')
             message = messages.get(message_id)
             if isinstance(message, dict):
-                message['content'] = stream.get('content', '')
-                message['output'] = stream.get('output') or []
-                message['done'] = False
+                overlay_message(message, stream)
 
     legacy_messages = chat_data.get('chat', {}).get('messages')
     if isinstance(legacy_messages, list):
         streams_by_message_id = {stream.get('message_id'): stream for stream in response_streams}
         for message in legacy_messages:
             if isinstance(message, dict) and (stream := streams_by_message_id.get(message.get('id'))):
-                message['content'] = stream.get('content', '')
-                message['output'] = stream.get('output') or []
-                message['done'] = False
+                overlay_message(message, stream)
 
     return chat_data
 
@@ -1383,9 +1387,6 @@ async def compact_chat_by_id(
                 ) from exc
 
     result = await compact_chat_branch(request, user, chat, model_id, models)
-    # The map fetched above predates compaction; let usage re-read the
-    # post-compaction normalized rows instead of the stale snapshot.
-    result['context_usage'] = await get_chat_context_usage(chat, model_id)
     if result.get('compacted'):
         await publish_event(
             request,
@@ -1462,7 +1463,6 @@ async def get_chat_by_id(
         )
         messages_map = await Chats.get_messages_map_by_chat_id(id)
         data = _overlay_context_summaries(data, messages_map)
-        data['context_usage'] = await get_chat_context_usage(chat, messages_map=messages_map)
         return data
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.NOT_FOUND)
@@ -1836,6 +1836,8 @@ async def fork_chat_by_id(
             status_code=status.HTTP_404_NOT_FOUND if detail == 'message not found' else status.HTTP_400_BAD_REQUEST,
             detail=detail,
         ) from exc
+
+    carry_fork_context_usage(fork_history, history.get('messages') or {})
 
     updated_chat = {**(chat.chat or {})}
     updated_chat.pop('currentId', None)

@@ -1033,6 +1033,18 @@ async def _emit_compaction_status(
     await event_emitter({'type': 'context_compaction', 'data': data})
 
 
+async def _emit_context_usage(event_emitter, snapshot: dict | None) -> None:
+    """Notify a numeric snapshot update only; carries no toast or scroll semantics."""
+    if not event_emitter or not isinstance(snapshot, dict):
+        return
+    await event_emitter(
+        {
+            'type': 'context_compaction',
+            'data': {'action': 'context_compaction', 'context_usage': snapshot},
+        }
+    )
+
+
 def _checkpoint_for_boundary(
     state: dict,
     working: list[dict],
@@ -1097,6 +1109,7 @@ async def compact_provider_payload(
     }
     before = await asyncio.to_thread(estimate_provider_tokens, projected_body)
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
+    _record_pending_context_usage(state, before, threshold, config)
     if before <= threshold:
         soft_ratio = config['soft_trigger_ratio']
         if (
@@ -1242,6 +1255,7 @@ async def compact_provider_payload(
                 'summary_message_content': summary_message['content'],
             }
         )
+        _update_pending_context_usage_tokens(state, after)
     except Exception:
         await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
         raise
@@ -1368,6 +1382,7 @@ async def compact_transient_provider_payload(
     }
     before = await asyncio.to_thread(estimate_provider_tokens, projected_body)
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
+    _record_pending_context_usage(state, before, threshold, config)
     if before <= threshold:
         return body
 
@@ -1467,6 +1482,7 @@ async def compact_transient_provider_payload(
                     'summary_message_content': summary_message['content'],
                 }
             )
+            _update_pending_context_usage_tokens(state, after)
         except Exception:
             await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
             raise
@@ -1550,6 +1566,7 @@ async def compact_transient_provider_payload(
             after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
             if after <= threshold:
                 compacted_body = candidate
+                selected_after = after
                 break
         if compacted_body is None:
             raise RuntimeError(
@@ -1578,6 +1595,7 @@ async def compact_transient_provider_payload(
             updates['selected_history'] = history_entry
             updates['checkpoint_history'] = history_entry
         state.update(updates)
+        _update_pending_context_usage_tokens(state, selected_after)
     except Exception:
         await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
         raise
@@ -1770,40 +1788,9 @@ def start_completed_turn_compaction_prefetch(
 
     durability_repair = state.get('compacted') is True and state.get('durable_compacted') is not True
     if not durability_repair:
-        total = usage.get('total_tokens') if isinstance(usage, dict) else None
-        if isinstance(usage, dict) and any(
-            key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')
-        ):
-            parts = [
-                usage.get(key, 0)
-                for key in (
-                    'input_tokens',
-                    'cache_creation_input_tokens',
-                    'cache_read_input_tokens',
-                    'output_tokens',
-                )
-            ]
-            if all(
-                not isinstance(value, bool)
-                and isinstance(value, (int, float))
-                and math.isfinite(value)
-                and value >= 0
-                for value in parts
-            ):
-                if (
-                    isinstance(total, bool)
-                    or not isinstance(total, (int, float))
-                    or not math.isfinite(total)
-                ):
-                    total = 0
-                total = max(total, sum(parts))
+        total = _usage_total_tokens(usage)
         ratio = config.get('soft_trigger_ratio', 0)
-        if (
-            isinstance(total, bool)
-            or not isinstance(total, (int, float))
-            or not math.isfinite(total)
-            or ratio <= 0
-        ):
+        if total is None or ratio <= 0:
             return None
         threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
         if total < int(threshold * ratio) or total >= threshold:
@@ -1893,61 +1880,108 @@ def _resolve_token_threshold(global_threshold: int, global_cap: int, metadata: d
     return min(configured_threshold or global_threshold, global_cap)
 
 
-async def get_chat_context_usage(
-    chat: Any,
-    model_id: str | None = None,
-    *,
-    messages_map: dict | None = None,
-) -> dict | None:
-    chat_data = chat.chat or {}
-    history = chat_data.get('history') or {}
-    current_id = getattr(chat, 'current_message_id', None) or history.get('currentId')
-    if not current_id:
-        current_id = chat_data.get('currentId') or chat_data.get('branchPointMessageId')
-    if not current_id and isinstance(chat_data.get('messages'), list) and chat_data['messages']:
-        current_id = chat_data['messages'][-1].get('id')
-    if not current_id:
+def _valid_token_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value >= 0
+    )
+
+
+_TOKEN_COUNTER_KEYS = (
+    'input_tokens',
+    'output_tokens',
+    'total_tokens',
+    'prompt_tokens',
+    'completion_tokens',
+    'prompt_eval_count',
+    'eval_count',
+    'cache_creation_input_tokens',
+    'cache_read_input_tokens',
+    'prompt_n',
+    'cache_n',
+    'predicted_n',
+)
+
+
+def has_valid_token_measurement(usage: Any) -> bool:
+    """Whether a raw usage dict carries at least one explicit token counter.
+
+    Must run before normalize_usage, which fills missing counters with zeros;
+    otherwise an all-null or cost-only receipt would read as a valid zero.
+    """
+    if not isinstance(usage, dict):
+        return False
+    return any(_valid_token_number(usage.get(key)) for key in _TOKEN_COUNTER_KEYS)
+
+
+def _usage_total_tokens(usage: Any) -> int | None:
+    """Input+output tokens for one provider response, cache-inclusive.
+
+    Shared with the completed-turn prefetch trigger so the ring and the
+    trigger never disagree about what a response consumed.
+    """
+    if not isinstance(usage, dict):
         return None
-
-    if messages_map is None:
-        messages_map = await Chats.get_messages_map_by_chat_id(chat.id)
-    messages = get_message_list(messages_map or history.get('messages') or {}, current_id)
-    if not messages:
-        return None
-
-    try:
-        config = await _load_config()
-    except re.error:
-        log.exception('Context compaction configuration is invalid; context usage is unavailable')
-        return None
-    if not config['enable']:
-        return None
-
-    params = ((chat.chat or {}).get('params') or {}).copy()
-    if model_id:
-        params['model'] = model_id
-    threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], {'params': params})
-    messages, previous_summary = _apply_latest_summary_checkpoint(messages)
-
-    tokens = await asyncio.to_thread(_candidate_input_tokens, messages, summary=previous_summary)
-    return _build_context_usage(tokens, threshold)
+    total = usage.get('total_tokens')
+    total = total if _valid_token_number(total) else None
+    if any(key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')):
+        parts = [
+            usage.get(key, 0)
+            for key in (
+                'input_tokens',
+                'cache_creation_input_tokens',
+                'cache_read_input_tokens',
+                'output_tokens',
+            )
+        ]
+        if all(_valid_token_number(value) for value in parts):
+            total = max(total or 0, sum(parts))
+    return int(total) if total is not None else None
 
 
-def _build_context_usage(tokens: int, threshold: int) -> dict:
-    return {
+def _soft_threshold_for(threshold: int, config: dict) -> int | None:
+    ratio = config.get('soft_trigger_ratio') or 0
+    return int(threshold * ratio) if ratio > 0 else None
+
+
+def _record_pending_context_usage(state: dict, tokens: int, threshold: int, config: dict) -> dict:
+    """Store the next-send candidate estimate; adopted into context_usage at send commit."""
+    snapshot = {
         'tokens': tokens,
-        'estimated_tokens': tokens,
         'threshold': threshold,
-        'percent': round((tokens / threshold) * 100) if threshold > 0 else 0,
+        'soft_threshold': _soft_threshold_for(threshold, config),
         'source': 'estimated',
     }
+    state['pending_context_usage'] = snapshot
+    return snapshot
 
 
-def _apply_latest_summary_checkpoint(messages: list[dict]) -> tuple[list[dict], str | None]:
-    system, _, active, message_index, _, summary = _stored_checkpoint_view(messages)
-    if message_index is None:
-        return messages, None
-    return [*system, *active], summary
+def _update_pending_context_usage_tokens(state: dict, tokens: int) -> None:
+    pending = state.get('pending_context_usage')
+    if isinstance(pending, dict):
+        state['pending_context_usage'] = {**pending, 'tokens': tokens, 'source': 'estimated'}
+
+
+def apply_response_usage_to_context_usage(state: dict, usage: dict | None) -> dict | None:
+    """Replace context_usage tokens with the measured input+output of the latest response.
+
+    Returns the new snapshot, or None when the usage carries no usable total and
+    the existing snapshot must stay untouched.
+    """
+    total = _usage_total_tokens(usage)
+    if total is None:
+        return None
+    snapshot = state.get('context_usage')
+    updated = {
+        'tokens': total,
+        'threshold': snapshot.get('threshold') if isinstance(snapshot, dict) else None,
+        'soft_threshold': snapshot.get('soft_threshold') if isinstance(snapshot, dict) else None,
+        'source': 'usage',
+    }
+    state['context_usage'] = updated
+    return updated
 
 
 def _split_leading_system_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -2090,29 +2124,6 @@ def estimate_provider_tokens(body: dict) -> int:
         suffix = estimate_body_tokens({'messages': messages[index:]})
         return input_tokens + max(0, suffix - 3)
     return estimate_body_tokens(body)
-
-
-def _candidate_input_tokens(messages: list[dict], system_prompt: str = '', summary: str | None = None) -> int:
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if message.get('role') != 'assistant':
-            continue
-        info = message.get('info')
-        usage = message.get('usage') or (info.get('usage') if isinstance(info, dict) else None)
-        if _is_merged_cache_usage(usage):
-            break
-        input_tokens = _strict_usage_input_tokens(usage)
-        if input_tokens is None:
-            continue
-        suffix_tokens = estimate_body_tokens({'messages': messages[index:]})
-        return input_tokens + max(0, suffix_tokens - 3)
-
-    fallback_messages = list(messages)
-    if summary:
-        fallback_messages.insert(0, {'role': 'system', 'content': f'[CONVERSATION SUMMARY]\n{summary}'})
-    if system_prompt:
-        fallback_messages.insert(0, {'role': 'system', 'content': system_prompt})
-    return estimate_body_tokens({'messages': fallback_messages})
 
 
 def find_safe_compaction_boundary(

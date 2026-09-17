@@ -52,11 +52,17 @@
 		getCurrentDateTime,
 		getFormattedDate,
 		getFormattedTime,
-		getUsageTokenCount,
 		getUserPosition,
 		getUserTimezone,
 		getWeekday
 	} from '$lib/utils';
+	import {
+		contextRingState,
+		contextUsagePercent,
+		softMarkerPosition,
+		type ContextUsageLiveState,
+		type ContextUsageSnapshot
+	} from '$lib/utils/contextUsage';
 	import { uploadFile } from '$lib/apis/files';
 	import { getCwd, uploadToTerminal } from '$lib/apis/terminal';
 	import { generateAutoCompletion } from '$lib/apis';
@@ -134,7 +140,8 @@
 	export let statusHandler: Function = () => {};
 	export let forkHandler: Function = () => {};
 	export let chatId = '';
-	export let contextUsage = null;
+	export let contextUsage: ContextUsageSnapshot | null = null;
+	export let contextLiveState: ContextUsageLiveState | null = null;
 	export let contextCompactionEnabled = false;
 	export let embedded = false;
 
@@ -442,76 +449,6 @@
 	const trimNumber = (value: number) =>
 		value >= 10 ? String(Math.round(value)) : value.toFixed(1).replace(/\.0$/, '');
 
-	const estimateTokens = (value) => {
-		if (value === null || value === undefined || value === '') {
-			return 0;
-		}
-		if (typeof value !== 'string') {
-			try {
-				value = JSON.stringify(value);
-			} catch {
-				value = String(value);
-			}
-		}
-		return Math.max(1, Math.floor(value.length / 4));
-	};
-
-	const estimateMessagesTokens = (messages) =>
-		messages.reduce((total, message) => {
-			let next = total + 4 + estimateTokens(message.content);
-			next += estimateTokens(message.output);
-			next += estimateTokens(message.tool_calls);
-			next += estimateTokens(message.files);
-			return next;
-		}, 0);
-
-	const getLocalContextUsage = () => {
-		if (!history?.currentId) {
-			return null;
-		}
-
-		const messages = createMessagesList(history, history.currentId);
-		if (!messages.length) {
-			return null;
-		}
-
-		let summary = '';
-		let startIdx = 0;
-		for (let idx = 0; idx < messages.length; idx += 1) {
-			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
-			if (typeof value === 'string' && value.trim()) {
-				summary = value;
-				startIdx = idx;
-			}
-		}
-
-		const activeMessages = messages.slice(startIdx);
-		let estimatedTokens = estimateTokens($settings?.system ?? '');
-		let hasUsageCheckpoint = false;
-
-		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {
-			const usage = activeMessages[idx]?.usage ?? activeMessages[idx]?.info?.usage;
-			const usageTokens = getUsageTokenCount(usage);
-			if (usageTokens) {
-				hasUsageCheckpoint = true;
-				estimatedTokens = usageTokens + estimateMessagesTokens(activeMessages.slice(idx + 1));
-				break;
-			}
-		}
-
-		if (!hasUsageCheckpoint) {
-			estimatedTokens += estimateTokens(summary) + estimateMessagesTokens(activeMessages);
-		}
-
-		return {
-			tokens: estimatedTokens,
-			estimated_tokens: estimatedTokens,
-			threshold: null,
-			percent: null,
-			source: 'estimated'
-		};
-	};
-
 	const copyStatusChatId = async () => {
 		if (!chatId) return;
 		await navigator.clipboard.writeText(chatId);
@@ -521,20 +458,40 @@
 		}, 1600);
 	};
 
-	$: statusContextUsage = contextUsage ?? getLocalContextUsage();
-	$: contextHasThreshold = Number(statusContextUsage?.threshold) > 0;
-	$: contextPercent = contextHasThreshold
-		? Math.max(0, Math.round(statusContextUsage?.percent ?? 0))
-		: null;
-	$: contextTokens = formatTokenCount(
-		statusContextUsage?.estimated_tokens || statusContextUsage?.tokens || 0
-	);
-	$: contextValue = statusContextUsage
+	$: contextHasThreshold = Number(contextUsage?.threshold) > 0;
+	$: contextPercent = contextUsagePercent(contextUsage);
+	$: contextTokens = formatTokenCount(contextUsage?.tokens || 0);
+	$: contextThresholdTokens = formatTokenCount(contextUsage?.threshold ?? 0);
+	$: contextValue = contextUsage
 		? contextHasThreshold
-			? `${contextPercent}% ${contextTokens}/${formatTokenCount(statusContextUsage.threshold)}`
+			? `${contextPercent}% ${contextTokens}/${contextThresholdTokens}`
 			: `${contextTokens} ${$i18n.t('tokens')}`
-		: $i18n.t('unknown');
-	$: contextBarPercent = contextHasThreshold ? Math.min(contextPercent, 100) : 0;
+		: $i18n.t('Not measured yet');
+	$: contextBarPercent = contextHasThreshold ? Math.min(contextPercent ?? 0, 100) : 0;
+	$: ringState = contextRingState(contextUsage, contextLiveState, contextCompactionEnabled);
+	$: ringVisible = ringState !== null;
+	$: ringStrokeClass =
+		ringState === 'red'
+			? 'text-red-500 dark:text-red-400'
+			: ringState === 'amber'
+				? 'text-amber-500 dark:text-amber-400'
+				: ringState === 'blue'
+					? 'text-blue-500 dark:text-blue-400'
+					: ringState === 'green'
+						? 'text-green-500 dark:text-green-400'
+						: 'text-gray-400 dark:text-gray-600';
+	$: ringArcOffset = 50.27 * (1 - Math.min(Math.max(contextPercent ?? 0, 0), 100) / 100);
+	$: ringSoftFraction =
+		ringVisible &&
+		contextUsage &&
+		typeof contextUsage.soft_threshold === 'number' &&
+		contextUsage.soft_threshold > 0 &&
+		Number(contextUsage.threshold) > 0
+			? Math.min(Math.max(contextUsage.soft_threshold / Number(contextUsage.threshold), 0), 1)
+			: null;
+	$: ringSoftMarker =
+		ringSoftFraction !== null ? softMarkerPosition(ringSoftFraction) : { x: 0, y: 0 };
+	$: ringTooltipContent = `${contextValue} ${$i18n.t('tokens')}`;
 
 	const getCommand = () => {
 		const chatInput = document.getElementById('chat-input');
@@ -1438,7 +1395,7 @@
 					forkDisabled: () => isActive,
 					canTemporary: () => canToggleTemporary,
 					temporaryEnabled: () => $temporaryChatEnabled === true,
-					contextUsage: () => statusContextUsage,
+					contextUsage: () => contextUsage,
 					onCompact: compactHandler,
 					onStatus: statusHandler,
 					onFork: forkHandler,
@@ -1804,7 +1761,7 @@
 												{contextValue}
 											</span>
 										</div>
-										{#if contextHasThreshold}
+										{#if contextUsage && contextHasThreshold}
 											<div
 												class="mt-1.5 h-0.5 overflow-hidden rounded-full bg-gray-100 dark:bg-white/8"
 											>
@@ -1987,10 +1944,66 @@
 							{/if}
 
 							<div class="px-2 relative">
+								{#if ringVisible}
+									<Tooltip
+										content={ringTooltipContent}
+										placement="top"
+										className="absolute top-1.5 right-2 z-20 flex h-7 w-7 items-center justify-center"
+									>
+										<button
+											type="button"
+											class="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-gray-100/50 dark:hover:bg-gray-800/50"
+											aria-label={ringTooltipContent}
+											aria-expanded={showStatusPanel}
+											on:pointerdown={(e) => e.preventDefault()}
+											on:click={() => {
+												showStatusPanel = !showStatusPanel;
+											}}
+										>
+											<svg
+												class="size-3.5 -rotate-90 {ringStrokeClass}"
+												viewBox="0 0 20 20"
+												aria-hidden="true"
+											>
+												<circle
+													cx="10"
+													cy="10"
+													r="8"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="2"
+													class="opacity-20"
+												/>
+												<circle
+													cx="10"
+													cy="10"
+													r="8"
+													fill="none"
+													stroke="currentColor"
+													stroke-width="2"
+													stroke-linecap="round"
+													stroke-dasharray="50.27"
+													style={`stroke-dashoffset: ${ringArcOffset};`}
+												/>
+												{#if ringSoftFraction !== null}
+													<circle
+														cx={ringSoftMarker.x}
+														cy={ringSoftMarker.y}
+														r="1.3"
+														fill="currentColor"
+														stroke="none"
+													/>
+												{/if}
+											</svg>
+										</button>
+									</Tooltip>
+								{/if}
 								{#if prompt.split('\n').length > 2}
 									<button
 										type="button"
-										class="absolute top-2.5 right-3 z-20 p-1 rounded-lg hover:bg-gray-100/50 dark:hover:bg-gray-800/50"
+										class="absolute {ringVisible
+											? 'top-9'
+											: 'top-2.5'} right-3 z-20 p-1 rounded-lg hover:bg-gray-100/50 dark:hover:bg-gray-800/50"
 										aria-label="Expand input"
 										on:click={() => {
 											showInputModal = true;
@@ -2001,8 +2014,9 @@
 								{/if}
 
 								<div
-									class="scrollbar-hidden rtl:text-right ltr:text-left bg-transparent dark:text-gray-100 outline-hidden w-full pb-0.5 px-1 resize-none h-fit max-h-96 overflow-auto {files.length ===
-									0
+									class="scrollbar-hidden rtl:text-right ltr:text-left bg-transparent dark:text-gray-100 outline-hidden w-full pb-0.5 px-1 {ringVisible
+										? 'pr-7'
+										: ''} resize-none h-fit max-h-96 overflow-auto {files.length === 0
 										? atSelectedModel !== undefined
 											? 'pt-1'
 											: 'pt-2'

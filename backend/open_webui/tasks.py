@@ -176,6 +176,7 @@ async def save_response_stream(
     message_id: str | None,
     content: str,
     output: list,
+    context_usage: dict | None = None,
 ):
     if not task_id or not chat_id or not message_id:
         return
@@ -186,6 +187,8 @@ async def save_response_stream(
         'content': content,
         'output': output,
     }
+    if isinstance(context_usage, dict):
+        data['context_usage'] = dict(context_usage)
 
     if redis:
         await redis.hset(REDIS_RESPONSE_STREAMS_KEY, task_id, dumps_bytes(data))

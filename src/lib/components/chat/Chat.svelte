@@ -61,11 +61,19 @@
 		processDetails,
 		removeAllDetails,
 		getCodeBlockContents,
-		displayFileHandler,
-		getUsageTokenCount
+		displayFileHandler
 	} from '$lib/utils';
 	import { AudioQueue } from '$lib/utils/audio';
 	import { createTemporaryChatId, isTemporaryChatId } from '$lib/utils/chatId';
+	import {
+		applyContextCompactionEvent,
+		directContextSummary,
+		isContextUsageSnapshot,
+		resolveBranchContextLiveState,
+		resolveBranchContextUsage,
+		type ContextUsageLiveState,
+		type ContextUsageSnapshot
+	} from '$lib/utils/contextUsage';
 	import { applyResponseStreamEvent, getOutputText } from './Messages/structuredOutput';
 
 	import {
@@ -180,8 +188,16 @@
 	} else {
 		selectedModelIds = selectedModels;
 	}
-	let serverContextUsage = null;
-	let contextUsage = null;
+	let contextLiveStates: Record<string, ContextUsageLiveState> = {};
+	let contextReadySummaries: Record<string, string> = {};
+	$: branchContextUsage = resolveBranchContextUsage(history.messages, history.currentId);
+	$: contextUsage = branchContextUsage?.snapshot ?? null;
+	$: contextLiveState = resolveBranchContextLiveState(
+		history.messages,
+		history.currentId,
+		contextLiveStates,
+		branchContextUsage?.messageId ?? null
+	);
 
 	const getAvailableModelIds = () =>
 		$models.filter((m) => !(m?.info?.meta?.hidden ?? false)).map((m) => m.id);
@@ -224,138 +240,8 @@
 		}
 	}
 
-	const estimateTokens = (value) => {
-		if (value === null || value === undefined || value === '') {
-			return 0;
-		}
-		if (typeof value !== 'string') {
-			try {
-				value = JSON.stringify(value);
-			} catch {
-				value = String(value);
-			}
-		}
-		return Math.max(1, Math.floor(value.length / 4));
-	};
-
-	const estimateMessagesTokens = (messages) =>
-		messages.reduce((total, message) => {
-			let next = total + 4 + estimateTokens(message.content);
-			next += estimateTokens(message.output);
-			next += estimateTokens(message.tool_calls);
-			next += estimateTokens(message.files);
-			return next;
-		}, 0);
-
 	$: contextCompactionEnabled = Boolean($config?.features?.enable_context_compaction);
 
-	const getContextThreshold = () => {
-		const chatThreshold = Number(params?.compact_token_threshold);
-		if (Number.isFinite(chatThreshold) && chatThreshold > 0) {
-			return chatThreshold;
-		}
-
-		const modelId = atSelectedModel?.id ?? selectedModels.find((id) => id);
-		const model = $models.find((item) => item.id === modelId);
-		const threshold = Number(model?.info?.params?.compact_token_threshold);
-		return Number.isFinite(threshold) && threshold > 0 ? threshold : null;
-	};
-
-	const getContextUsage = () => {
-		if (!history?.currentId) {
-			return null;
-		}
-
-		const messages = createMessagesList(history, history.currentId);
-		const threshold = contextCompactionEnabled
-			? (getContextThreshold() ?? serverContextUsage?.threshold ?? null)
-			: null;
-		const systemTokens = estimateTokens($settings?.system ?? '');
-		let estimatedTokens = systemTokens;
-		let hasUsageCheckpoint = false;
-		let summary = '';
-		let startIdx = 0;
-		let outputStartIdx: number | null = null;
-
-		for (let idx = 0; idx < messages.length; idx += 1) {
-			const value = messages[idx]?.contextSummary ?? messages[idx]?.context_summary;
-			if (typeof value === 'string' && value.trim()) {
-				summary = value;
-				startIdx = idx;
-				outputStartIdx = null;
-			}
-			for (let outputIdx = 0; outputIdx < (messages[idx]?.output?.length ?? 0); outputIdx += 1) {
-				const output = messages[idx].output[outputIdx];
-				const outputSummary = output?.contextSummary ?? output?.context_summary;
-				if (typeof outputSummary === 'string' && outputSummary.trim()) {
-					summary = outputSummary;
-					startIdx = idx;
-					outputStartIdx = outputIdx;
-				}
-			}
-		}
-
-		let activeMessages = messages.slice(startIdx);
-		if (activeMessages[0]) {
-			const carrierSource = activeMessages[0];
-			const carrierInfo = carrierSource?.info;
-			let carrier = carrierSource;
-
-			// Mirror the backend checkpoint view: the selected carrier's own
-			// usage predates the compaction cut and must not anchor the estimate.
-			if (summary && (carrierSource?.usage ?? carrierInfo?.usage) != null) {
-				carrier = { ...carrier };
-				if (carrierSource?.usage != null) {
-					delete carrier.usage;
-				}
-				if (carrierInfo?.usage != null) {
-					carrier.info = { ...carrierInfo };
-					delete carrier.info.usage;
-				}
-			}
-
-			if (outputStartIdx !== null) {
-				const output = Array.isArray(carrierSource.output)
-					? carrierSource.output.slice(outputStartIdx)
-					: [];
-				if (output[0]) {
-					const outputCarrier = { ...output[0] };
-					delete outputCarrier.contextSummary;
-					delete outputCarrier.context_summary;
-					output[0] = outputCarrier;
-				}
-				carrier = { ...carrier, content: '', output };
-			}
-
-			if (carrier !== carrierSource) {
-				activeMessages = [carrier, ...activeMessages.slice(1)];
-			}
-		}
-
-		for (let idx = activeMessages.length - 1; idx >= 0; idx -= 1) {
-			const usage = activeMessages[idx]?.usage ?? activeMessages[idx]?.info?.usage;
-			const usageTokens = getUsageTokenCount(usage);
-			if (usageTokens) {
-				hasUsageCheckpoint = true;
-				estimatedTokens = usageTokens + estimateMessagesTokens(activeMessages.slice(idx + 1));
-				break;
-			}
-		}
-
-		if (!hasUsageCheckpoint) {
-			estimatedTokens += estimateTokens(summary) + estimateMessagesTokens(activeMessages);
-		}
-
-		return {
-			tokens: estimatedTokens,
-			estimated_tokens: estimatedTokens,
-			threshold,
-			percent: threshold > 0 ? Math.max(0, Math.round((estimatedTokens / threshold) * 100)) : null,
-			source: 'estimated'
-		};
-	};
-
-	$: contextUsage = getContextUsage() ?? (contextCompactionEnabled ? serverContextUsage : null);
 	$: embeddedHeaderTitle = embeddedTitle || $chatTitle || $i18n.t('Chat');
 
 	let selectedToolIds: string[] = [];
@@ -921,7 +807,8 @@
 		tags = [];
 		taskIds = null;
 		chatTasks = [];
-		serverContextUsage = null;
+		contextLiveStates = {};
+		contextReadySummaries = {};
 		history = {
 			messages: {},
 			currentId: null
@@ -1207,9 +1094,26 @@
 		}
 	};
 
-	const handleContextCompactionStatus = (status) => {
+	const handleContextCompactionStatus = (status, messageId: string) => {
 		if (status?.action !== 'context_compaction') {
 			return;
+		}
+
+		applyContextCompactionEvent(contextLiveStates, contextReadySummaries, status, messageId);
+		contextLiveStates = contextLiveStates;
+		contextReadySummaries = contextReadySummaries;
+
+		if (isContextUsageSnapshot(status?.context_usage)) {
+			const target = (
+				history.messages as Record<string, { context_usage?: ContextUsageSnapshot }>
+			)[messageId];
+			if (target) {
+				target.context_usage = status.context_usage;
+				history = history;
+			}
+			if (status.description === undefined) {
+				return;
+			}
 		}
 
 		if (status?.done) {
@@ -1280,7 +1184,7 @@
 						message.statusHistory = [data];
 					}
 				} else if (type === 'context_compaction') {
-					handleContextCompactionStatus(data);
+					handleContextCompactionStatus(data, event.message_id);
 				} else if (type === 'chat:active') {
 					if (!data?.active) {
 						taskIds = null;
@@ -1301,6 +1205,10 @@
 					chatCompletionEventHandler(data, message, event.chat_id);
 				} else if (type === 'chat:tasks:cancel') {
 					dismissContextCompactionToast();
+					if (contextLiveStates[event.message_id] === 'compacting') {
+						delete contextLiveStates[event.message_id];
+						contextLiveStates = contextLiveStates;
+					}
 					if (event.message_id === history.currentId) {
 						taskIds = null;
 						// Set all response messages to done
@@ -2387,7 +2295,8 @@
 
 				// Load tasks from chat-level DB field
 				chatTasks = chat?.tasks ?? [];
-				serverContextUsage = chat?.context_usage ?? null;
+				contextLiveStates = {};
+				contextReadySummaries = {};
 
 				autoScroll = true;
 				await tick();
@@ -2823,6 +2732,27 @@
 			dispatchCallOverlayAudio(message);
 		}
 
+		if (isContextUsageSnapshot(data?.context_usage)) {
+			message.context_usage = data.context_usage;
+		}
+
+		const readySummary = contextReadySummaries[message.id];
+		if (
+			readySummary !== undefined &&
+			Array.isArray(output) &&
+			output.some(
+				(item) =>
+					item?.type === 'open_webui:context_compaction' && item?.compaction_summary === readySummary
+			)
+		) {
+			delete contextReadySummaries[message.id];
+			contextReadySummaries = contextReadySummaries;
+			if (contextLiveStates[message.id] === 'ready') {
+				delete contextLiveStates[message.id];
+				contextLiveStates = contextLiveStates;
+			}
+		}
+
 		if (error) {
 			await handleOpenAIError(error, message);
 		}
@@ -3003,16 +2933,16 @@
 			atSelectedModel ??
 			$models.find((item) => item.id === selectedModels.find((modelId) => modelId));
 		const toastId = toast.loading($i18n.t('Compacting context...'));
+		const compactChatId = $chatId;
 
 		try {
 			const result = await compactChatById(
 				localStorage.token,
-				$chatId,
+				compactChatId,
 				model?.id,
 				(model as (Model & { direct?: boolean }) | undefined)?.direct ? model : null,
 				$socket?.id
 			);
-			serverContextUsage = result?.context_usage ?? serverContextUsage;
 
 			if (result?.compacted) {
 				toast.success($i18n.t('Context compacted'), { id: toastId });
@@ -3026,9 +2956,23 @@
 								? $i18n.t('Context compaction is disabled')
 								: $i18n.t('Nothing to compact');
 				toast.message(skippedReason, { id: toastId });
+				// A skipped compact changes nothing; keep live state and reloads away.
+				return;
 			}
 
-			await loadChat();
+			const reloadResult = await loadChat();
+
+			// Mark the compacted carrier as ready only when the same chat
+			// reloaded with its fresh summary; failed reloads keep prior state.
+			if (reloadResult === true && $chatId === compactChatId && history?.currentId) {
+				const carrierSummary = directContextSummary(history.messages[history.currentId]);
+				if (carrierSummary) {
+					contextLiveStates[history.currentId] = 'ready';
+					contextLiveStates = contextLiveStates;
+					contextReadySummaries[history.currentId] = carrierSummary;
+					contextReadySummaries = contextReadySummaries;
+				}
+			}
 		} catch (error) {
 			const message = error?.detail ?? error?.message ?? $i18n.t('Context compaction failed');
 			toast.error(message, { id: toastId });
@@ -4516,6 +4460,7 @@
 										dropzoneId={messageInputDropzoneId}
 										chatId={$chatId}
 										{contextUsage}
+										{contextLiveState}
 										{contextCompactionEnabled}
 										{embedded}
 										compactHandler={handleManualCompact}
@@ -4606,13 +4551,14 @@
 										bind:showCommands
 										bind:dragged
 										dropzoneId={messageInputDropzoneId}
-										chatId={$chatId}
-										{contextUsage}
-										{contextCompactionEnabled}
-										{embedded}
-										compactHandler={handleManualCompact}
-										statusHandler={handleStatusCommand}
-										forkHandler={handleForkChat}
+									chatId={$chatId}
+									{contextUsage}
+									{contextLiveState}
+									{contextCompactionEnabled}
+									{embedded}
+									compactHandler={handleManualCompact}
+									statusHandler={handleStatusCommand}
+									forkHandler={handleForkChat}
 										{toolApprovalMode}
 										onToolApprovalModeChange={handleToolApprovalModeChange}
 										{generating}

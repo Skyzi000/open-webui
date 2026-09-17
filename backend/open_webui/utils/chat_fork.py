@@ -39,3 +39,14 @@ def build_fork_history(messages_map: dict, source_message_id: str) -> tuple[dict
         parent_id = message_id
 
     return {'messages': fork_messages, 'currentId': source_message_id}, ordered_messages
+
+
+def carry_fork_context_usage(fork_history: dict, embedded_messages: dict) -> None:
+    # The normalized map drops the display-only snapshot; restore the stored
+    # context_usage from the embedded history onto the forked message copies.
+    for message_id, fork_message in fork_history['messages'].items():
+        source_message = embedded_messages.get(message_id)
+        if isinstance(source_message, dict) and source_message is not fork_message:
+            snapshot = source_message.get('context_usage')
+            if isinstance(snapshot, dict):
+                fork_message['context_usage'] = dict(snapshot)

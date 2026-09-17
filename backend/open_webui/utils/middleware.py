@@ -88,11 +88,14 @@ from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import (
     CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
     CONTEXT_COMPACTION_USAGE_ANCHOR_KEY,
+    _emit_context_usage,
+    apply_response_usage_to_context_usage,
     compact_provider_payload,
     compact_transient_provider_payload,
     context_compaction_adoption_record,
     estimate_text_tokens,
     get_last_persistent_user_message,
+    has_valid_token_measurement,
     prepare_compaction_messages,
     replay_cached_compaction_messages,
     replay_stored_compaction_checkpoint,
@@ -2612,6 +2615,14 @@ async def _compact_final_provider_payload(
     )
 
 
+def _adopt_pending_context_usage(state: dict) -> dict | None:
+    """Promote the measured send candidate; callers persist and notify it."""
+    snapshot = state.pop('pending_context_usage', None)
+    if snapshot is not None:
+        state['context_usage'] = snapshot
+    return snapshot
+
+
 def _stateful_continuation_body(body: dict, response_id: str, call_ids: set[str]) -> dict:
     system_message = get_system_message(body.get('messages', []))
     tool_messages = [
@@ -3700,6 +3711,19 @@ async def process_chat_payload(
         _commit_walk_held(canonical, apply_snapshot['held'], compaction_state)
     compaction_state['canonical_body'] = canonical
     compaction_state['last_send_body'] = send
+    promoted_snapshot = _adopt_pending_context_usage(compaction_state)
+    if promoted_snapshot is not None:
+        # Persist the confirmed snapshot before the provider call so it
+        # survives reloads and stream cleanup; then notify the value.
+        # The dedicated update avoids the upsert's chat_message dual-write,
+        # which would re-add the message's saved usage to running totals.
+        if is_saved_chat_id(chat_id) and metadata.get('message_id'):
+            await Chats.update_message_context_usage(
+                chat_id,
+                metadata['message_id'],
+                promoted_snapshot,
+            )
+        await _emit_context_usage(event_emitter, promoted_snapshot)
 
     return send, metadata, events, compaction_state
 
@@ -4001,7 +4025,14 @@ async def drain_approved_tool_calls(request, form_data, user, model, metadata) -
     return False, []
 
 
-async def pause_for_tool_approval(chat_id: str, message_id: str, output: list[dict], form_data: dict, metadata: dict):
+async def pause_for_tool_approval(
+    chat_id: str,
+    message_id: str,
+    output: list[dict],
+    form_data: dict,
+    metadata: dict,
+    context_usage: dict | None = None,
+):
     result_call_ids = {
         item.get('call_id') for item in output if item.get('type') == 'function_call_output' and item.get('call_id')
     }
@@ -4028,6 +4059,7 @@ async def pause_for_tool_approval(chat_id: str, message_id: str, output: list[di
         {
             'done': False,
             'output': output,
+            **({'context_usage': context_usage} if context_usage else {}),
             'meta': {
                 **(metadata.get('tool_approval') or {}),
                 'session_id': metadata.get('session_id'),
@@ -4739,6 +4771,22 @@ async def non_streaming_chat_response_handler(response, ctx):
                     if adoption_record is not None:
                         response_output = [adoption_record, *response_output]
 
+                    raw_usage = response_data.get('usage') or {}
+                    usage = normalize_usage(raw_usage)
+                    single_usage = None
+                    # Same adoption rule as streaming: an explicit raw measurement,
+                    # then helper-validated totals; anything else keeps prior values
+                    # and must not feed zero-filled totals to the prefetch gate.
+                    if usage and has_valid_token_measurement(raw_usage):
+                        if (
+                            apply_response_usage_to_context_usage(
+                                ctx.get('compaction_state') or {}, usage
+                            )
+                            is not None
+                        ):
+                            single_usage = usage
+                    context_usage = (ctx.get('compaction_state') or {}).get('context_usage')
+
                     await event_emitter(
                         {
                             'type': 'chat:completion',
@@ -4746,13 +4794,13 @@ async def non_streaming_chat_response_handler(response, ctx):
                                 'done': True,
                                 'output': response_output,
                                 'title': title,
+                                **({'usage': usage} if usage else {}),
+                                **({'context_usage': context_usage} if context_usage else {}),
                             },
                         }
                     )
 
                     # Save message in the database
-                    usage = normalize_usage(response_data.get('usage', {}) or {})
-
                     if save_to_chat:
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
@@ -4762,6 +4810,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                                 'role': 'assistant',
                                 'output': response_output,
                                 **({'usage': usage} if usage else {}),
+                                **({'context_usage': context_usage} if context_usage else {}),
                             },
                         )
 
@@ -4773,7 +4822,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                         **({'usage': usage} if usage else {}),
                     }
                     ctx['completed_compaction'] = {
-                        'usage': usage,
+                        'usage': single_usage,
                     }
                     await outlet_filter_handler(ctx)
                     await background_tasks_handler(ctx)
@@ -5336,12 +5385,43 @@ async def streaming_chat_response_handler(response, ctx):
                             },
                         )
 
+                joined_content = ''
+                joined_part_count = 0
+                unsaved_context_usage = False
+
+                async def save_current_response_stream(stream_output: list | None = None):
+                    nonlocal joined_content
+                    nonlocal joined_part_count
+                    nonlocal unsaved_context_usage
+
+                    if not chat_id or not metadata.get('message_id'):
+                        return
+
+                    # content_parts is append-only, so its length tells us when the join is stale
+                    if joined_part_count != len(content_parts):
+                        joined_content = ''.join(content_parts)
+                        joined_part_count = len(content_parts)
+
+                    current_stream_output = stream_output if stream_output is not None else full_output()
+                    snapshot = (ctx.get('compaction_state') or {}).get('context_usage')
+                    await save_response_stream(
+                        request.app.state.redis,
+                        response_stream_task_id,
+                        chat_id,
+                        metadata.get('message_id'),
+                        joined_content or get_output_text(current_stream_output),
+                        current_stream_output,
+                        context_usage=snapshot if isinstance(snapshot, dict) else None,
+                    )
+                    unsaved_context_usage = False
+
                 async def stream_body_handler(response, form_data):
                     nonlocal usage
                     nonlocal response_usage
                     nonlocal output
                     nonlocal prior_output
                     nonlocal last_response_id
+                    nonlocal unsaved_context_usage
 
                     response_tool_calls = []
 
@@ -5353,31 +5433,6 @@ async def streaming_chat_response_handler(response, ctx):
                     last_delta_data = None
                     last_delta_type = None
                     last_delta_key = None
-
-                    joined_content = ''
-                    joined_part_count = 0
-
-                    async def save_current_response_stream(stream_output: list | None = None):
-                        nonlocal joined_content
-                        nonlocal joined_part_count
-
-                        if not chat_id or not metadata.get('message_id'):
-                            return
-
-                        # content_parts is append-only, so its length tells us when the join is stale
-                        if joined_part_count != len(content_parts):
-                            joined_content = ''.join(content_parts)
-                            joined_part_count = len(content_parts)
-
-                        current_stream_output = stream_output if stream_output is not None else full_output()
-                        await save_response_stream(
-                            request.app.state.redis,
-                            response_stream_task_id,
-                            chat_id,
-                            metadata.get('message_id'),
-                            joined_content or get_output_text(current_stream_output),
-                            current_stream_output,
-                        )
 
                     def get_response_delta_key(delta_data: dict):
                         event_type = delta_data.get('type', '')
@@ -5465,6 +5520,10 @@ async def streaming_chat_response_handler(response, ctx):
                         await save_current_response_stream(stream_output)
 
                     filter_extra_params = {'__body__': form_data, **extra_params} if filter_functions else None
+
+                    # Persist the confirmed snapshot (and any prior output) before
+                    # the first chunk so an in-progress reload sees the send state.
+                    await save_current_response_stream()
 
                     async for line in response.body_iterator:
                         line = line.decode('utf-8', 'replace') if isinstance(line, bytes) else line
@@ -5593,7 +5652,21 @@ async def streaming_chat_response_handler(response, ctx):
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
                                             usage = merge_usage(usage, response_metadata['usage'])
-                                            response_usage = merge_usage(response_usage, response_metadata['usage'])
+                                            raw_single_usage = response_metadata['usage']
+                                            single_usage = normalize_usage(raw_single_usage)
+                                            # Adopt the latest single-response usage only when
+                                            # the shared helper validates its total; otherwise
+                                            # the raw check alone must not replace values.
+                                            if single_usage and has_valid_token_measurement(raw_single_usage):
+                                                updated_context_usage = apply_response_usage_to_context_usage(
+                                                    ctx['compaction_state'], single_usage
+                                                )
+                                                if updated_context_usage is not None:
+                                                    response_usage = single_usage
+                                                    await _emit_context_usage(
+                                                        event_emitter, updated_context_usage
+                                                    )
+                                                    unsaved_context_usage = True
                                             response_metadata['usage'] = usage
 
                                         if response_metadata.get('error'):
@@ -5622,7 +5695,20 @@ async def streaming_chat_response_handler(response, ctx):
                                     raw_usage.update(data.get('timings', {}))  # llama.cpp
                                     if raw_usage:
                                         usage = merge_usage(usage, raw_usage)
-                                        response_usage = merge_usage(response_usage, raw_usage)
+                                        single_usage = normalize_usage(raw_usage)
+                                        # Adopt the latest single-response usage only when the
+                                        # shared helper validates its total; otherwise the raw
+                                        # check alone must not replace the previous values.
+                                        if single_usage and has_valid_token_measurement(raw_usage):
+                                            updated_context_usage = apply_response_usage_to_context_usage(
+                                                ctx['compaction_state'], single_usage
+                                            )
+                                            if updated_context_usage is not None:
+                                                response_usage = single_usage
+                                                await _emit_context_usage(
+                                                    event_emitter, updated_context_usage
+                                                )
+                                                unsaved_context_usage = True
                                         await event_emitter(
                                             {
                                                 'type': 'chat:completion',
@@ -5655,6 +5741,10 @@ async def streaming_chat_response_handler(response, ctx):
                                                     },
                                                 }
                                             )
+                                        if unsaved_context_usage:
+                                            # A usage-only chunk carries no delta; push the
+                                            # updated snapshot to the stream store now.
+                                            await save_current_response_stream()
                                         continue
 
                                     delta = choices[0].get('delta', {})
@@ -6122,7 +6212,11 @@ async def streaming_chat_response_handler(response, ctx):
                             else:
                                 log.debug('Error: %s', e)
                                 continue
+                    # A trailing usage chunk whose snapshot no flush carried (e.g. an
+                    # empty delta) still has to land before tool execution starts.
                     await flush_pending_delta_data()
+                    if unsaved_context_usage:
+                        await save_current_response_stream()
 
                     if output:
                         # Clean up the last message item
@@ -6265,6 +6359,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 full_output(),
                                 continuation_body,
                                 metadata,
+                                ctx['compaction_state'].get('context_usage'),
                             )
                         await event_emitter({'type': 'chat:completion', 'data': {'output': full_output()}})
                         return
@@ -6311,6 +6406,7 @@ async def streaming_chat_response_handler(response, ctx):
                                 full_output(),
                                 continuation_body,
                                 metadata,
+                                ctx['compaction_state'].get('context_usage'),
                             )
                             await event_emitter(
                                 {
@@ -6668,6 +6764,12 @@ async def streaming_chat_response_handler(response, ctx):
                         send_body = await apply_externalized_refs(send_body, ctx['compaction_state'])
                         _commit_walk_held(standalone_body, prev_held, ctx['compaction_state'])
                         ctx['compaction_state']['last_send_body'] = send_body
+                        promoted_snapshot = _adopt_pending_context_usage(ctx['compaction_state'])
+                        if promoted_snapshot is not None:
+                            # Persist the confirmed snapshot with the current body
+                            # before waiting on the provider, then notify it.
+                            await save_current_response_stream()
+                            await _emit_context_usage(event_emitter, promoted_snapshot)
                         res, _ = await forward_continuation(send_body)
 
                         if isinstance(res, StreamingResponse):
@@ -6892,6 +6994,10 @@ async def streaming_chat_response_handler(response, ctx):
                             send_body = await apply_externalized_refs(send_body, ctx['compaction_state'])
                             _commit_walk_held(standalone_body, prev_held, ctx['compaction_state'])
                             ctx['compaction_state']['last_send_body'] = send_body
+                            promoted_snapshot = _adopt_pending_context_usage(ctx['compaction_state'])
+                            if promoted_snapshot is not None:
+                                await save_current_response_stream()
+                                await _emit_context_usage(event_emitter, promoted_snapshot)
                             res, _ = await forward_continuation(send_body)
 
                             if isinstance(res, StreamingResponse):
@@ -6917,11 +7023,13 @@ async def streaming_chat_response_handler(response, ctx):
 
                 current_output = full_output()
                 title = await Chats.get_chat_title_by_id(metadata['chat_id']) if save_to_chat else ''
+                context_usage = (ctx.get('compaction_state') or {}).get('context_usage')
                 data = {
                     'done': True,
                     'output': current_output,
                     'title': title,
                     **({'usage': usage} if usage else {}),
+                    **({'context_usage': context_usage} if context_usage else {}),
                 }
 
                 if save_to_chat:
@@ -6934,6 +7042,7 @@ async def streaming_chat_response_handler(response, ctx):
                             'done': True,
                             'output': current_output,
                             **({'usage': usage} if usage else {}),
+                            **({'context_usage': context_usage} if context_usage else {}),
                         },
                     )
 
@@ -6975,12 +7084,14 @@ async def streaming_chat_response_handler(response, ctx):
                 async def save_cancelled_state():
                     await event_emitter({'type': 'chat:tasks:cancel'})
                     if save_to_chat:
+                        cancelled_usage = (ctx.get('compaction_state') or {}).get('context_usage')
                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                             metadata['chat_id'],
                             metadata['message_id'],
                             {
                                 'done': True,
                                 'output': full_output(),
+                                **({'context_usage': cancelled_usage} if cancelled_usage else {}),
                             },
                         )
                     await clear_response_stream(request.app.state.redis, response_stream_task_id)

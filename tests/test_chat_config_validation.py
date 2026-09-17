@@ -1,5 +1,4 @@
 import asyncio
-import copy
 import importlib
 import os
 from pathlib import Path
@@ -126,36 +125,6 @@ def test_chat_config_reports_invalid_regex_line():
     assert 'Invalid transient message regex on line 3' in str(response.json())
 
 
-def test_context_usage_ignores_invalid_persisted_regex(monkeypatch, caplog):
-    compaction = importlib.import_module('open_webui.utils.context_compaction')
-
-    async def get_many(*_keys):
-        return {
-            'chat.context_compaction.enable': True,
-            'chat.context_compaction.transient_message_patterns': '(',
-        }
-
-    async def get_messages_map(_chat_id):
-        return {
-            'm1': {
-                'id': 'm1',
-                'parentId': None,
-                'role': 'user',
-                'content': 'hello',
-            }
-        }
-
-    monkeypatch.setattr(compaction.Config, 'get_many', get_many)
-    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages_map)
-    chat = SimpleNamespace(id='chat-1', current_message_id='m1', chat={})
-
-    with caplog.at_level('ERROR', logger=compaction.__name__):
-        result = asyncio.run(compaction.get_chat_context_usage(chat))
-
-    assert result is None
-    assert 'Context compaction configuration is invalid' in caplog.text
-
-
 def test_direct_manual_compact_preserves_websocket_metadata(monkeypatch):
     chat = SimpleNamespace(
         id='chat-1',
@@ -177,14 +146,10 @@ def test_direct_manual_compact_preserves_websocket_metadata(monkeypatch):
         captured.update(request.state.metadata)
         return {'ok': True, 'compacted': False}
 
-    async def context_usage(*_args, **_kwargs):
-        return None
-
     monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_and_user_id', get_chat)
     monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages)
     monkeypatch.setattr(chats_router, 'has_active_tasks', no_active_tasks)
     monkeypatch.setattr(chats_router, 'compact_chat_branch', compact)
-    monkeypatch.setattr(chats_router, 'get_chat_context_usage', context_usage)
 
     request = SimpleNamespace(
         state=SimpleNamespace(),
@@ -221,80 +186,6 @@ def test_get_chat_config_normalizes_externalized_refs_threshold(monkeypatch):
     assert config_with(1)['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] == 1000
     assert config_with('5000')['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] == 5000
     assert config_with('not-a-number')['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] == 10000
-
-
-def test_compact_context_usage_reads_post_compaction_normalized_map(monkeypatch):
-    compaction = importlib.import_module('open_webui.utils.context_compaction')
-
-    pre_map = {
-        'u1': {
-            'id': 'u1',
-            'parentId': None,
-            'role': 'user',
-            'content': 'large history ' * 5000,
-        },
-        'a1': {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'tip', 'model': 'model'},
-    }
-    post_map = copy.deepcopy(pre_map)
-    post_map['a1']['contextSummary'] = 'checkpoint summary'
-    fetch_log = []
-
-    async def get_messages(_chat_id):
-        fetch_log.append('fetch')
-        return pre_map if len(fetch_log) == 1 else post_map
-
-    async def compact_branch(*_args, **_kwargs):
-        fetch_log.append('compact')
-        return {'ok': True, 'compacted': True, 'dropped_messages': 1}
-
-    async def load_config():
-        return {'enable': True, 'token_threshold': 80000, 'token_cap': 80000}
-
-    chat = SimpleNamespace(
-        id='chat-1',
-        current_message_id='a1',
-        chat={'history': {'currentId': 'a1', 'messages': pre_map}},
-    )
-
-    async def get_chat(_chat_id, _user_id, db=None):
-        return chat
-
-    async def no_active_tasks(*_args, **_kwargs):
-        return False
-
-    async def no_event(*_args, **_kwargs):
-        return None
-
-    monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_and_user_id', get_chat)
-    monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages)
-    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
-    monkeypatch.setattr(chats_router, 'has_active_tasks', no_active_tasks)
-    monkeypatch.setattr(chats_router, 'compact_chat_branch', compact_branch)
-    monkeypatch.setattr(chats_router, 'publish_event', no_event)
-    monkeypatch.setattr(compaction, '_load_config', load_config)
-    monkeypatch.setattr(chats_router, 'BYPASS_MODEL_ACCESS_CONTROL', True)
-
-    request = SimpleNamespace(
-        state=SimpleNamespace(),
-        app=SimpleNamespace(
-            state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)
-        ),
-    )
-    user = SimpleNamespace(id='user-1', role='user')
-
-    result = asyncio.run(chats_router.compact_chat_by_id(request, 'chat-1', None, user, None))
-
-    assert fetch_log == ['fetch', 'compact', 'fetch']
-    expected_messages, expected_summary = compaction._apply_latest_summary_checkpoint(
-        compaction.get_message_list(post_map, 'a1')
-    )
-    expected_tokens = compaction._candidate_input_tokens(expected_messages, summary=expected_summary)
-    stale_messages, _ = compaction._apply_latest_summary_checkpoint(
-        compaction.get_message_list(pre_map, 'a1')
-    )
-    stale_tokens = compaction._candidate_input_tokens(stale_messages, summary=None)
-    assert expected_tokens < stale_tokens
-    assert result['context_usage']['tokens'] == expected_tokens
 
 
 def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
@@ -348,7 +239,6 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
             'contextSummary': 'normalized summary',
         },
     }
-    captured_usage_maps = []
 
     async def get_chat(_chat_id, _user, db=None):
         return chat
@@ -359,14 +249,9 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
     async def get_streams(*_args):
         return {}
 
-    async def context_usage(_chat, model_id=None, *, messages_map=None):
-        captured_usage_maps.append(messages_map)
-        return None
-
     monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_for_user', get_chat)
     monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages_map)
     monkeypatch.setattr(chats_router, 'get_response_streams_by_chat_id', get_streams)
-    monkeypatch.setattr(chats_router, 'get_chat_context_usage', context_usage)
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None)))
     data = asyncio.run(chats_router.get_chat_by_id('chat-1', request, SimpleNamespace(id='user-1'), None))
@@ -380,4 +265,3 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
     assert message['output'][0] == {'type': 'reasoning', 'content': 'think'}
     assert 'contextSummary' not in data['chat']['history']['messages']['u1']
     assert 'contextSummary' not in embedded_a1
-    assert captured_usage_maps == [normalized_map]

@@ -293,7 +293,6 @@ class ChatResponse(BaseModel):
     tasks: list | None = None
     summary: str | None = None
     current_message_id: str | None = None
-    context_usage: dict | None = None
 
     @field_validator('variables', mode='before')
     @classmethod
@@ -1137,6 +1136,37 @@ class ChatTable:
 
         message = chat.chat.get('history', {}).get('messages', {}).get(message_id, {})
         return message.get(metadata_key)
+
+    async def update_message_context_usage(
+        self,
+        chat_id: str,
+        message_id: str,
+        context_usage: dict,
+        db: AsyncSession | None = None,
+    ) -> bool:
+        """Update only a message's context_usage in the embedded history.
+
+        Deliberately skips the chat_message dual-write: replaying the merged
+        message there would re-add its saved usage to the running totals.
+        """
+        async with get_async_db_context(db) as session:
+            chat_item = await session.get(
+                Chat,
+                chat_id,
+                populate_existing=True,
+                with_for_update=session.bind.dialect.name == 'postgresql',
+            )
+            if chat_item is None:
+                return False
+
+            message = ((chat_item.chat or {}).get('history', {}).get('messages', {}) or {}).get(message_id)
+            if not isinstance(message, dict):
+                return False
+
+            message['context_usage'] = dict(context_usage)
+            flag_modified(chat_item, 'chat')
+            await session.commit()
+            return True
 
     async def upsert_message_to_chat_by_id_and_message_id(
         self, id: str, message_id: str, message: dict, *, touch: bool = True

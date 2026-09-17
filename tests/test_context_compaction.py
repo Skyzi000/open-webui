@@ -52,63 +52,321 @@ def test_strict_usage_uses_only_complete_input_measurements():
         assert compaction._strict_usage_input_tokens(usage) is None
 
 
-def test_candidate_input_never_treats_reported_output_as_input():
+def test_usage_total_tokens_shares_prefetch_trigger_accounting():
+    assert compaction._usage_total_tokens(None) is None
+    assert compaction._usage_total_tokens('x') is None
+    assert compaction._usage_total_tokens({'total_tokens': True}) is None
+    assert compaction._usage_total_tokens({'total_tokens': 'big'}) is None
+    assert (
+        compaction._usage_total_tokens(
+            {'prompt_tokens': 100, 'completion_tokens': 50, 'total_tokens': 150}
+        )
+        == 150
+    )
+    assert (
+        compaction._usage_total_tokens(
+            {
+                'input_tokens': 60,
+                'cache_creation_input_tokens': 10,
+                'cache_read_input_tokens': 5,
+                'output_tokens': 10,
+                'total_tokens': 70,
+            }
+        )
+        == 85
+    )
+    assert (
+        compaction._usage_total_tokens(
+            {
+                'input_tokens': 60,
+                'cache_creation_input_tokens': 'bad',
+                'cache_read_input_tokens': 5,
+                'output_tokens': 10,
+                'total_tokens': 70,
+            }
+        )
+        == 70
+    )
+
+
+def test_compact_functions_record_pending_candidate_only(monkeypatch):
+    def estimate(body, **_kwargs):
+        return 60
+
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    provider_state = {'config': _compaction_config(soft_trigger_ratio=0.5)}
+    transient_state = {'config': _compaction_config(soft_trigger_ratio=0.5)}
+
+    result = asyncio.run(
+        compaction.compact_provider_payload(
+            None,
+            None,
+            {'messages': [{'role': 'user', 'content': 'hello'}]},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            provider_state,
+        )
+    )
+    transient_result = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': [{'role': 'user', 'content': 'hello'}]},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            transient_state,
+        )
+    )
+
+    assert result['messages'] == [{'role': 'user', 'content': 'hello'}]
+    assert transient_result['messages'] == [{'role': 'user', 'content': 'hello'}]
+    pending = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    assert provider_state['pending_context_usage'] == pending
+    assert transient_state['pending_context_usage'] == pending
+    assert 'context_usage' not in provider_state
+    assert 'context_usage' not in transient_state
+
+
+def test_compact_provider_updates_pending_to_selected_candidate_after(monkeypatch):
+    history = [
+        {'id': 'u1', 'role': 'user', 'content': 'old'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'answer'},
+        {'id': 'u2', 'role': 'user', 'content': 'new', compaction._BOUNDARY_KEY: True},
+    ]
+
+    async def generate_checkpoint(*_args, **_kwargs):
+        return 'summary', {'historical_user_messages': []}, (history, 2), 'u2'
+
+    async def save_checkpoint(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(compaction, '_generate_checkpoint', generate_checkpoint)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', save_checkpoint)
+    confirmed = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    state = {
+        'active_offset': 0,
+        'checkpoint_messages': history,
+        'checkpoint_history': (history, 2),
+        'config': _compaction_config(soft_trigger_ratio=0.5),
+        'context_usage': dict(confirmed),
+    }
+
+    compacted = asyncio.run(
+        compaction.compact_provider_payload(
+            None,
+            None,
+            {'messages': history},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert compacted['messages'][0]['content'].startswith('<auto_compaction_context>')
+    assert state['pending_context_usage'] == {
+        'tokens': 20,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    assert state['context_usage'] == confirmed
+
+
+def test_transient_compact_updates_pending_to_selected_candidate_after(monkeypatch):
+    async def generate_summary(*_args, **_kwargs):
+        return 'BOUNDARY'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+    confirmed = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    state = {
+        'config': _compaction_config(soft_trigger_ratio=0.5),
+        'context_usage': dict(confirmed),
+    }
     messages = [
-        {'role': 'user', 'content': 'old prompt'},
-        {
-            'role': 'assistant',
-            'content': 'visible answer',
-            'usage': {'input_tokens': 200, 'output_tokens': 1},
-        },
-        {'role': 'user', 'content': 'next prompt'},
-    ]
-    baseline = compaction._candidate_input_tokens(messages)
-
-    huge_output = copy.deepcopy(messages)
-    huge_output[1]['usage']['output_tokens'] = 1_000_000
-    assert compaction._candidate_input_tokens(huge_output) == baseline
-    assert compaction._candidate_input_tokens(huge_output) <= 1_000
-
-    huge_input = copy.deepcopy(messages)
-    huge_input[1]['usage']['input_tokens'] = 10_000
-    assert compaction._candidate_input_tokens(huge_input) > baseline
-    assert compaction._candidate_input_tokens(huge_input) > 1_000
-
-
-def test_merged_anthropic_usage_falls_back_without_discarding_core_anchors(monkeypatch):
-    estimates = []
-
-    def estimate(body):
-        estimates.append(body['messages'])
-        return 51_300 if len(body['messages']) == 3 else 50
-
-    monkeypatch.setattr(compaction, 'estimate_body_tokens', estimate)
-    merged = [
-        {'role': 'user', 'content': 'old'},
-        {
-            'role': 'assistant',
-            'content': 'answer',
-            'usage': {
-                'prompt_tokens': 300,
-                'cache_creation_input_tokens': 50_000,
-                'cache_read_input_tokens': 1_000,
-            },
-        },
-        {'role': 'user', 'content': 'next'},
+        {'role': 'user', 'content': 'old question'},
+        {'role': 'assistant', 'content': 'old answer'},
+        {'role': 'user', 'content': 'new question'},
     ]
 
-    assert compaction._candidate_input_tokens(merged) == 51_300
-    assert estimates == [merged]
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
 
-    for key in ('prompt_tokens', 'prompt_eval_count'):
-        estimates.clear()
-        messages = [
-            {'role': 'user', 'content': 'old'},
-            {'role': 'assistant', 'content': 'answer', 'usage': {key: 900}},
-            {'role': 'user', 'content': 'next'},
-        ]
-        assert compaction._candidate_input_tokens(messages) == 947
-        assert estimates == [messages[1:]]
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
+    assert state['pending_context_usage'] == {
+        'tokens': 20,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    assert state['context_usage'] == confirmed
+
+
+def test_compact_functions_emit_no_numeric_notifications(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+    events = []
+
+    async def emitter(event):
+        events.append(event['data'])
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    def estimate(body, **_kwargs):
+        return 40
+
+    monkeypatch.setattr(socket_main, 'get_event_emitter', get_event_emitter)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    state = {'config': _compaction_config()}
+    messages = [{'role': 'user', 'content': 'hello'}]
+
+    asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'chat', 'message_id': 'assistant'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert events == []
+    assert state['pending_context_usage']['tokens'] == 40
+
+
+def test_transient_blocking_compaction_events_carry_no_snapshot(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+    events = []
+
+    async def emitter(event):
+        events.append(event['data'])
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'BOUNDARY'
+
+    monkeypatch.setattr(socket_main, 'get_event_emitter', get_event_emitter)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', _estimate_compacted_when_summarized)
+    confirmed = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+    state = {'config': _compaction_config(), 'context_usage': dict(confirmed)}
+    messages = [
+        {'role': 'user', 'content': 'old question'},
+        {'role': 'assistant', 'content': 'old answer'},
+        {'role': 'user', 'content': 'new question'},
+    ]
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'chat', 'message_id': 'assistant'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
+    assert [event['description'] for event in events] == ['Compacting context', 'Context compacted']
+    assert all('context_usage' not in event for event in events)
+    assert state['pending_context_usage'] == {
+        'tokens': 20,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'estimated',
+    }
+    assert state['context_usage'] == confirmed
+
+
+def test_provider_replay_never_carries_context_usage():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    assert 'context_usage' not in middleware.MESSAGE_REPLAY_KEYS
+    assert 'pending_context_usage' not in middleware.MESSAGE_REPLAY_KEYS
+
+
+def test_response_usage_replaces_tokens_and_keeps_thresholds():
+    state = {
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': 50,
+            'source': 'estimated',
+        }
+    }
+    updated = compaction.apply_response_usage_to_context_usage(
+        state, {'prompt_tokens': 70, 'completion_tokens': 10, 'total_tokens': 80}
+    )
+    assert updated == {
+        'tokens': 80,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    assert state['context_usage'] == updated
+    assert state['context_usage'] is updated
+
+    assert compaction.apply_response_usage_to_context_usage(state, None) is None
+    assert compaction.apply_response_usage_to_context_usage(state, {}) is None
+    assert compaction.apply_response_usage_to_context_usage(state, {'total_tokens': 'n/a'}) is None
+    assert state['context_usage']['tokens'] == 80
+
+    empty_state: dict = {}
+    created = compaction.apply_response_usage_to_context_usage(
+        empty_state,
+        {
+            'input_tokens': 60,
+            'cache_creation_input_tokens': 10,
+            'cache_read_input_tokens': 5,
+            'output_tokens': 10,
+            'total_tokens': 70,
+        },
+    )
+    assert created == {
+        'tokens': 85,
+        'threshold': None,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+    assert empty_state['context_usage'] == created
 
 
 def test_provider_estimate_uses_exact_input_anchor_plus_new_suffix():
@@ -128,35 +386,6 @@ def test_provider_estimate_uses_exact_input_anchor_plus_new_suffix():
     )
 
     assert compaction.estimate_provider_tokens(body) == 1_000 + suffix - 3
-
-
-def test_context_usage_degrades_on_invalid_runtime_regex(monkeypatch, caplog):
-    messages = {
-        'u1': {
-            'id': 'u1',
-            'parentId': None,
-            'role': 'user',
-            'content': 'hello',
-        }
-    }
-    chat = SimpleNamespace(
-        id='chat',
-        current_message_id='u1',
-        chat={'history': {'currentId': 'u1', 'messages': messages}},
-    )
-
-    async def get_messages(_chat_id):
-        return messages
-
-    async def load_config():
-        raise re.error('invalid pattern')
-
-    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
-    monkeypatch.setattr(compaction, '_load_config', load_config)
-
-    with caplog.at_level(logging.ERROR):
-        assert asyncio.run(compaction.get_chat_context_usage(chat)) is None
-    assert 'context usage is unavailable' in caplog.text
 
 
 def test_body_estimate_includes_extras_and_bounds_large_payload_encoding(monkeypatch):
@@ -5556,6 +5785,565 @@ def test_tool_loop_records_each_adopted_summary_position(monkeypatch):
     assert marker_emits
 
 
+def test_completion_save_carries_snapshot_without_provider_leak(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    snapshot = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    state = {
+        'config': {'enable': False},
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': dict(snapshot),
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    final_saves = [update for update in current['saved'] if update.get('done') is True and 'output' in update]
+    assert final_saves
+    for update in final_saves:
+        assert update['context_usage'] == snapshot
+        assert 'pending_context_usage' not in update
+
+    done_events = [
+        event['data']
+        for event in current['emitted']
+        if event.get('type') == 'chat:completion' and event.get('data', {}).get('done')
+    ]
+    assert done_events and done_events[-1]['context_usage'] == snapshot
+
+    assert current['sent'], 'provider bodies must be captured for the leak check'
+    for sent in current['sent']:
+        assert 'context_usage' not in sent
+        assert 'pending_context_usage' not in sent
+        for message in sent.get('messages', []):
+            assert 'context_usage' not in message
+
+
+def test_streamed_usage_replaces_snapshot_tokens_per_response(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+
+    def usage_response(text, usage):
+        async def chunks():
+            payload = {
+                'choices': [{'delta': {'content': text}, 'finish_reason': 'stop'}],
+                'usage': usage,
+            }
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    current['replies'] = [
+        usage_response(
+            'leg one',
+            {
+                'prompt_tokens': 70,
+                'completion_tokens': 10,
+                'total_tokens': 80,
+                'cache_creation_input_tokens': 5,
+                'cache_read_input_tokens': 5,
+            },
+        )
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0.5,
+            'transient_patterns': (),
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': 50,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['replies'][0], ctx))
+
+    # 70 + 5 + 5 + 10 = 90 cache-inclusive, above the naive total of 80.
+    assert state['context_usage'] == {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    numeric_events = [
+        event['data']['context_usage']
+        for event in current['emitted']
+        if event.get('type') == 'context_compaction' and 'context_usage' in event.get('data', {})
+    ]
+    assert numeric_events == [
+        {
+            'tokens': 90,
+            'threshold': 100,
+            'soft_threshold': 50,
+            'source': 'usage',
+        }
+    ]
+
+
+def _numeric_snapshots(emitted):
+    return [
+        event['data']['context_usage']
+        for event in emitted
+        if event.get('type') == 'context_compaction' and 'context_usage' in event.get('data', {})
+    ]
+
+
+def test_tool_loop_send_commit_adopts_pending_and_notifies(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=['S1'])
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': _compaction_config(),
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 90,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'usage',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    assert len(current['sent']) == 1
+    assert 'pending_context_usage' not in state
+    # Estimate call 1 measures 120 (blocking), the adopted candidate lands at 20.
+    assert state['context_usage'] == {
+        'tokens': 20,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'estimated',
+    }
+    assert _numeric_snapshots(current['emitted']) == [
+        {
+            'tokens': 20,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        }
+    ]
+    for sent in current['sent']:
+        assert 'context_usage' not in sent
+        assert 'pending_context_usage' not in sent
+        for message in sent.get('messages', []):
+            assert 'context_usage' not in message
+
+
+def test_tool_execution_observes_usage_receipt_before_next_send(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': _compaction_config(),
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+    observed = {}
+
+    async def inspect_tool():
+        observed['state'] = copy.deepcopy(ctx['compaction_state']['context_usage'])
+        observed['notifications'] = copy.deepcopy(_numeric_snapshots(current['emitted']))
+        return 'tool result'
+
+    tools['view_file']['callable'] = inspect_tool
+
+    def usage_tool_response(call_id, name, usage):
+        async def chunks():
+            payload = {
+                'choices': [
+                    {
+                        'delta': {
+                            'tool_calls': [
+                                {
+                                    'index': 0,
+                                    'id': call_id,
+                                    'type': 'function',
+                                    'function': {'name': name, 'arguments': '{}'},
+                                }
+                            ]
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': usage,
+            }
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    first = usage_tool_response(
+        'call-a',
+        'view_file',
+        {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': 90},
+    )
+    asyncio.run(middleware.streaming_chat_response_handler(first, ctx))
+
+    assert observed['state'] == {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+    assert observed['notifications'] == [
+        {
+            'tokens': 90,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'usage',
+        }
+    ]
+
+
+def test_usage_receipt_is_saved_when_cancelled_before_stream_closes(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': _compaction_config(),
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    async def exercise():
+        received = asyncio.Event()
+        release = asyncio.Event()
+
+        async def chunks():
+            payload = {
+                'choices': [{'delta': {'content': 'answer'}, 'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': 90},
+            }
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+            received.set()
+            await release.wait()
+
+        task = asyncio.create_task(
+            middleware.streaming_chat_response_handler(
+                StreamingResponse(chunks(), media_type='text/event-stream'), ctx
+            )
+        )
+        try:
+            await asyncio.wait_for(received.wait(), 2)
+            return (
+                copy.deepcopy(ctx['compaction_state']['context_usage']),
+                copy.deepcopy(_numeric_snapshots(current['emitted'])),
+            )
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            release.set()
+
+    observed, notifications = asyncio.run(exercise())
+    cancelled_saves = [update for update in current['saved'] if update.get('done') is True and 'output' in update]
+    assert cancelled_saves
+    measured = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+    assert observed == measured
+    assert measured in notifications
+    assert cancelled_saves[-1]['context_usage'] == measured
+
+
+def test_cancelled_unsent_compaction_keeps_last_response_measurement(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = []
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': _compaction_config(),
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    async def exercise():
+        pending = asyncio.Event()
+
+        async def hanging_summary(*_args, **_kwargs):
+            pending.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(compaction, '_generate_summary', hanging_summary)
+
+        def usage_tool_response(call_id, name, usage):
+            async def chunks():
+                payload = {
+                    'choices': [
+                        {
+                            'delta': {
+                                'tool_calls': [
+                                    {
+                                        'index': 0,
+                                        'id': call_id,
+                                        'type': 'function',
+                                        'function': {'name': name, 'arguments': '{}'},
+                                    }
+                                ]
+                            },
+                            'finish_reason': 'tool_calls',
+                        }
+                    ],
+                    'usage': usage,
+                }
+                yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+                yield b'data: [DONE]\n\n'
+
+            return StreamingResponse(chunks(), media_type='text/event-stream')
+
+        first = usage_tool_response(
+            'call-a',
+            'view_file',
+            {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': 90},
+        )
+        task = asyncio.create_task(middleware.streaming_chat_response_handler(first, ctx))
+        try:
+            await asyncio.wait_for(pending.wait(), 2)
+            return copy.deepcopy(ctx['compaction_state']['context_usage'])
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    measured = asyncio.run(exercise())
+    cancelled_saves = [update for update in current['saved'] if update.get('done') is True and 'output' in update]
+    assert cancelled_saves
+    assert current['sent'] == []
+    assert _numeric_snapshots(current['emitted']) == [
+        {
+            'tokens': 90,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'usage',
+        }
+    ]
+    assert cancelled_saves[-1]['context_usage'] == {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+    # The unsent 120-token candidate stays pending and never becomes visible.
+    assert ctx['compaction_state']['pending_context_usage']['tokens'] == 120
+    assert measured == {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
+
+
+def test_initial_send_commit_adopts_pending_and_notifies(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    events = []
+
+    async def emitter(event):
+        events.append(copy.deepcopy(event))
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    _seed_state_on_capture(monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()})
+    monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 40)
+
+    send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'start'}])
+    )
+
+    assert state['last_send_body'] is send
+    assert 'pending_context_usage' not in state
+    assert state['context_usage'] == {
+        'tokens': 40,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'estimated',
+    }
+    assert _numeric_snapshots(events) == [
+        {
+            'tokens': 40,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        }
+    ]
+
+
+def test_repause_publishes_no_measurement_and_keeps_stored_snapshot(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    events = []
+    saves = []
+
+    async def emitter(event):
+        events.append(copy.deepcopy(event))
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    async def save(_chat_id, _message_id, update, **_kwargs):
+        saves.append(copy.deepcopy(update))
+        return update
+
+    stored = {
+        'context_usage': {
+            'tokens': 90,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'usage',
+        },
+        'output': [
+            {
+                'type': 'function_call',
+                'call_id': 'call-1',
+                'name': 'lookup',
+                'arguments': '{}',
+                'status': 'queued',
+            }
+        ],
+    }
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, stored)
+    _seed_state_on_capture(monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()})
+    monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 40)
+
+    _send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'start'}],
+            params={'tool_approval_mode': 'ask'},
+        )
+    )
+
+    assert state.get('paused') is True
+    assert 'last_send_body' not in state
+    assert _numeric_snapshots(events) == []
+    pause_saves = [update for update in saves if update.get('done') is False]
+    assert pause_saves
+    for update in pause_saves:
+        assert 'context_usage' not in update
+        assert 'pending_context_usage' not in update
+    merged = {**stored, **pause_saves[-1]}
+    assert merged['context_usage'] == stored['context_usage']
+
+
 def test_first_send_dedupes_against_branch_and_continues_existing_output(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
@@ -5807,7 +6595,7 @@ def test_approval_pause_records_no_continuation_adoption(monkeypatch):
 
     paused_outputs = []
 
-    async def pause(_chat_id, _message_id, output, _form_data, _metadata):
+    async def pause(_chat_id, _message_id, output, _form_data, _metadata, _context_usage=None):
         paused_outputs.append(copy.deepcopy(output))
 
     monkeypatch.setattr(middleware, 'pause_for_tool_approval', pause)
@@ -5950,3 +6738,1369 @@ def test_non_stream_response_prepends_adoption_record(monkeypatch):
     saved.clear()
     asyncio.run(middleware.non_streaming_chat_response_handler(copy.deepcopy(response), ctx))
     assert _adoption_shape(saved[-1]['output']) == [('message', None, None, None)]
+
+
+def test_fork_carries_embedded_context_usage_snapshots(tmp_path, monkeypatch):
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+    chats_router = importlib.import_module('open_webui.routers.chats')
+
+    makers = {}
+
+    @asynccontextmanager
+    async def use_test_db(db=None):
+        if isinstance(db, AsyncSession):
+            yield db
+        else:
+            async with makers['session']() as session:
+                yield session
+
+    monkeypatch.setattr(chats_model, 'get_async_db_context', use_test_db)
+    monkeypatch.setattr(chat_messages, 'get_async_db_context', use_test_db)
+
+    async def permission_granted(*_args, **_kwargs):
+        return None
+
+    async def no_active_tasks(*_args, **_kwargs):
+        return False
+
+    async def no_event(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(chats_router, 'require_chat_import_permission', permission_granted)
+    monkeypatch.setattr(chats_router, 'has_active_tasks', no_active_tasks)
+    monkeypatch.setattr(chats_router, 'publish_event', no_event)
+
+    snapshot = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    source_messages = {
+        'u1': {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'start'},
+        'a1': {
+            'id': 'a1',
+            'parentId': 'u1',
+            'role': 'assistant',
+            'content': '',
+            'done': True,
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'answer'}]}],
+        },
+    }
+    source_chat_payload = {'history': {'currentId': 'a1', 'messages': copy.deepcopy(source_messages)}}
+
+    async def run():
+        engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "fork.db"}')
+        makers['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
+                await connection.run_sync(chat_messages.ChatMessage.__table__.create)
+
+            await chats_model.Chats.insert_new_chat(
+                'source-chat',
+                'user-1',
+                chats_model.ChatForm(chat=source_chat_payload),
+            )
+
+            saved = await chats_model.Chats.upsert_message_to_chat_by_id_and_message_id(
+                'source-chat',
+                'a1',
+                {
+                    'done': True,
+                    'output': source_messages['a1']['output'],
+                    'context_usage': dict(snapshot),
+                    'usage': {'prompt_tokens': 50, 'completion_tokens': 10, 'total_tokens': 60},
+                },
+            )
+            assert saved is not None
+
+            embedded = saved.chat['history']['messages']['a1']
+            assert embedded['context_usage'] == snapshot
+
+            normalized_map = await chats_model.Chats.get_messages_map_by_chat_id('source-chat')
+            assert normalized_map is not None
+            assert 'context_usage' not in normalized_map['a1']
+
+            async with makers['session']() as db:
+                request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None)))
+                fork = await chats_router.fork_chat_by_id(
+                    request,
+                    'source-chat',
+                    None,
+                    SimpleNamespace(id='user-1', role='admin'),
+                    db=db,
+                )
+            assert fork is not None
+
+            assert fork.chat['history']['messages']['a1']['context_usage'] == snapshot
+            assert 'context_usage' not in fork.chat['history']['messages']['u1']
+
+            fork_row = await chats_model.Chats.get_chat_by_id(fork.id)
+            assert fork_row is not None
+            assert fork_row.chat['history']['messages']['a1']['context_usage'] == snapshot
+            assert 'context_usage' not in fork_row.chat['history']['messages']['u1']
+
+            source_row = await chats_model.Chats.get_chat_by_id('source-chat')
+            assert source_row.chat['history']['messages']['a1']['context_usage'] == snapshot
+            assert 'context_usage' not in source_row.chat['history']['messages']['u1']
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())
+
+
+def _usage_chunk(total):
+    return {
+        'choices': [{'delta': {'content': 'PART'}, 'finish_reason': None}],
+        'usage': {'prompt_tokens': 80, 'completion_tokens': total - 80, 'total_tokens': total},
+    }
+
+
+def _usage_only_chunk(total):
+    return {
+        'choices': [],
+        'usage': {'prompt_tokens': 80, 'completion_tokens': total - 80, 'total_tokens': total},
+    }
+
+
+def _completed_chunk(total):
+    return {
+        'type': 'response.completed',
+        'response': {
+            'id': 'resp',
+            'output': [
+                {
+                    'type': 'message',
+                    'role': 'assistant',
+                    'status': 'completed',
+                    'content': [{'type': 'output_text', 'text': 'PART'}],
+                }
+            ],
+            'usage': {
+                'input_tokens': 80,
+                'output_tokens': total - 80,
+                'total_tokens': total,
+            },
+        },
+    }
+
+
+def test_same_response_usage_stays_latest_single_response(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0.5,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': {
+            'tokens': 60,
+            'threshold': 100,
+            'soft_threshold': 50,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    async def run():
+        response = StreamingResponse(
+            _chunk_iter(middleware, [_usage_chunk(85), _usage_chunk(90)]), media_type='text/event-stream'
+        )
+        await middleware.streaming_chat_response_handler(response, ctx)
+        task = compaction.start_completed_turn_compaction_prefetch(
+            ctx['request'], ctx['user'], ctx['form_data']['messages'], metadata, 'model', {}, state,
+            ctx['completed_compaction']['usage'],
+        )
+        assert task is not None, 'the single-response usage must arm the prefetch'
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return (
+            copy.deepcopy(_numeric_snapshots(current['emitted'])),
+            copy.deepcopy(state['context_usage']),
+            copy.deepcopy(ctx['completed_compaction']),
+        )
+
+    notifications, snapshot, completed = asyncio.run(run())
+
+    assert [item['tokens'] for item in notifications] == [85, 90]
+    assert snapshot['tokens'] == 90
+    assert completed['usage']['total_tokens'] == 90
+
+
+def _chunk_iter(middleware, specs, done=True):
+    async def chunks():
+        for spec in specs:
+            yield f'data: {middleware.JSONCodec.dumps(spec)}\n\n'.encode()
+        if done:
+            yield b'data: [DONE]\n\n'
+
+    return chunks()
+
+
+def test_responses_api_usage_stays_latest_single_response(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            StreamingResponse(
+                _chunk_iter(middleware, [_completed_chunk(85), _completed_chunk(90)]),
+                media_type='text/event-stream',
+            ),
+            ctx,
+        )
+    )
+
+    assert [item['tokens'] for item in _numeric_snapshots(current['emitted'])] == [85, 90]
+    assert state['context_usage']['tokens'] == 90
+
+
+def test_next_round_usage_does_not_accumulate(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    async def run():
+        first = StreamingResponse(_chunk_iter(middleware, [_usage_chunk(85)]), media_type='text/event-stream')
+        await middleware.streaming_chat_response_handler(first, ctx)
+        current['emitted'].clear()
+        second = StreamingResponse(_chunk_iter(middleware, [_usage_chunk(90)]), media_type='text/event-stream')
+        await middleware.streaming_chat_response_handler(second, ctx)
+        return copy.deepcopy(_numeric_snapshots(current['emitted'])), copy.deepcopy(state['context_usage'])
+
+    notifications, snapshot = asyncio.run(run())
+
+    assert [item['tokens'] for item in notifications] == [90]
+    assert snapshot['tokens'] == 90
+
+
+def _stream_store_harness(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    tasks = importlib.import_module('open_webui.tasks')
+    chats_router = importlib.import_module('open_webui.routers.chats')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+
+    save_calls = []
+    real_save = tasks.save_response_stream
+
+    async def counting_save(redis, task_id, chat_id, message_id, content, output, **kwargs):
+        save_calls.append(
+            {
+                'content': content,
+                'context_usage': copy.deepcopy(kwargs.get('context_usage')),
+            }
+        )
+        await real_save(redis, task_id, chat_id, message_id, content, output, **kwargs)
+
+    monkeypatch.setattr(middleware, 'save_response_stream', counting_save)
+    monkeypatch.setattr(middleware, 'clear_response_stream', tasks.clear_response_stream)
+    monkeypatch.setattr(tasks, 'response_streams', {})
+    monkeypatch.setattr(tasks, 'item_tasks', {'chat': ['stream-task']})
+
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'task_id': 'stream-task',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    confirmed = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 100,
+            'token_cap': 100,
+            'retention_percentage': 40,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+        'context_usage': dict(confirmed),
+        'pending_context_usage': {
+            'tokens': 120,
+            'threshold': 100,
+            'soft_threshold': None,
+            'source': 'estimated',
+        },
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    def blob():
+        return {
+            'chat': {
+                'history': {
+                    'currentId': 'assistant',
+                    'messages': {
+                        'assistant': {
+                            'id': 'assistant',
+                            'role': 'assistant',
+                            'content': '',
+                            'done': True,
+                            'context_usage': dict(confirmed),
+                        }
+                    },
+                },
+                'messages': [
+                    {'id': 'assistant', 'role': 'assistant', 'content': '', 'done': True},
+                ],
+            }
+        }
+
+    return {
+        'middleware': middleware,
+        'tasks': tasks,
+        'chats_router': chats_router,
+        'current': current,
+        'ctx': ctx,
+        'state': state,
+        'metadata': metadata,
+        'confirmed': confirmed,
+        'save_calls': save_calls,
+        'blob': blob,
+    }
+
+
+def _parked_stream(middleware, specs, park_before_done=True):
+    parked = asyncio.Event()
+    release = asyncio.Event()
+
+    async def chunks():
+        for spec in specs:
+            yield f'data: {middleware.JSONCodec.dumps(spec)}\n\n'.encode()
+        parked.set()
+        if park_before_done:
+            await release.wait()
+        yield b'data: [DONE]\n\n'
+
+    return StreamingResponse(chunks(), media_type='text/event-stream'), parked, release
+
+
+def test_in_progress_reload_restores_notified_snapshot(monkeypatch):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    ctx = harness['ctx']
+
+    async def run():
+        response, parked, release = _parked_stream(
+            middleware,
+            [{'choices': [{'delta': {'content': 'PART'}, 'finish_reason': None}]}, _usage_only_chunk(90)],
+        )
+        running = asyncio.create_task(middleware.streaming_chat_response_handler(response, ctx))
+        try:
+            await asyncio.wait_for(parked.wait(), 5)
+            streams = copy.deepcopy(await harness['tasks'].get_response_streams_by_chat_id(None, 'chat'))
+            restored = harness['chats_router'].overlay_response_streams(harness['blob'](), streams)
+            return streams, restored, copy.deepcopy(harness['current']['saved'])
+        finally:
+            release.set()
+            await asyncio.wait_for(running, 5)
+
+    streams, restored, saved_before_completion = asyncio.run(run())
+
+    measured = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    assert streams and streams[0]['content'] == 'PART'
+    assert streams[0]['context_usage'] == measured
+    assert saved_before_completion == []
+
+    message = restored['chat']['history']['messages']['assistant']
+    assert message['content'] == 'PART'
+    assert message['context_usage'] == measured
+    assert restored['chat']['messages'][0]['context_usage'] == measured
+
+    # The unsent candidate must never leak into the stream store.
+    for call in harness['save_calls']:
+        if call['context_usage'] is not None:
+            assert call['context_usage'] != harness['state']['pending_context_usage']
+
+
+def test_usage_only_chunk_updates_stream_store_before_wait(monkeypatch):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    ctx = harness['ctx']
+
+    async def run():
+        response, parked, release = _parked_stream(
+            middleware, [{'choices': [{'delta': {'content': 'PART'}, 'finish_reason': None}]}, _usage_only_chunk(90)]
+        )
+        running = asyncio.create_task(middleware.streaming_chat_response_handler(response, ctx))
+        try:
+            await asyncio.wait_for(parked.wait(), 5)
+            streams = copy.deepcopy(await harness['tasks'].get_response_streams_by_chat_id(None, 'chat'))
+            restored = harness['chats_router'].overlay_response_streams(harness['blob'](), streams)
+            return streams, restored, list(harness['save_calls'])
+        finally:
+            release.set()
+            await asyncio.wait_for(running, 5)
+
+    streams, restored, save_calls = asyncio.run(run())
+
+    measured = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    assert streams[0]['content'] == 'PART'
+    assert streams[0]['context_usage'] == measured
+    message = restored['chat']['history']['messages']['assistant']
+    assert message['content'] == 'PART'
+    assert message['context_usage'] == measured
+
+    usage_saves = [call for call in save_calls if call['context_usage'] == measured]
+    assert usage_saves, 'usage receipt must reach the stream store before waiting'
+    assert len(usage_saves) == 1, 'the same content must not be saved twice for one chunk'
+
+
+def test_stream_start_persists_confirmed_snapshot(monkeypatch):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    ctx = harness['ctx']
+
+    async def run():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def chunks():
+            started.set()
+            await release.wait()
+            yield b'data: [DONE]\n\n'
+
+        running = asyncio.create_task(
+            middleware.streaming_chat_response_handler(
+                StreamingResponse(chunks(), media_type='text/event-stream'), ctx
+            )
+        )
+        try:
+            await asyncio.wait_for(started.wait(), 5)
+            for _ in range(200):
+                streams = await harness['tasks'].get_response_streams_by_chat_id(None, 'chat')
+                if streams:
+                    return copy.deepcopy(streams)
+                await asyncio.sleep(0.01)
+            return []
+        finally:
+            release.set()
+            await asyncio.wait_for(running, 5)
+
+    streams = asyncio.run(run())
+
+    assert streams and streams[0]['context_usage'] == harness['confirmed']
+    assert streams[0]['content'] == ''
+    assert streams[0]['context_usage'] != harness['state']['pending_context_usage']
+
+
+def test_overlay_keeps_existing_snapshot_without_stream_value():
+    chats_router = importlib.import_module('open_webui.routers.chats')
+    existing = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+    chat_data = {
+        'chat': {
+            'history': {
+                'currentId': 'a1',
+                'messages': {
+                    'a1': {'id': 'a1', 'role': 'assistant', 'content': 'old', 'context_usage': dict(existing)},
+                    'sib': {'id': 'sib', 'role': 'assistant', 'content': 'sibling'},
+                },
+            },
+            'messages': [{'id': 'a1', 'role': 'assistant', 'content': 'old'}],
+        }
+    }
+    streams = [
+        {
+            'chat_id': 'chat',
+            'message_id': 'a1',
+            'content': 'restored',
+            'output': [],
+        }
+    ]
+
+    chats_router.overlay_response_streams(chat_data, streams)
+
+    message = chat_data['chat']['history']['messages']['a1']
+    assert message['content'] == 'restored'
+    assert message['context_usage'] == existing
+    assert 'context_usage' not in chat_data['chat']['history']['messages']['sib']
+
+    streams.append(
+        {
+            'chat_id': 'chat',
+            'message_id': 'a1',
+            'content': 'restored',
+            'output': [],
+            'context_usage': None,
+        }
+    )
+    chats_router.overlay_response_streams(chat_data, streams)
+    assert chat_data['chat']['history']['messages']['a1']['context_usage'] == existing
+
+
+def test_overlay_copies_stream_snapshot_to_both_message_paths():
+    chats_router = importlib.import_module('open_webui.routers.chats')
+    snapshot = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'usage',
+    }
+    chat_data = {
+        'chat': {
+            'history': {
+                'currentId': 'a1',
+                'messages': {'a1': {'id': 'a1', 'role': 'assistant', 'content': ''}},
+            },
+            'messages': [{'id': 'a1', 'role': 'assistant', 'content': ''}],
+        }
+    }
+    streams = [
+        {
+            'chat_id': 'chat',
+            'message_id': 'a1',
+            'content': 'PART',
+            'output': [],
+            'context_usage': dict(snapshot),
+        }
+    ]
+
+    chats_router.overlay_response_streams(chat_data, streams)
+
+    assert chat_data['chat']['history']['messages']['a1']['context_usage'] == snapshot
+    assert chat_data['chat']['messages'][0]['context_usage'] == snapshot
+
+
+class _RecordingRedis:
+    def __init__(self):
+        self.entries = {}
+        self.writes = []
+
+    async def hset(self, key, field, value):
+        self.entries[(key, field)] = value
+        self.writes.append(value)
+
+    async def hmget(self, key, fields):
+        return [self.entries.get((key, field)) for field in fields]
+
+    async def smembers(self, key):
+        return {'stream-task'}
+
+    async def hexpire(self, *args):
+        return None
+
+    async def hdel(self, key, field):
+        self.entries.pop((key, field), None)
+
+
+def _observe_redis_stream(monkeypatch, specs, batch_size=1):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    redis = _RecordingRedis()
+    harness['ctx']['request'].app.state.redis = redis
+    harness['metadata']['params']['stream_delta_chunk_size'] = batch_size
+    monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE', batch_size)
+
+    async def run():
+        response, parked, release = _parked_stream(middleware, specs)
+        running = asyncio.create_task(
+            middleware.streaming_chat_response_handler(response, harness['ctx'])
+        )
+        try:
+            await asyncio.wait_for(parked.wait(), 5)
+            streams = copy.deepcopy(await harness['tasks'].get_response_streams_by_chat_id(redis, 'chat'))
+            return {
+                'streams': streams,
+                'writes': [middleware.JSONCodec.loads(value) for value in redis.writes],
+                'events': copy.deepcopy(harness['current']['emitted']),
+                'state': copy.deepcopy(harness['state']['context_usage']),
+            }
+        finally:
+            running.cancel()
+            try:
+                await running
+            except asyncio.CancelledError:
+                pass
+            release.set()
+
+    return asyncio.run(run())
+
+
+def test_structured_updates_reach_stream_store_serialized(monkeypatch):
+    base = {
+        'type': 'function_call',
+        'id': 'fc',
+        'call_id': 'call',
+        'name': 'view_file',
+        'arguments': '',
+        'status': 'in_progress',
+    }
+    specs = [
+        {'type': 'response.output_item.added', 'output_index': 0, 'item': dict(base)},
+        {
+            'type': 'response.function_call_arguments.delta',
+            'output_index': 0,
+            'item_id': 'fc',
+            'delta': '{"x":1}',
+        },
+        {
+            'type': 'response.output_item.done',
+            'output_index': 0,
+            'item': {**base, 'arguments': '{"x":1}', 'status': 'completed'},
+        },
+    ]
+
+    result = _observe_redis_stream(monkeypatch, specs)
+
+    assert any(e.get('data', {}).get('type') == 'response.output_item.done' for e in result['events'])
+    stored = result['streams'][0]['output'][0]
+    assert stored['arguments'] == '{"x":1}'
+    assert stored['status'] == 'completed'
+
+
+def test_batched_body_usage_does_not_add_full_saves(monkeypatch):
+    specs = [_usage_chunk(total) for total in range(81, 85)]
+    no_usage_specs = [{k: v for k, v in spec.items() if k != 'usage'} for spec in specs]
+
+    with pytest.MonkeyPatch.context() as inner:
+        control = _observe_redis_stream(inner, no_usage_specs, batch_size=20)
+    with pytest.MonkeyPatch.context() as inner:
+        measured = _observe_redis_stream(inner, specs, batch_size=20)
+
+    assert len(measured['writes']) == len(control['writes'])
+
+
+@pytest.mark.parametrize(
+    'invalid_usage',
+    [
+        {'prompt_tokens': None, 'completion_tokens': None, 'total_tokens': None},
+        {'cost': 0.01},
+    ],
+)
+def test_missing_token_counters_keep_latest(monkeypatch, invalid_usage):
+    result = _observe_redis_stream(
+        monkeypatch, [_usage_chunk(90), {'choices': [], 'usage': dict(invalid_usage)}]
+    )
+
+    assert result['state']['tokens'] == 90
+    assert [item['tokens'] for item in _numeric_snapshots(result['events'])] == [90]
+
+
+def _completed_stream_observe(monkeypatch, specs, batch_size=1):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    redis = _RecordingRedis()
+    harness['ctx']['request'].app.state.redis = redis
+    harness['metadata']['params']['stream_delta_chunk_size'] = batch_size
+    monkeypatch.setattr(middleware, 'CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE', batch_size)
+
+    async def run():
+        response = StreamingResponse(_chunk_iter(middleware, specs), media_type='text/event-stream')
+        await middleware.streaming_chat_response_handler(response, harness['ctx'])
+        return {
+            'snapshot': copy.deepcopy(harness['state']['context_usage']),
+            'completed': copy.deepcopy(harness['ctx']['completed_compaction']),
+            'writes': [middleware.JSONCodec.loads(raw) for raw in redis.writes],
+            'snapshots': copy.deepcopy(_numeric_snapshots(harness['current']['emitted'])),
+        }
+
+    return asyncio.run(run())
+
+
+def test_invalid_total_preserves_single_response_usage(monkeypatch):
+    result = _completed_stream_observe(
+        monkeypatch,
+        [
+            _usage_chunk(90),
+            {'choices': [], 'usage': {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': -1}},
+        ],
+    )
+
+    assert result['snapshot']['tokens'] == 90
+    assert result['completed']['usage']['total_tokens'] == 90
+
+
+def test_finished_body_usage_has_no_redundant_save(monkeypatch):
+    specs = [_usage_chunk(81), _usage_chunk(82)]
+    plain = [{k: v for k, v in spec.items() if k != 'usage'} for spec in specs]
+
+    with pytest.MonkeyPatch.context() as inner:
+        control = _completed_stream_observe(inner, plain)
+    with pytest.MonkeyPatch.context() as inner:
+        measured = _completed_stream_observe(inner, specs)
+
+    assert len(measured['writes']) == len(control['writes'])
+
+
+@pytest.mark.parametrize(
+    ('raw', 'tokens'),
+    [
+        ({'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}, 0),
+        ({'prompt_eval_count': 80, 'eval_count': 10}, 90),
+        ({'prompt_n': 50, 'cache_n': 30, 'predicted_n': 10}, 90),
+        (
+            {
+                'input_tokens': 20,
+                'cache_creation_input_tokens': 10,
+                'cache_read_input_tokens': 50,
+                'output_tokens': 10,
+            },
+            90,
+        ),
+    ],
+)
+def test_valid_measurements_still_work(monkeypatch, raw, tokens):
+    result = _completed_stream_observe(monkeypatch, [{'choices': [], 'usage': dict(raw)}])
+
+    assert result['snapshot']['tokens'] == tokens
+
+
+def _non_stream_observe(monkeypatch, usage):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    response = {'choices': [{'message': {'content': 'OK'}}], 'usage': copy.deepcopy(usage)}
+
+    asyncio.run(middleware.non_streaming_chat_response_handler(response, harness['ctx']))
+
+    saved = harness['current']['saved'][-1]
+    notified = [
+        event['data']['context_usage']
+        for event in harness['current']['emitted']
+        if isinstance(event.get('data'), dict) and 'context_usage' in event['data']
+    ]
+    return {
+        'state': copy.deepcopy(harness['state']['context_usage']),
+        'completed': copy.deepcopy(harness['ctx'].get('completed_compaction')),
+        'saved': saved,
+        'notified': notified,
+    }
+
+
+@pytest.mark.parametrize(
+    'raw',
+    [
+        {'cost': 0.01},
+        {'prompt_tokens': None, 'completion_tokens': None, 'total_tokens': None},
+    ],
+)
+def test_non_stream_keeps_estimate_without_measurement(monkeypatch, raw):
+    result = _non_stream_observe(monkeypatch, raw)
+
+    assert result['state'] == _stream_confirmed_snapshot()
+    assert result['saved']['context_usage'] == _stream_confirmed_snapshot()
+    assert result['notified'][-1] == _stream_confirmed_snapshot()
+    assert result['completed']['usage'] is None
+
+
+def test_non_stream_invalid_total_is_not_adopted(monkeypatch):
+    result = _non_stream_observe(
+        monkeypatch, {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': -1}
+    )
+
+    assert result['state'] == _stream_confirmed_snapshot()
+    assert result['completed']['usage'] is None
+
+
+def test_non_stream_explicit_zero_is_adopted(monkeypatch):
+    result = _non_stream_observe(monkeypatch, {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0})
+
+    assert result['state']['tokens'] == 0
+    assert result['state']['source'] == 'usage'
+    assert result['completed']['usage']['total_tokens'] == 0
+
+
+def test_non_stream_cache_inclusive_usage_is_adopted(monkeypatch):
+    result = _non_stream_observe(
+        monkeypatch,
+        {
+            'input_tokens': 20,
+            'cache_creation_input_tokens': 10,
+            'cache_read_input_tokens': 50,
+            'output_tokens': 10,
+        },
+    )
+
+    assert result['state']['tokens'] == 90
+    assert result['state']['source'] == 'usage'
+    completed = result['completed']['usage']
+    assert completed is not None
+    assert completed['cache_creation_input_tokens'] == 10
+    assert completed['cache_read_input_tokens'] == 50
+    assert (
+        compaction._usage_total_tokens(completed) == 90
+    ), 'the prefetch gate must see the cache-inclusive total'
+
+
+def _sqlite_session_context(makers):
+    from contextlib import asynccontextmanager
+
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    @asynccontextmanager
+    async def use_test_db(db=None):
+        if isinstance(db, AsyncSession):
+            yield db
+        else:
+            async with makers['session']() as session:
+                yield session
+
+    return use_test_db
+
+
+def _stream_confirmed_snapshot():
+    return {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': 50,
+        'source': 'estimated',
+    }
+
+
+def _entry_wait_harness(monkeypatch, tmp_path):
+    routing = importlib.import_module('test_chat_routing')
+    main = importlib.import_module('open_webui.main')
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    tasks = importlib.import_module('open_webui.tasks')
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+
+    _, request, user, _ = routing._install_provider_sink_harness(monkeypatch, {'model': routing._EntryModelInfo({})})
+
+    makers = {}
+    monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+
+    events = []
+    upsert_calls = []
+
+    async def emit(event):
+        events.append(copy.deepcopy(event))
+
+    async def get_emitter(*_args, **_kwargs):
+        return emit
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def config_many(*keys):
+        values = {
+            'chat.context_compaction.enable': True,
+            'chat.context_compaction.token_threshold': 100,
+            'chat.context_compaction.token_cap': 100,
+            'chat.context_compaction.soft_trigger_ratio': 0,
+            'chat.externalized_refs.enable': False,
+        }
+        return {key: values.get(key) for key in keys}
+
+    real_upsert = chats_model.Chats.upsert_message_to_chat_by_id_and_message_id
+    real_snapshot_update = chats_model.Chats.update_message_context_usage
+    upsert_calls = []
+    snapshot_calls = []
+
+    async def capturing_upsert(chat_id, message_id, update, **kwargs):
+        upsert_calls.append({'update': copy.deepcopy(update)})
+        return await real_upsert(chat_id, message_id, update, **kwargs)
+
+    async def capturing_snapshot_update(chat_id, message_id, snapshot):
+        snapshot_calls.append({'message_id': message_id, 'snapshot': copy.deepcopy(snapshot)})
+        return await real_snapshot_update(chat_id, message_id, snapshot)
+
+    monkeypatch.setattr(middleware.Config, 'get_many', config_many)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 60)
+    for module in (main, middleware):
+        monkeypatch.setattr(module, 'get_event_emitter', get_emitter)
+    for name in ('update_chat_by_id', 'update_chat_variables_by_id', 'get_chat_folder_id'):
+        monkeypatch.setattr(main.Chats, name, noop)
+    monkeypatch.setattr(main.Chats, 'is_chat_owner', noop)
+    monkeypatch.setattr(main.Chats, 'upsert_message_to_chat_by_id_and_message_id', capturing_upsert)
+    monkeypatch.setattr(main.Chats, 'update_message_context_usage', capturing_snapshot_update)
+    monkeypatch.setattr(main, 'publish_event', noop)
+    monkeypatch.setattr(main, 'emit_chat_list_event', noop)
+    monkeypatch.setattr(main, 'create_task', tasks.create_task)
+    monkeypatch.setattr(main, 'cleanup_task', tasks.cleanup_task)
+    monkeypatch.setattr(tasks, 'tasks', {})
+    monkeypatch.setattr(tasks, 'item_tasks', {})
+    monkeypatch.setattr(tasks, 'response_streams', {})
+    monkeypatch.setattr(
+        importlib.import_module('open_webui.utils.subagents'), 'process_pending_internal_messages', noop
+    )
+    monkeypatch.setattr(
+        importlib.import_module('open_webui.utils.timers'), 'cancel_timers_for_chat', noop
+    )
+
+    return {
+        'routing': routing,
+        'main': main,
+        'middleware': middleware,
+        'tasks': tasks,
+        'chats_model': chats_model,
+        'request': request,
+        'user': user,
+        'events': events,
+        'upsert_calls': upsert_calls,
+        'snapshot_calls': snapshot_calls,
+        'makers': makers,
+        'tmp_path': tmp_path,
+    }
+
+
+def test_initial_wait_and_cancel_keep_confirmed_snapshot(monkeypatch, tmp_path):
+    harness = _entry_wait_harness(monkeypatch, tmp_path)
+    main = harness['main']
+    tasks = harness['tasks']
+    chats_model = harness['chats_model']
+    routing = harness['routing']
+
+    async def run():
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        engine = create_async_engine(f"sqlite+aiosqlite:///{harness['tmp_path'] / 'entry.db'}")
+        harness['makers']['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
+                await connection.run_sync(
+                    importlib.import_module('open_webui.models.chat_messages').ChatMessage.__table__.create
+                )
+
+            stored_output = [
+                {
+                    'type': 'message',
+                    'id': 'msg_1',
+                    'status': 'in_progress',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'old'}],
+                }
+            ]
+            await chats_model.Chats.insert_new_chat(
+                'entry-review-chat',
+                'user-1',
+                chats_model.ChatForm(
+                    chat={
+                        'history': {
+                            'currentId': 'assistant',
+                            'messages': {
+                                'u1': {
+                                    'id': 'u1',
+                                    'parentId': None,
+                                    'role': 'user',
+                                    'content': 'start',
+                                    'childrenIds': ['assistant'],
+                                },
+                                'assistant': {
+                                    'id': 'assistant',
+                                    'parentId': 'u1',
+                                    'role': 'assistant',
+                                    'content': 'old',
+                                    'output': stored_output,
+                                    'done': True,
+                                },
+                            },
+                        }
+                    }
+                ),
+            )
+
+            request = harness['request']
+            request.app.state.MODELS = {'model': {'id': 'model', 'owned_by': 'openai', 'info': {}}}
+
+            async def run_completion():
+                form_data = routing._base_form_data(
+                    'model',
+                    [{'model_id': 'model', 'message_id': 'assistant'}],
+                    chat_id='entry-review-chat',
+                    chat_variables={},
+                    user_message={
+                        'id': 'u1',
+                        'role': 'user',
+                        'content': 'start',
+                        'childrenIds': ['assistant'],
+                    },
+                )
+                return await main.chat_completion(request, dict(form_data), harness['user'])
+
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def provider(request=None, form_data=None, user=None):
+                entered.set()
+                await release.wait()
+                return {'choices': [{'message': {'content': 'OK'}}]}
+
+            monkeypatch.setattr(
+                importlib.import_module('open_webui.utils.chat'),
+                'generate_openai_chat_completion',
+                provider,
+            )
+
+            result = await run_completion()
+            task_id = result['task_ids'][0]
+            task = tasks.tasks[task_id]
+            try:
+                await asyncio.wait_for(entered.wait(), 5)
+
+                async def read_row():
+                    row = await chats_model.Chats.get_chat_by_id('entry-review-chat')
+                    message = row.chat['history']['messages']['assistant']
+                    return copy.deepcopy(message)
+
+                before = {
+                    'row': await read_row(),
+                    'streams': copy.deepcopy(
+                        await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')
+                    ),
+                }
+                await tasks.stop_task(None, task_id)
+                await asyncio.sleep(0)
+                after = {
+                    'row': await read_row(),
+                    'streams': copy.deepcopy(
+                        await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')
+                    ),
+                }
+                return {'before': before, 'after': after}
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                release.set()
+        finally:
+            await engine.dispose()
+
+    observed = asyncio.run(run())
+
+    notified = _numeric_snapshots(harness['events'])
+    snapshot = {
+        'tokens': 60,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'estimated',
+    }
+    assert notified and notified[-1] == snapshot
+    assert harness['snapshot_calls'] == [
+        {'message_id': 'assistant', 'snapshot': snapshot}
+    ], 'the send commit must persist through the dedicated snapshot update'
+    assert not any(
+        call['update'].keys() == {'context_usage'} for call in harness['upsert_calls']
+    ), 'the send commit must not reuse the dual-writing upsert'
+
+    for phase in ('before', 'after'):
+        message = observed[phase]['row']
+        assert message['context_usage'] == snapshot
+    assert observed['after']['streams'] == []
+
+
+def test_continuation_commit_saves_snapshot_before_provider_wait(monkeypatch):
+    harness = _stream_store_harness(monkeypatch)
+    middleware = harness['middleware']
+    ctx = harness['ctx']
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 40)
+
+    async def run():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        real_generate = middleware.generate_chat_completion
+
+        async def parking_generate(request, candidate, user, **kwargs):
+            entered.set()
+            await release.wait()
+            return await real_generate(request, candidate, user, **kwargs)
+
+        monkeypatch.setattr(middleware, 'generate_chat_completion', parking_generate)
+        harness['current']['replies'] = [harness['current']['text_response']('done')]
+        db_saves_before = len(harness['current']['saved'])
+        running = asyncio.create_task(
+            middleware.streaming_chat_response_handler(
+                harness['current']['tool_response']('call-a', 'view_file'), ctx
+            )
+        )
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            streams = copy.deepcopy(
+                await harness['tasks'].get_response_streams_by_chat_id(None, 'chat')
+            )
+            restored = harness['chats_router'].overlay_response_streams(harness['blob'](), streams)
+            return {
+                'streams': streams,
+                'restored': restored,
+                'db_saves': len(harness['current']['saved']) - db_saves_before,
+            }
+        finally:
+            release.set()
+            await asyncio.wait_for(running, 5)
+
+    result = asyncio.run(run())
+
+    snapshot = {
+        'tokens': 40,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'estimated',
+    }
+    assert result['streams'] and result['streams'][0]['context_usage'] == snapshot
+    message = result['restored']['chat']['history']['messages']['assistant']
+    assert message['context_usage'] == snapshot
+    assert message['output'], 'prior tool output must not be overwritten with an empty list'
+    assert any(item.get('type') == 'function_call' for item in message['output'])
+    assert result['db_saves'] == 0, 'continuation commits must not add per-round DB writes'
+
+
+async def _run_dualwrite_send_commit_leg(monkeypatch, middleware, chats_model, real_upsert, real_snapshot_update):
+    upsert_calls = []
+    snapshot_calls = []
+    events = []
+
+    async def emitter(event):
+        events.append(copy.deepcopy(event))
+
+    async def get_event_emitter(_metadata):
+        return emitter
+
+    async def counting_upsert(chat_id, message_id, update, **kwargs):
+        upsert_calls.append({'update': copy.deepcopy(update)})
+        return await real_upsert(chat_id, message_id, update, **kwargs)
+
+    async def counting_snapshot_update(chat_id, message_id, snapshot):
+        snapshot_calls.append(copy.deepcopy(snapshot))
+        return await real_snapshot_update(chat_id, message_id, snapshot)
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    _seed_state_on_capture(
+        monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()}
+    )
+    monkeypatch.setattr(
+        middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', counting_upsert
+    )
+    if real_snapshot_update is not None:
+        monkeypatch.setattr(
+            middleware.Chats, 'update_message_context_usage', counting_snapshot_update
+        )
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 60)
+    monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
+
+    _send, _metadata, _events, state = await _run_payload_leg(
+        middleware, [{'role': 'user', 'content': 'start'}], message_id='assistant'
+    )
+    return state, events, upsert_calls, snapshot_calls
+
+
+def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+    middleware = importlib.import_module('open_webui.utils.middleware')
+
+    makers = {}
+    monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+
+    async def read_rows():
+        async with makers['session']() as session:
+            chat_item = await session.get(chats_model.Chat, 'chat')
+            message_item = await session.get(chat_messages.ChatMessage, 'chat-assistant')
+            return (
+                copy.deepcopy(chat_item.chat),
+                chat_item.updated_at,
+                chat_item.current_message_id,
+                chat_messages.ChatMessageModel.model_validate(message_item).model_dump(),
+            )
+
+    async def run():
+        engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "dualwrite.db"}')
+        makers['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
+                await connection.run_sync(chat_messages.ChatMessage.__table__.create)
+
+            output = [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'OLD'}]}]
+            await chats_model.Chats.insert_new_chat(
+                'chat',
+                'user-1',
+                chats_model.ChatForm(
+                    chat={
+                        'history': {
+                            'currentId': 'assistant',
+                            'messages': {
+                                'user': {
+                                    'id': 'user',
+                                    'parentId': None,
+                                    'role': 'user',
+                                    'content': 'question',
+                                    'childrenIds': ['assistant'],
+                                },
+                                'assistant': {
+                                    'id': 'assistant',
+                                    'parentId': 'user',
+                                    'role': 'assistant',
+                                    'content': 'OLD',
+                                    'output': output,
+                                    'done': True,
+                                },
+                            },
+                        }
+                    }
+                ),
+            )
+            for tokens in (60, 90):
+                await chats_model.Chats.upsert_message_to_chat_by_id_and_message_id(
+                    'chat',
+                    'assistant',
+                    {
+                        'usage': {
+                            'prompt_tokens': tokens - 10,
+                            'completion_tokens': 10,
+                            'total_tokens': tokens,
+                        }
+                    },
+                )
+            before = await read_rows()
+            assert before[3]['usage']['total_tokens'] == 150
+            assert before[0]['history']['messages']['assistant']['usage']['total_tokens'] == 90
+
+            real_upsert = chats_model.Chats.upsert_message_to_chat_by_id_and_message_id
+            real_snapshot_update = getattr(chats_model.Chats, 'update_message_context_usage', None)
+
+            state, events, upsert_calls, snapshot_calls = await _run_dualwrite_send_commit_leg(
+                monkeypatch, middleware, chats_model, real_upsert, real_snapshot_update
+            )
+
+            snapshot = {
+                'tokens': 60,
+                'threshold': 100,
+                'soft_threshold': None,
+                'source': 'estimated',
+            }
+            assert state['context_usage'] == snapshot
+            after = await read_rows()
+            assert after[3] == before[3], 'the send commit must not replay saved usage'
+            expected_blob = copy.deepcopy(before[0])
+            expected_blob['history']['messages']['assistant']['context_usage'] = snapshot
+            assert after[0] == expected_blob
+            assert after[1:3] == before[1:3]
+            assert _numeric_snapshots(events) == [snapshot]
+            assert not any(call['update'].keys() == {'context_usage'} for call in upsert_calls)
+            assert snapshot_calls == [snapshot]
+
+            if real_snapshot_update is not None:
+                refreshed = {**snapshot, 'tokens': 45}
+                await real_snapshot_update('chat', 'assistant', refreshed)
+                assert (await read_rows())[3]['usage']['total_tokens'] == 150
+
+            await chats_model.Chats.upsert_message_to_chat_by_id_and_message_id(
+                'chat',
+                'assistant',
+                {
+                    'usage': {
+                        'prompt_tokens': 20,
+                        'completion_tokens': 10,
+                        'total_tokens': 30,
+                    }
+                },
+            )
+            assert (await read_rows())[3]['usage']['total_tokens'] == 180
+        finally:
+            await engine.dispose()
+
+    asyncio.run(run())

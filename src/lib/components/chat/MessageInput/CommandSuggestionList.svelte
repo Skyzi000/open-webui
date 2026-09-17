@@ -44,9 +44,13 @@
 		typeof temporaryEnabled === 'function' ? temporaryEnabled() : temporaryEnabled;
 	$: resolvedContextUsage = typeof contextUsage === 'function' ? contextUsage() : contextUsage;
 	$: contextHasThreshold = Number(resolvedContextUsage?.threshold) > 0;
-	$: contextPercent = contextHasThreshold
-		? Math.max(0, Math.round(resolvedContextUsage?.percent ?? 0))
-		: null;
+	$: contextPercent =
+		contextHasThreshold && Number.isFinite(Number(resolvedContextUsage?.tokens))
+			? Math.max(
+					0,
+					Math.round((resolvedContextUsage.tokens / resolvedContextUsage.threshold) * 100)
+				)
+			: null;
 
 	let suggestionElement: any = null;
 	let filteredItems: any[] = [];
