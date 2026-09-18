@@ -8,7 +8,6 @@ import {
 	isContextUsageSnapshot,
 	resolveBranchContextLiveState,
 	resolveBranchContextUsage,
-	softMarkerPosition,
 	type ContextUsageLiveState,
 	type ContextUsageSnapshot
 } from './contextUsage';
@@ -167,20 +166,6 @@ describe('contextRingState', () => {
 		expect(contextRingState(snapshot({ tokens: 55, soft_threshold: 50 }), null, true)).toBe(
 			'normal'
 		);
-	});
-});
-
-describe('softMarkerPosition', () => {
-	it('places the marker at 6 oclock for a half threshold under the rotated ring', () => {
-		const { x, y } = softMarkerPosition(0.5);
-		expect(x).toBeCloseTo(2, 6);
-		expect(y).toBeCloseTo(10, 6);
-	});
-
-	it('starts at the arc origin for a zero fraction', () => {
-		const { x, y } = softMarkerPosition(0);
-		expect(x).toBeCloseTo(18, 6);
-		expect(y).toBeCloseTo(10, 6);
 	});
 });
 

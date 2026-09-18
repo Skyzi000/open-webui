@@ -110,11 +110,6 @@ export const contextRingState = (
 	return 'normal';
 };
 
-export const softMarkerPosition = (fraction: number): { x: number; y: number } => ({
-	x: 10 + 8 * Math.cos(fraction * 2 * Math.PI),
-	y: 10 + 8 * Math.sin(fraction * 2 * Math.PI)
-});
-
 type CompactionStatus = {
 	action?: unknown;
 	description?: unknown;

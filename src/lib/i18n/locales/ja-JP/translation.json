@@ -613,7 +613,7 @@
 	"Content Field": "",
 	"Content lengths (character counts only)": "",
 	"Content matches": "",
-	"Context": "",
+	"Context": "コンテキスト",
 	"Context compacted": "コンテキストを圧縮しました",
 	"Context Compaction": "",
 	"Context compaction failed": "コンテキストの圧縮に失敗しました",

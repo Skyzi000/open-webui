@@ -59,7 +59,6 @@
 	import {
 		contextRingState,
 		contextUsagePercent,
-		softMarkerPosition,
 		type ContextUsageLiveState,
 		type ContextUsageSnapshot
 	} from '$lib/utils/contextUsage';
@@ -476,21 +475,11 @@
 			: ringState === 'amber'
 				? 'text-amber-500 dark:text-amber-400'
 				: ringState === 'blue'
-					? 'text-blue-500 dark:text-blue-400'
+					? 'text-sky-500 dark:text-sky-300'
 					: ringState === 'green'
 						? 'text-green-500 dark:text-green-400'
-						: 'text-gray-400 dark:text-gray-600';
+						: 'text-gray-500 dark:text-gray-400';
 	$: ringArcOffset = 50.27 * (1 - Math.min(Math.max(contextPercent ?? 0, 0), 100) / 100);
-	$: ringSoftFraction =
-		ringVisible &&
-		contextUsage &&
-		typeof contextUsage.soft_threshold === 'number' &&
-		contextUsage.soft_threshold > 0 &&
-		Number(contextUsage.threshold) > 0
-			? Math.min(Math.max(contextUsage.soft_threshold / Number(contextUsage.threshold), 0), 1)
-			: null;
-	$: ringSoftMarker =
-		ringSoftFraction !== null ? softMarkerPosition(ringSoftFraction) : { x: 0, y: 0 };
 	$: ringTooltipContent = `${contextValue} ${$i18n.t('tokens')}`;
 
 	const getCommand = () => {
@@ -1946,14 +1935,14 @@
 							<div class="px-2 relative">
 								{#if ringVisible}
 									<Tooltip
-										content={ringTooltipContent}
+										content={`${$i18n.t('Context')}:<br>${ringTooltipContent}`}
 										placement="top"
-										className="absolute top-1.5 right-2 z-20 flex h-7 w-7 items-center justify-center"
+										className="absolute top-1.5 right-2.5 z-20 flex h-7 w-7 items-center justify-center"
 									>
 										<button
 											type="button"
 											class="flex h-7 w-7 items-center justify-center rounded-lg hover:bg-gray-100/50 dark:hover:bg-gray-800/50"
-											aria-label={ringTooltipContent}
+											aria-label={`${$i18n.t('Context')}: ${ringTooltipContent}`}
 											aria-expanded={showStatusPanel}
 											on:pointerdown={(e) => e.preventDefault()}
 											on:click={() => {
@@ -1971,8 +1960,8 @@
 													r="8"
 													fill="none"
 													stroke="currentColor"
-													stroke-width="2"
-													class="opacity-20"
+													stroke-width="2.5"
+													class="opacity-25"
 												/>
 												<circle
 													cx="10"
@@ -1980,20 +1969,11 @@
 													r="8"
 													fill="none"
 													stroke="currentColor"
-													stroke-width="2"
+													stroke-width="2.5"
 													stroke-linecap="round"
 													stroke-dasharray="50.27"
 													style={`stroke-dashoffset: ${ringArcOffset};`}
 												/>
-												{#if ringSoftFraction !== null}
-													<circle
-														cx={ringSoftMarker.x}
-														cy={ringSoftMarker.y}
-														r="1.3"
-														fill="currentColor"
-														stroke="none"
-													/>
-												{/if}
 											</svg>
 										</button>
 									</Tooltip>
