@@ -1,10 +1,13 @@
 import asyncio
 import copy
 import importlib
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from fastapi import Request
 from fastapi.responses import StreamingResponse
 
 for name in ('data', 'static'):
@@ -17,6 +20,11 @@ main = importlib.import_module('open_webui.main')
 middleware = importlib.import_module('open_webui.utils.middleware')
 chat = importlib.import_module('open_webui.utils.chat')
 compaction = importlib.import_module('open_webui.utils.context_compaction')
+tasks_router = importlib.import_module('open_webui.routers.tasks')
+openai_router = importlib.import_module('open_webui.routers.openai')
+ollama_router = importlib.import_module('open_webui.routers.ollama')
+config_model = importlib.import_module('open_webui.models.config')
+models_model = importlib.import_module('open_webui.models.models')
 
 
 class _EntryParams:
@@ -735,3 +743,335 @@ def test_generate_chat_completion_strips_markers_without_mutating_canonical_body
 
     canonical = captured['ctx']['compaction_state']['canonical_body']['messages']
     assert any(message.get(marker_key) is True for message in canonical)
+
+
+# Task token-limit tests assert on the FINAL wire payload (after provider
+# conversion); only config/model-fetch/HTTP boundaries may be stubbed.
+
+_TASK_LIMIT_KINDS = ['title', 'emoji', 'summary']
+
+_TASK_LIMIT_FIELDS = ('max_tokens', 'max_completion_tokens', 'max_output_tokens')
+
+
+class _WireResponse:
+    status = 200
+    headers = {'Content-Type': 'application/json'}
+
+    def __init__(self, api_type):
+        self._api_type = api_type
+
+    async def json(self, **_kwargs):
+        if self._api_type == 'responses':
+            return {
+                'id': 'resp-wire',
+                'status': 'completed',
+                'output': [
+                    {
+                        'type': 'message',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': 'ok'}],
+                    }
+                ],
+            }
+        return {'choices': [{'message': {'role': 'assistant', 'content': 'ok'}, 'finish_reason': 'stop'}]}
+
+
+class _WireSession:
+    def __init__(self, captured, api_type):
+        self._captured = captured
+        self._api_type = api_type
+
+    async def request(self, **kwargs):
+        self._captured.append(json.loads(kwargs['data']))
+        return _WireResponse(self._api_type)
+
+
+class _WireSink:
+    """Provider-side boundary stubs capturing the final serialized payloads."""
+
+    def __init__(self, *, values, model_params=None, api_type='chat'):
+        self.values = values
+        self.model_params = copy.deepcopy(model_params or {})
+        self.api_type = api_type
+        self.captured = []
+
+    async def get_config(self, key, default=None):
+        if key in self.values:
+            return copy.deepcopy(self.values[key])
+        if key.endswith('.enable'):
+            return True
+        if key.endswith('.prompt_template'):
+            return ''
+        return default
+
+    async def get_many(self, *keys):
+        return {key: await self.get_config(key) for key in keys}
+
+    async def get_model(self, _model_id):
+        return SimpleNamespace(base_model_id=None, params=models_model.ModelParams(**self.model_params))
+
+    async def check_access(self, *_args, **_kwargs):
+        return None
+
+    async def connection(self, *_args):
+        return 'https://api.openai.com/v1', 'wire-placeholder', {'api_type': self.api_type}
+
+    async def headers(self, *_args, **_kwargs):
+        return {}, None
+
+    async def ollama_url(self, *_args, **_kwargs):
+        return 'http://localhost:11434', 0
+
+    async def session(self):
+        return _WireSession(self.captured, self.api_type)
+
+    async def cleanup(self, *_args):
+        return None
+
+    async def ollama_send_request(self, _url, _method='POST', *, payload=None, **_kwargs):
+        self.captured.append(json.loads(payload))
+        return {'model': 'wire-model', 'message': {'role': 'assistant', 'content': 'ok'}, 'done': True}
+
+
+def _install_task_wire_harness(monkeypatch, *, model_params=None, task_params=None, api_type='chat'):
+    sink = _WireSink(
+        values={'task.model.params': copy.deepcopy(task_params or {})},
+        model_params=model_params,
+        api_type=api_type,
+    )
+
+    monkeypatch.setattr(config_model.Config, 'get', staticmethod(sink.get_config))
+    monkeypatch.setattr(config_model.Config, 'get_many', staticmethod(sink.get_many))
+    monkeypatch.setattr(models_model.Models, 'get_model_by_id', staticmethod(sink.get_model))
+    monkeypatch.setattr(tasks_router, 'process_pipeline_inlet_filter', _task_pipeline_passthrough)
+    monkeypatch.setattr(openai_router, 'check_model_access', sink.check_access)
+    monkeypatch.setattr(openai_router, 'get_openai_connection', sink.connection)
+    monkeypatch.setattr(openai_router, 'get_headers_and_cookies', sink.headers)
+    monkeypatch.setattr(openai_router, 'get_session', sink.session)
+    monkeypatch.setattr(openai_router, 'cleanup_response', sink.cleanup)
+    monkeypatch.setattr(ollama_router, 'check_model_access', sink.check_access)
+    monkeypatch.setattr(ollama_router, 'get_ollama_url', sink.ollama_url)
+    monkeypatch.setattr(ollama_router, 'send_request', sink.ollama_send_request)
+    return sink.captured
+
+
+async def _task_pipeline_passthrough(_request, payload, *_args):
+    return payload
+
+
+def _task_wire_request(model_id, model_params, *, owned_by='openai', direct=False):
+    model = {
+        'id': model_id,
+        'owned_by': owned_by,
+        'info': {'params': copy.deepcopy(model_params or {})},
+    }
+    state = {'metadata': {}}
+    if direct:
+        state.update({'direct': True, 'model': model})
+    return Request(
+        {
+            'type': 'http',
+            'app': SimpleNamespace(
+                state=SimpleNamespace(
+                    MODELS={} if direct else {model_id: model},
+                    OPENAI_MODELS={model_id: {'urlIdx': 0}},
+                )
+            ),
+            'state': state,
+        }
+    )
+
+
+def _task_wire_user():
+    return SimpleNamespace(id='wire-1', role='admin', email='wire@test', name='wire')
+
+
+def _wire_token_limits(payload):
+    return {key: payload[key] for key in _TASK_LIMIT_FIELDS if key in payload}
+
+
+def _ollama_token_limits(payload):
+    options = payload.get('options') or {}
+    limits = {}
+    if 'num_predict' in payload:
+        limits['num_predict'] = payload['num_predict']
+    if 'num_predict' in options:
+        limits['options.num_predict'] = options['num_predict']
+    return limits
+
+
+def _summary_models(request):
+    models = dict(request.app.state.MODELS.items())
+    direct_model = getattr(request.state, 'model', None)
+    if getattr(request.state, 'direct', False) and direct_model:
+        models[direct_model['id']] = direct_model
+    return models
+
+
+def _run_task_generation(kind, request, user, model_id):
+    messages = [{'role': 'user', 'content': 'Please describe the result.'}]
+    if kind == 'normal_chat':
+        return asyncio.run(
+            chat.generate_chat_completion(request, {'model': model_id, 'messages': messages, 'stream': False}, user)
+        )
+    if kind == 'summary':
+        summary = asyncio.run(
+            compaction._generate_summary(
+                request, user, model_id, _summary_models(request), messages, [], None, ''
+            )
+        )
+        assert summary == 'ok'
+        return summary
+    body = {'model': model_id, 'messages': messages, 'prompt': 'Please describe the result.'}
+    fn = {
+        'title': tasks_router.generate_title,
+        'emoji': tasks_router.generate_emoji,
+        'follow_up': tasks_router.generate_follow_ups,
+    }[kind]
+    result = asyncio.run(fn(request, body, user))
+    assert not hasattr(result, 'status_code'), (kind, getattr(result, 'body', None))
+    return result
+
+
+@pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)
+def test_task_generation_without_token_limits_sends_none(monkeypatch, kind):
+    captured = _install_task_wire_harness(monkeypatch)
+    request = _task_wire_request('gpt-4.1', {})
+
+    _run_task_generation(kind, request, _task_wire_user(), 'gpt-4.1')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == {}
+
+
+@pytest.mark.parametrize('task_params', [{'temperature': 0.2}, {'max_tokens': None}, {'max_tokens': ''}])
+@pytest.mark.parametrize('kind', ['title', 'summary'])
+def test_task_generation_empty_task_params_add_no_limit(monkeypatch, kind, task_params):
+    captured = _install_task_wire_harness(monkeypatch, task_params=task_params)
+    request = _task_wire_request('gpt-4.1', {})
+
+    _run_task_generation(kind, request, _task_wire_user(), 'gpt-4.1')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == {}
+
+
+@pytest.mark.parametrize('max_tokens', [32768, 65536, 131072])
+@pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)
+def test_task_generation_preserves_explicit_task_token_limits(monkeypatch, kind, max_tokens):
+    captured = _install_task_wire_harness(monkeypatch, task_params={'max_tokens': max_tokens})
+    request = _task_wire_request('gpt-4.1', {})
+
+    _run_task_generation(kind, request, _task_wire_user(), 'gpt-4.1')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == {'max_tokens': max_tokens}
+
+
+@pytest.mark.parametrize(
+    'model_max_tokens, expected',
+    [(None, {}), (8192, {'max_tokens': 8192})],
+)
+@pytest.mark.parametrize('kind', ['title', 'summary'])
+def test_task_generation_inherits_explicit_model_max_tokens(monkeypatch, kind, model_max_tokens, expected):
+    model_params = {} if model_max_tokens is None else {'max_tokens': model_max_tokens}
+    captured = _install_task_wire_harness(monkeypatch, model_params=model_params)
+    request = _task_wire_request('gpt-4.1', model_params)
+
+    _run_task_generation(kind, request, _task_wire_user(), 'gpt-4.1')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == expected
+
+
+@pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)
+@pytest.mark.parametrize(
+    'field, model_id, api_type, wire_key',
+    [
+        ('max_completion_tokens', 'gpt-5', 'chat', 'max_completion_tokens'),
+        ('max_output_tokens', 'gpt-4.1', 'responses', 'max_output_tokens'),
+    ],
+)
+def test_task_generation_native_limit_fields_not_overwritten(
+    monkeypatch, kind, field, model_id, api_type, wire_key
+):
+    model_params = {'custom_params': {field: 65536}}
+    captured = _install_task_wire_harness(monkeypatch, model_params=model_params, api_type=api_type)
+    request = _task_wire_request(model_id, model_params)
+
+    _run_task_generation(kind, request, _task_wire_user(), model_id)
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == {wire_key: 65536}
+
+
+@pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)
+def test_ollama_task_generation_unset_adds_no_num_predict(monkeypatch, kind):
+    captured = _install_task_wire_harness(monkeypatch)
+    request = _task_wire_request('llama3.1', {}, owned_by='ollama')
+
+    _run_task_generation(kind, request, _task_wire_user(), 'llama3.1')
+
+    assert len(captured) == 1
+    assert _ollama_token_limits(captured[0]) == {}
+    assert _wire_token_limits(captured[0]) == {}
+
+
+@pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)
+def test_ollama_task_generation_explicit_limit_maps_to_num_predict(monkeypatch, kind):
+    captured = _install_task_wire_harness(monkeypatch, task_params={'max_tokens': 65536})
+    request = _task_wire_request('llama3.1', {}, owned_by='ollama')
+
+    _run_task_generation(kind, request, _task_wire_user(), 'llama3.1')
+
+    assert len(captured) == 1
+    assert _ollama_token_limits(captured[0]) == {'options.num_predict': 65536}
+
+
+@pytest.mark.parametrize('kind', ['normal_chat', 'follow_up'])
+def test_unchanged_generation_paths_gain_no_fixed_limit(monkeypatch, kind):
+    captured = _install_task_wire_harness(monkeypatch)
+    request = _task_wire_request('gpt-4.1', {})
+
+    _run_task_generation(kind, request, _task_wire_user(), 'gpt-4.1')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == {}
+
+
+@pytest.mark.parametrize(
+    'model_params, expected',
+    [({}, {}), ({'max_tokens': 8192}, {'max_tokens': 8192})],
+)
+@pytest.mark.parametrize('kind', ['title', 'summary'])
+def test_direct_connection_keeps_explicit_model_max_tokens(monkeypatch, kind, model_params, expected):
+    # Direct connections bypass the server provider router, so an explicit
+    # model max_tokens only survives via the task-side inheritance.
+    captured = []
+
+    async def get_config(key, default=None):
+        if key.endswith('.enable'):
+            return True
+        if key.endswith('.prompt_template'):
+            return ''
+        return default
+
+    async def get_many(*keys):
+        return {key: await get_config(key) for key in keys}
+
+    async def fake_generate(_request, form_data=None, user=None, **_kwargs):
+        captured.append(form_data)
+        return {'choices': [{'message': {'content': 'ok'}, 'finish_reason': 'stop'}]}
+
+    monkeypatch.setattr(config_model.Config, 'get', staticmethod(get_config))
+    monkeypatch.setattr(config_model.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(tasks_router, 'process_pipeline_inlet_filter', _task_pipeline_passthrough)
+    monkeypatch.setattr(tasks_router, 'generate_chat_completion', fake_generate)
+    monkeypatch.setattr(chat, 'generate_chat_completion', fake_generate)
+
+    request = _task_wire_request('direct-model', model_params, direct=True)
+
+    _run_task_generation(kind, request, _task_wire_user(), 'direct-model')
+
+    assert len(captured) == 1
+    assert _wire_token_limits(captured[0]) == expected

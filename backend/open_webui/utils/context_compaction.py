@@ -2262,6 +2262,15 @@ async def _summary_file_sources(request, user, model_id: str, messages: list[dic
     return sources
 
 
+def _inherit_model_max_tokens(task_model_params: dict, model: dict) -> dict:
+    if task_model_params:
+        return task_model_params
+    max_tokens = model.get('info', {}).get('params', {}).get('max_tokens')
+    if max_tokens is None or max_tokens == '':
+        return {}
+    return {'max_tokens': max_tokens}
+
+
 async def _generate_summary(
     request,
     user,
@@ -2359,9 +2368,7 @@ async def _generate_summary(
     if not isinstance(task_model_params, dict):
         task_model_params = {}
     task_model_params = {key: value for key, value in task_model_params.items() if value is not None and value != ''}
-    task_model_params = task_model_params or {
-        'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
-    }
+    task_model_params = _inherit_model_max_tokens(task_model_params, models[task_model_id])
 
     summary_metadata = dict(request.state.metadata) if hasattr(request.state, 'metadata') else {}
     summary_metadata.pop('tools', None)

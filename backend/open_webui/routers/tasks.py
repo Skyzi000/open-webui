@@ -177,9 +177,10 @@ async def generate_title(request: Request, form_data: dict, user=Depends(get_ver
         template = DEFAULT_TITLE_GENERATION_PROMPT_TEMPLATE
 
     content = await title_generation_template(template, form_data['messages'], user)
-    task_model_params = task_model_params or {
-        'max_tokens': models[task_model_id].get('info', {}).get('params', {}).get('max_tokens', 1000)
-    }
+    if not task_model_params:
+        model_max_tokens = models[task_model_id].get('info', {}).get('params', {}).get('max_tokens')
+        if model_max_tokens is not None and model_max_tokens != '':
+            task_model_params = {'max_tokens': model_max_tokens}
 
     payload = {
         'model': task_model_id,
@@ -570,7 +571,7 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
             detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
         )
 
-    task_model_id, _ = await get_task_model_generation_config(model_id, models)
+    task_model_id, task_model_params = await get_task_model_generation_config(model_id, models)
 
     log.debug('generating emoji using model %s for user %s ', task_model_id, user.email)
 
@@ -596,7 +597,7 @@ async def generate_emoji(request: Request, form_data: dict, user=Depends(get_ver
     except Exception as e:
         raise e
 
-    payload = apply_task_model_params(payload, models, task_model_id, {'max_tokens': 4})
+    payload = apply_task_model_params(payload, models, task_model_id, task_model_params)
 
     try:
         return await generate_chat_completion(request, form_data=payload, user=user)
