@@ -157,7 +157,7 @@ async def test_oversized_tail_does_not_pre_empt_a_later_stage_error():
 
     command = f'tail -n {refs.REF_EXEC_RESPONSE_MAX_BYTES + 1} {ref} | grep -E "["'
 
-    assert await reader(command) == 'Error: Invalid regex: unterminated character set at position 1'
+    assert (await reader(command)).startswith('Error: Invalid or unsupported regex (RE2 syntax):')
 
 
 @pytest.mark.parametrize(
@@ -506,25 +506,30 @@ async def test_token_capped_single_line_grep_keeps_the_match():
     assert compaction.estimate_text_tokens(result) < TOKEN_THRESHOLD
 
 
+@pytest.mark.parametrize('use_regex', [False, True])
 @pytest.mark.asyncio
-async def test_grep_only_matching_stops_scanning_when_the_response_is_full(monkeypatch):
+async def test_grep_only_matching_stops_scanning_when_the_response_is_full(monkeypatch, use_regex):
     source = 'a' * 1_000_000
     _, _, reader, ref = await _project(source)
-    original_finditer = refs.re.finditer
+    matcher = refs.re2._Regexp if use_regex else refs.re
+    original_finditer = matcher.finditer
     matches = 0
+    iterations = 0
 
     def bounded_finditer(*args, **kwargs):
-        nonlocal matches
+        nonlocal matches, iterations
+        iterations += 1
         for match in original_finditer(*args, **kwargs):
             matches += 1
             if matches > 100_000:
                 raise AssertionError('grep materialized matches past the response budget')
             yield match
 
-    monkeypatch.setattr(refs.re, 'finditer', bounded_finditer)
-    result = await reader(f'grep -o a {ref}')
+    monkeypatch.setattr(matcher, 'finditer', bounded_finditer)
+    result = await reader(f'grep {"-Eo" if use_regex else "-o"} a {ref}')
 
     assert 0 < matches < 100_000
+    assert iterations == 1
     assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
     assert '<auto_compact_ref_truncated>' in result
 
@@ -557,38 +562,56 @@ async def test_byte_page_commands_reconstruct_exact_requested_slice():
         assert all(compaction.estimate_text_tokens(page) < TOKEN_THRESHOLD for page in pages)
 
 
+@pytest.mark.parametrize('finished_at', [0.9, 1.1])
 @pytest.mark.asyncio
-async def test_pipeline_regex_stages_share_one_match_budget(monkeypatch):
+async def test_pipeline_regex_stages_share_one_match_budget(monkeypatch, finished_at):
     reader, ref = await _history_reader('x')
-    observed_timeouts: list[float] = []
+    observed_budgets: list[float] = []
+    budgets = []
 
     class Compiled:
-        def finditer(self, text, pos=0, *, timeout):
-            observed_timeouts.append(timeout)
-            match = re.search('x', text[pos:])
-            return iter([match] if match is not None else [])
+        def finditer(self, text):
+            observed_budgets.append(budgets[0].remaining)
+            return re.finditer('x', text)
 
     class Budget:
         def __init__(self):
             self.remaining = 1.0
+            budgets.append(self)
 
-    monotonic_values = iter([0.0, 0.75, 0.75, 1.0])
+    monotonic_values = iter([0.0, 0.75, 0.75, finished_at])
     monkeypatch.setattr(refs, 'MATCH_BUDGET_SECONDS', 1.0)
     monkeypatch.setattr(refs, 'MatchBudget', Budget)
-    monkeypatch.setattr(refs.regex, 'compile', lambda *_args, **_kwargs: Compiled())
+    monkeypatch.setattr(refs.re2, 'compile', lambda *_args, **_kwargs: Compiled())
     monkeypatch.setattr(refs, '_monotonic', lambda: next(monotonic_values))
 
-    assert await reader(f'grep -Eo x {ref} | head -1 | grep -E x') == 'x'
-    assert observed_timeouts == pytest.approx([1.0, 0.25])
+    expected = 'x' if finished_at < 1 else 'Error: Search exceeded 1s, narrow the pattern'
+    assert await reader(f'grep -Eo x {ref} | head -1 | grep -E x') == expected
+    assert observed_budgets == pytest.approx([1.0, 0.25])
+
+
+@pytest.mark.parametrize('pattern', ['a{999999999}', r'(a)\1', 'a(?=a)'])
+@pytest.mark.asyncio
+async def test_grep_uses_the_core_re2_syntax(pattern):
+    _, _, reader, ref = await _project('a' * 20_000)
+
+    result = await reader(f"grep -E '{pattern}' {ref}")
+
+    assert result.startswith('Error: Invalid or unsupported regex (RE2 syntax):')
 
 
 @pytest.mark.asyncio
-async def test_grep_uses_the_core_regex_quantifier_limit():
-    _, _, reader, ref = await _project('a' * 20_000)
-
-    result = await reader(f'grep -E "a{{999999999}}" {ref}')
-
-    assert result.startswith('Error: Regex quantifier counts over ')
+async def test_re2_grep_preserves_multibyte_spans_and_skips_empty_matches():
+    source = '前ああ中あ末ABC\n日本語abc'
+    reader, ref = await _history_reader(source)
+    assert await reader(f"grep -Eo 'あ*' {ref}") == 'ああ\nあ'
+    assert await reader(f"grep -Ein 'abc' {ref}") == '1:前ああ中あ末ABC\n2:日本語abc'
+    stages = refs._parse_command(f"grep -Eo 'あ+' {ref}")
+    compiled = refs._compile_grep(stages[0])
+    assert compiled.options.max_mem == 1 << 20
+    assert compiled.options.log_errors is False
+    lines = refs._apply_stage(refs._iter_text_lines(source, source_offsets=True), stages[0], refs.MatchBudget())
+    assert [(line.presented, line.source_byte_start) for line in lines] == [('ああ', 3), ('あ', 12)]
 
 
 @pytest.mark.asyncio

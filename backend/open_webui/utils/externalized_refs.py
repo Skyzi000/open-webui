@@ -15,14 +15,13 @@ from itertools import chain, islice
 from operator import itemgetter
 from typing import Any
 
-import regex
+import re2
 from open_webui.tools.knowledge_fs import (
     MATCH_BUDGET_SECONDS,
     MatchBudget,
     MatchBudgetExceeded,
     is_regex_pattern,
     normalize_regex,
-    validate_regex_quantifiers,
 )
 
 _monotonic = time.monotonic
@@ -46,6 +45,7 @@ REF_EXEC_FUNCTION_SPEC: dict[str, Any] = {
         'tail [-n N|-N|-c N|-c +N] REF; sed -n Np|M,Np|M,$p REF; '
         'grep [-E] [-i] [-n] [-c] [-o] [--] PATTERN REF. '
         'grep/head/tail/sed/wc can be piped. '
+        'Regex uses RE2 syntax; no lookarounds/backreferences, and shorthand character classes are ASCII-only. '
         'Truncated tool results and reader pages embed a <auto_compact_ref_truncated> '
         'marker whose next command reads the omitted span; follow it across pages '
         'when the span is large.'
@@ -813,27 +813,24 @@ def _regex_spans(
     *,
     all_matches: bool,
 ) -> Iterator[tuple[int, int]]:
-    position = 0
-    while position <= len(text):
+    matches = compiled.finditer(text)
+    while True:
         if budget.remaining <= 0:
             raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern')
         started = _monotonic()
         try:
-            matches = compiled.finditer(text, position, timeout=budget.remaining)
-            match = next(
-                (candidate for candidate in matches if not all_matches or candidate.end() > candidate.start()),
-                None,
-            )
-        except TimeoutError:
-            raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern') from None
+            match = next(matches, None)
         finally:
             budget.remaining -= _monotonic() - started
+        if budget.remaining <= 0:
+            raise MatchBudgetExceeded(f'Search exceeded {MATCH_BUDGET_SECONDS:g}s, narrow the pattern')
         if match is None:
             return
+        if all_matches and match.end() == match.start():
+            continue
         yield match.span()
         if not all_matches:
             return
-        position = match.end()
 
 
 def _compile_grep(stage: _Stage) -> Any | None:
@@ -841,16 +838,14 @@ def _compile_grep(stage: _Stage) -> Any | None:
     if 'E' not in stage.flags and not is_regex_pattern(pattern):
         return None
     normalized = normalize_regex(pattern)
-    quantifier_error = validate_regex_quantifiers(normalized)
-    if quantifier_error:
-        raise RefExecError(quantifier_error)
     try:
-        return regex.compile(
-            normalized,
-            regex.IGNORECASE if 'i' in stage.flags else 0,
-        )
-    except regex.error as exc:
-        raise RefExecError(f'Invalid regex: {exc}') from exc
+        options = re2.Options()
+        options.case_sensitive = 'i' not in stage.flags
+        options.max_mem = 1 << 20
+        options.log_errors = False
+        return re2.compile(normalized, options=options)
+    except re2.error as exc:
+        raise RefExecError(f'Invalid or unsupported regex (RE2 syntax): {exc}') from exc
 
 
 def _grep_spans(
@@ -1639,6 +1634,7 @@ def _new_reader(
 
         Truncation markers embed a next command that reads the omitted span;
         follow it across pages when the span is large.
+        Regex uses RE2 syntax; no lookarounds/backreferences, and shorthand character classes are ASCII-only.
 
         :param command: Use ls, stat, wc, cat, head, tail, sed, grep, or a bounded pipeline.
         """

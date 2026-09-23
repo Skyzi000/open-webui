@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+	applyResponseStreamEvent,
 	buildOutputDisplayItems,
 	getOutputText,
 	type OutputDisplayItem,
@@ -56,6 +57,21 @@ function shapes(items: OutputDisplayItem[]): string[] {
 }
 
 describe('buildOutputDisplayItems compaction boundaries', () => {
+	it('keeps checkpoint and adoption dividers when a later Responses round completes', () => {
+		const checkpoint = { ...messageItem('old', 'old'), contextSummary: 'CHECKPOINT' };
+		const adoption = adoptionItem('cc_1', 'SUMMARY');
+		const before = [checkpoint, adoption, messageItem('new', 'partial')];
+		const completed = messageItem('new', 'answer');
+		const after = applyResponseStreamEvent(before, {
+			type: 'response.completed',
+			response: { output: [completed] }
+		});
+		expect(after).toEqual([checkpoint, adoption, completed]);
+		expect(buildOutputDisplayItems(after).map((item) => item.id)).toEqual(
+			buildOutputDisplayItems(before).map((item) => item.id)
+		);
+	});
+
 	it('places a nested checkpoint divider immediately before its carrier output item', () => {
 		const carrier = {
 			...functionCallItem('call-a', 'lookup'),
@@ -68,12 +84,7 @@ describe('buildOutputDisplayItems compaction boundaries', () => {
 			messageItem('m2', 'after')
 		]);
 
-		expect(shapes(items)).toEqual([
-			'message',
-			'checkpoint:CHECKPOINT',
-			'detail_single',
-			'message'
-		]);
+		expect(shapes(items)).toEqual(['message', 'checkpoint:CHECKPOINT', 'detail_single', 'message']);
 	});
 
 	it('renders adoption records as dividers instead of normal output', () => {
@@ -85,12 +96,7 @@ describe('buildOutputDisplayItems compaction boundaries', () => {
 			messageItem('m1', 'done')
 		]);
 
-		expect(shapes(items)).toEqual([
-			'adoption:S1',
-			'detail_single',
-			'adoption:S2',
-			'message'
-		]);
+		expect(shapes(items)).toEqual(['adoption:S1', 'detail_single', 'adoption:S2', 'message']);
 	});
 
 	it('keeps call/result pairing and reasoning-first outputs across dividers', () => {

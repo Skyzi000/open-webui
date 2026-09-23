@@ -704,7 +704,11 @@ def test_chat_merge_keeps_state_authority_except_per_call_params(monkeypatch):
     assert captured['metadata']['params'] is state_params
 
 
-def test_generate_chat_completion_strips_markers_without_mutating_canonical_body(monkeypatch):
+@pytest.mark.parametrize('marker_key', [
+    compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
+    compaction.CONTEXT_COMPACTION_PREFIX_MARKER_KEY,
+])
+def test_generate_chat_completion_strips_markers_without_mutating_canonical_body(monkeypatch, marker_key):
     models_map = {
         'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
     }
@@ -722,7 +726,6 @@ def test_generate_chat_completion_strips_markers_without_mutating_canonical_body
 
     monkeypatch.setattr(main, 'build_chat_response_context', build_ctx)
 
-    marker_key = compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY
     marked = {'role': 'user', 'content': 'please summarize', marker_key: True}
     form_data = _base_form_data(
         'primary-model',
@@ -982,6 +985,102 @@ def test_task_generation_inherits_explicit_model_max_tokens(monkeypatch, kind, m
 
     assert len(captured) == 1
     assert _wire_token_limits(captured[0]) == expected
+
+
+@pytest.mark.parametrize(
+    'reason, expected', [(None, 'tool_calls'), ('max_output_tokens', 'length'), ('content_filter', 'content_filter')]
+)
+def test_responses_tool_calls_keep_incomplete_finish_reason(reason, expected):
+    result = openai_router.convert_responses_result(
+        {
+            'status': 'incomplete' if reason else 'completed',
+            **({'incomplete_details': {'reason': reason}} if reason else {}),
+            'output': [{'type': 'function_call', 'call_id': 'call', 'name': 'lookup', 'arguments': {'q': 'x'}}],
+        }
+    )
+    choice = result['choices'][0]
+    assert choice['finish_reason'] == expected
+    function = choice['message']['tool_calls'][0]['function']
+    assert function['name'] == 'lookup'
+    assert json.loads(function['arguments']) == {'q': 'x'}
+
+
+@pytest.mark.parametrize('saved', [False, True])
+def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatch, saved):
+    real_build = main.build_chat_response_context
+    captured, request, user, _ = _install_provider_sink_harness(monkeypatch, {'model': _EntryModelInfo({})})
+    request.app.state.MODELS = {'model': {'id': 'model', 'owned_by': 'openai', 'info': {}}}
+    original = {
+        'id': 'm1',
+        'role': 'assistant',
+        'content': 'OLD',
+        'output': [
+            {'type': 'message', 'id': 'old', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': 'OLD'}]}
+        ],
+    }
+    if saved:
+        original['output'].append(
+            {
+                'type': 'function_call',
+                'call_id': 'call',
+                'name': 'lookup',
+                'arguments': '{}',
+                'status': 'queued',
+                'approved': True,
+            }
+        )
+    stored = copy.deepcopy(original)
+
+    async def noop(*args, **kwargs):
+        return None
+
+    async def get_message(*args, **kwargs):
+        return copy.deepcopy(stored)
+
+    async def save(_chat_id, _message_id, update, **kwargs):
+        stored.update(copy.deepcopy(update))
+        return stored
+
+    async def execute(*args, **kwargs):
+        return {'tool_call_id': 'call', 'content': 'RESULT'}
+
+    async def build(*args, **kwargs):
+        ctx = await real_build(*args, **kwargs)
+        captured['ctx'] = ctx
+        return ctx
+
+    for name in (
+        'is_chat_owner',
+        'update_chat_by_id',
+        'update_chat_variables_by_id',
+        'get_chat_by_id',
+        'get_chat_folder_id',
+    ):
+        monkeypatch.setattr(main.Chats, name, noop)
+    monkeypatch.setattr(main.Chats, 'get_message_by_id_and_message_id', get_message)
+    monkeypatch.setattr(main.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+    monkeypatch.setattr(main, 'build_chat_response_context', build)
+    monkeypatch.setattr(middleware, 'get_event_emitter', noop)
+    monkeypatch.setattr(middleware, 'get_event_call', noop)
+    _run_chat_completion(
+        request,
+        user,
+        _base_form_data(
+            'model',
+            [{'model_id': 'model', 'message_id': 'm1'}],
+            chat_id='saved' if saved else 'local:unit',
+            assistant_message_id='m1',
+            messages=[{'role': 'user', 'content': 'start'}, original],
+        ),
+    )
+    preserved = captured['ctx']['assistant_message']['output']
+    assert preserved[0] == original['output'][0]
+    assert all('output' not in message for message in captured['m1']['messages'])
+    results = [item for item in preserved if item['type'] == 'function_call_output']
+    assert len(results) == int(saved)
+    if saved:
+        assert results[0]['output'][0]['text'] == 'RESULT'
 
 
 @pytest.mark.parametrize('kind', _TASK_LIMIT_KINDS)

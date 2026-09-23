@@ -23,7 +23,12 @@ from open_webui.models.config import Config
 from open_webui.utils.chat_id import is_saved_chat_id
 from open_webui.utils.externalized_refs import RefEntry, can_externalize_refs, make_ref_entry, project_tool_refs
 from open_webui.utils.json_codec import JSONCodec
-from open_webui.utils.misc import convert_output_to_messages, get_content_from_message, get_message_list
+from open_webui.utils.misc import (
+    convert_output_to_messages,
+    get_content_from_message,
+    get_message_list,
+    is_raster_image_content_type,
+)
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
     prompt_template,
@@ -60,6 +65,7 @@ _MEDIA_PART_TYPES = {'file', 'image', 'image_url', 'input_audio', 'input_file', 
 _BOUNDARY_KEY = '_open_webui_context_compaction_boundary'
 CONTEXT_COMPACTION_USAGE_ANCHOR_KEY = '_open_webui_context_compaction_usage_anchor'
 CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY = '_open_webui_context_compaction_transient'
+CONTEXT_COMPACTION_PREFIX_MARKER_KEY = '_open_webui_context_compaction_prefix'
 CONTEXT_COMPACTION_OUTPUT_TYPE = 'open_webui:context_compaction'
 _DEFAULT_EXCERPT_BYTES = 512
 _DEFAULT_EXCERPT_COUNT = 32
@@ -124,7 +130,7 @@ def _non_image_files(messages: list[dict]) -> list[dict]:
         for item in message.get('files') or []:
             if not isinstance(item, dict):
                 continue
-            if item.get('type') == 'image' or str(item.get('content_type') or '').startswith('image/'):
+            if item.get('type') == 'image' or is_raster_image_content_type(item.get('content_type')):
                 continue
             file_id = item.get('id')
             if isinstance(file_id, str) and file_id:
@@ -894,8 +900,11 @@ def _without_boundary_marker(
     messages: list[dict],
     *,
     keep_transient: bool = False,
+    keep_prefix: bool = True,
 ) -> list[dict]:
     removed_keys = {_BOUNDARY_KEY, CONTEXT_COMPACTION_USAGE_ANCHOR_KEY}
+    if not keep_prefix:
+        removed_keys.add(CONTEXT_COMPACTION_PREFIX_MARKER_KEY)
     if not keep_transient:
         removed_keys.add(CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY)
     return [
@@ -908,7 +917,7 @@ def _without_boundary_marker(
 
 def strip_compaction_marker_keys(messages: list[dict]) -> list[dict]:
     """Drop compaction bookkeeping keys at provider dispatch."""
-    return _without_boundary_marker(messages)
+    return _without_boundary_marker(messages, keep_prefix=False)
 
 
 async def _generate_checkpoint(
@@ -1986,7 +1995,10 @@ def apply_response_usage_to_context_usage(state: dict, usage: dict | None) -> di
 
 def _split_leading_system_messages(messages: list[dict]) -> tuple[list[dict], list[dict]]:
     boundary = 0
-    while boundary < len(messages) and messages[boundary].get('role') == 'system':
+    while boundary < len(messages) and (
+        messages[boundary].get('role') == 'system'
+        or messages[boundary].get(CONTEXT_COMPACTION_PREFIX_MARKER_KEY) is True
+    ):
         boundary += 1
     return messages[:boundary], messages[boundary:]
 

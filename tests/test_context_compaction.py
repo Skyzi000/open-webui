@@ -6426,6 +6426,7 @@ def test_first_send_dedupes_against_branch_and_continues_existing_output(monkeyp
     }
     ctx2 = _adoption_stream_ctx(tools2, metadata2, state=state2)
     ctx2['event_emitter'] = current2['emitter']
+    ctx2['assistant_message'] = asyncio.run(middleware.Chats.get_message_by_id_and_message_id('chat', 'assistant'))
 
     asyncio.run(middleware.streaming_chat_response_handler(current2['text_response']('more'), ctx2))
 
@@ -6548,6 +6549,7 @@ def test_content_only_continuation_places_adoption_after_previous_text(monkeypat
     }
     ctx = _adoption_stream_ctx(tools, metadata, state=state)
     ctx['event_emitter'] = current['emitter']
+    ctx['assistant_message'] = asyncio.run(middleware.Chats.get_message_by_id_and_message_id('chat', 'assistant'))
 
     asyncio.run(middleware.streaming_chat_response_handler(current['text_response']('MORE'), ctx))
 
@@ -7372,6 +7374,18 @@ class _RecordingRedis:
     def __init__(self):
         self.entries = {}
         self.writes = []
+        self.exists_count = 0
+
+    def pipeline(self, transaction=False):
+        self.exists_count = 0
+        return self
+
+    def exists(self, key):
+        self.exists_count += 1
+        return self
+
+    async def execute(self):
+        return [True] * self.exists_count
 
     async def hset(self, key, field, value):
         self.entries[(key, field)] = value
@@ -8104,3 +8118,139 @@ def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path)
             await engine.dispose()
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize('code_interpreter', [False, True])
+@pytest.mark.parametrize('old_text', ['OLD', ''])
+def test_continue_compaction_keeps_joined_text_outside_checkpoint(monkeypatch, code_interpreter, old_text):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    previous = {
+        'id': 'assistant',
+        'role': 'assistant',
+        'content': old_text,
+        'output': [
+            {
+                'id': 'old',
+                'type': 'message',
+                'role': 'assistant',
+                'status': 'completed',
+                'content': [{'type': 'output_text', 'text': old_text}],
+            }
+        ],
+    }
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=['S'], existing_message=previous)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'assistant_message_id': 'assistant',
+        'params': {'tool_approval_mode': 'full', 'function_calling': 'legacy' if code_interpreter else 'native'},
+        'tools': tools,
+        'features': {'code_interpreter': code_interpreter},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['assistant_message'] = copy.deepcopy(previous)
+    ctx['event_emitter'] = current['emitter']
+    if old_text:
+        ctx['form_data']['messages'].append({'role': 'assistant', 'content': old_text})
+    current['replies'] = [current['text_response']('DONE')]
+    summarized = []
+
+    async def config_get(key, default=None):
+        return True if key == 'code_interpreter.enable' else default
+
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+
+    async def summarize(_request, _user, _model_id, _models, compacted, recent, *args, **kwargs):
+        summarized.append((copy.deepcopy(compacted), copy.deepcopy(recent)))
+        return 'S'
+
+    monkeypatch.setattr(compaction, '_generate_summary', summarize)
+
+    async def chunks():
+        # The provider's stop sequence excludes the closing code tag.
+        text = 'NEW<code_interpreter type="code">print(1)' if code_interpreter else 'NEW'
+        yield f'data: {json.dumps({"choices": [{"delta": {"content": text}}]})}\n\n'.encode()
+        if not code_interpreter:
+            async for chunk in current['tool_response']('call-a', 'view_file').body_iterator:
+                yield chunk
+        else:
+            yield b'data: [DONE]\n\n'
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
+    )
+    assert len(summarized) == 1
+    assert [item.get('content') for item in summarized[0][0]] == ['start']
+    assert summarized[0][1][0]['content'].startswith(old_text or 'NEW')
+    assert len(current['sent']) == 1
+    assert not any(event.get('type') == 'chat:message:error' for event in current['emitted'])
+    final_output = current['saved'][-1]['output']
+    assert final_output[0]['id'] == 'old'
+    assert final_output[0]['contextSummary'] == 'S'
+    assert ''.join(part['text'] for part in final_output[0]['content']) == old_text + 'NEW'
+    replay = compaction._messages_from_checkpoint([{'role': 'assistant', 'output': final_output}], 0, 0)
+    assert replay[0]['output'][0] == final_output[0]
+
+
+def test_terminal_instructions_survive_compaction_and_count_towards_budget(monkeypatch):
+    terminals = importlib.import_module('open_webui.utils.terminals')
+    measured, summarized = [], []
+    instructions = '# AGENTS.md\n\nKeep these instructions verbatim.'
+    messages = terminals.add_terminal_agents_md(
+        [
+            {'role': 'system', 'content': 'SYSTEM'},
+            {'role': 'user', 'content': 'old request'},
+            {'role': 'assistant', 'content': 'old answer'},
+            {'role': 'user', 'content': 'new request'},
+        ],
+        instructions,
+    )
+
+    def estimate(body, **kwargs):
+        measured.append(copy.deepcopy(body['messages']))
+        return (
+            20 if any(str(m.get('content')).startswith('<auto_compaction_context>') for m in body['messages']) else 120
+        )
+
+    async def summarize(_request, _user, _model_id, _models, compacted, recent, *args, **kwargs):
+        summarized.append(copy.deepcopy(compacted))
+        return 'S'
+
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    monkeypatch.setattr(compaction, '_generate_summary', summarize)
+    state = {'config': _compaction_config(soft_trigger_ratio=0)}
+    body = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {},
+            'model',
+            {},
+            state,
+        )
+    )
+    assert body['messages'][:2] == messages[:2]
+    assert all(any(m.get('content') == instructions for m in candidate) for candidate in measured)
+    assert all(m.get('content') != instructions for prefix in summarized for m in prefix)
+    # Early no-compaction passes must not discard the marker needed by later passes.
+    body = asyncio.run(compaction.compact_provider_payload(None, None, body, {}, 'model', {}, state))
+    assert body['messages'][1][compaction.CONTEXT_COMPACTION_PREFIX_MARKER_KEY] is True
+    stripped = compaction.strip_compaction_marker_keys(body['messages'])
+    assert stripped[1] == {'role': 'user', 'content': instructions}
+    assert compaction.estimate_body_tokens({'messages': [stripped[1]]}) > 0
+    transient = {'role': 'user', 'content': 'RAG', compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY: True}
+    assert compaction._split_leading_system_messages([transient]) == ([], [transient])
+
+
+def test_svg_attachments_remain_text_files_for_compaction():
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    svg = {'id': 'svg', 'content_type': 'image/svg+xml', 'url': '/svg'}
+    png = {'id': 'png', 'content_type': 'image/png', 'url': '/png'}
+    message = {'role': 'user', 'content': 'files', 'files': [svg, png]}
+    assert compaction._non_image_files([message]) == [svg]
+    projected = middleware.inject_message_file_images([message])[0]
+    assert projected['content'] == [
+        {'type': 'text', 'text': 'files'},
+        {'type': 'image_url', 'image_url': {'url': '/png'}},
+    ]
