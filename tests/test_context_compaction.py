@@ -2990,6 +2990,223 @@ def test_boundary_compact_pins_summary_identity(monkeypatch):
     assert _summary_content_of(compacted['messages']) is state['summary_message_content']
 
 
+def test_transient_sends_largest_compaction_when_estimate_stays_over_threshold(monkeypatch):
+    compacted_ranges = []
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted_messages, *_args, **_kwargs):
+        compacted_ranges.append([message['content'] for message in compacted_messages])
+        return f'SUMMARY-{len(compacted_ranges)}'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'assistant', 'content': 'a1'},
+        {'role': 'user', 'content': 'q2'},
+        {'role': 'assistant', 'content': 'a2'},
+        {'role': 'user', 'content': 'q3'},
+    ]
+    state = {'config': _compaction_config()}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert compacted_ranges == [['q1', 'a1'], ['q1', 'a1', 'q2', 'a2']]
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
+    assert 'SUMMARY-2' in state['summary_message_content']
+    assert compacted['messages'][1:] == [{'role': 'user', 'content': 'q3'}]
+    assert state['pending_context_usage']['tokens'] == 120
+
+
+def test_transient_keeps_existing_summary_when_nothing_new_to_compact(monkeypatch):
+    async def generate_summary(*_args, **_kwargs):
+        raise AssertionError('the existing summary alone must not be summarized again')
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    summary_message = compaction.render_summary_message('EXISTING', {})
+    tails = [
+        [{'role': 'user', 'content': 'large question'}],
+        [
+            {'role': 'user', 'content': 'large question'},
+            {
+                'role': 'assistant',
+                'content': '',
+                'tool_calls': [{'id': 't1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}],
+            },
+            {'role': 'tool', 'tool_call_id': 't1', 'content': 'result'},
+        ],
+    ]
+    for tail in tails:
+        body = {'messages': [{'role': 'system', 'content': 'policy'}, summary_message, *tail]}
+        state = {
+            'config': _compaction_config(),
+            'previous_summary': 'EXISTING',
+            'previous_summary_meta': {},
+        }
+
+        result = asyncio.run(
+            compaction.compact_transient_provider_payload(
+                None,
+                None,
+                body,
+                {'chat_id': 'local:unit'},
+                'model',
+                {},
+                state,
+            )
+        )
+
+        assert result is body
+
+
+def test_transient_stops_when_uncompacted_history_has_no_safe_cut(monkeypatch):
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'system', 'content': 'mid-conversation instruction'},
+        {'role': 'assistant', 'content': 'a1'},
+        {'role': 'user', 'content': 'q2'},
+    ]
+
+    with pytest.raises(RuntimeError, match='no complete earlier user turn'):
+        asyncio.run(
+            compaction.compact_transient_provider_payload(
+                None,
+                None,
+                {'messages': messages},
+                {'chat_id': 'local:unit'},
+                'model',
+                {},
+                {'config': _compaction_config()},
+            )
+        )
+
+
+def test_nested_compact_sends_candidate_when_estimate_stays_over_threshold(monkeypatch):
+    socket_main = importlib.import_module('open_webui.socket.main')
+    saved = []
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'FOLDED'
+
+    async def save(_chat_id, message_id, update, **_kwargs):
+        saved.append((message_id, update['output'][0]['contextSummary']))
+        return update
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    monkeypatch.setattr(compaction.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
+
+    carrier = {'type': 'function_call', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}'}
+    output = [carrier]
+    messages = [
+        {'id': 'user', 'role': 'user', 'content': 'start'},
+        {'id': 'assistant', 'role': 'assistant', 'content': '', 'output': output},
+        {'id': 'user2', 'role': 'user', 'content': 'follow-up'},
+    ]
+    state = {'config': _compaction_config()}
+
+    candidate = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'chat', 'message_id': 'assistant'},
+            'model',
+            {},
+            state,
+            checkpoint_output=output,
+            checkpoint_carrier=carrier,
+            checkpoint_message_start=1,
+        )
+    )
+
+    assert _summary_content_of(candidate['messages']) is state['summary_message_content']
+    assert candidate['messages'][1:] == messages[1:]
+    assert saved == [('assistant', 'FOLDED')]
+
+
+def test_compact_provider_saves_largest_checkpoint_when_estimate_stays_over_threshold(monkeypatch):
+    history = [
+        {'id': 'u1', 'role': 'user', 'content': 'q1'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'a1'},
+        {'id': 'u2', 'role': 'user', 'content': 'q2', compaction._BOUNDARY_KEY: True},
+        {'id': 'a2', 'role': 'assistant', 'content': 'a2'},
+        {'id': 'u3', 'role': 'user', 'content': 'q3'},
+    ]
+    saved = []
+
+    async def generate_checkpoint(*args, checkpoint_history=None, **_kwargs):
+        compacted_messages = args[7]
+        return f'SUM-{len(compacted_messages)}', {}, checkpoint_history, history[checkpoint_history[1]]['id']
+
+    async def save_checkpoint(chat_id, message_id, summary):
+        saved.append((chat_id, message_id, summary))
+
+    monkeypatch.setattr(compaction, '_generate_checkpoint', generate_checkpoint)
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    state = {
+        'active_offset': 0,
+        'checkpoint_messages': history,
+        'checkpoint_history': (history, 2),
+        'config': _compaction_config(),
+    }
+
+    compacted = asyncio.run(
+        compaction.compact_provider_payload(
+            None, None, {'messages': copy.deepcopy(history)}, {'chat_id': 'chat'}, 'model', {}, state
+        )
+    )
+
+    assert compacted['messages'][0]['content'] is state['summary_message_content']
+    assert 'SUM-4' in state['summary_message_content']
+    assert compacted['messages'][1:] == [{'id': 'u3', 'role': 'user', 'content': 'q3'}]
+    assert saved == [('chat', 'u3', 'SUM-4')]
+    assert state['checkpoint_history'] == (history, 4)
+    assert state['pending_context_usage']['tokens'] == 120
+
+
+def test_compact_provider_keeps_existing_summary_when_nothing_new_to_compact(monkeypatch):
+    history = [
+        {'id': 'u1', 'role': 'user', 'content': 'q1'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'a1'},
+        {'id': 'u2', 'role': 'user', 'content': 'large question'},
+    ]
+
+    async def generate_checkpoint(*_args, **_kwargs):
+        raise AssertionError('the existing summary alone must not be summarized again')
+
+    monkeypatch.setattr(compaction, '_generate_checkpoint', generate_checkpoint)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    body = {'messages': [compaction.render_summary_message('EXISTING', {}), copy.deepcopy(history[2])]}
+    state = {
+        'active_offset': 2,
+        'checkpoint_messages': history,
+        'previous_summary': 'EXISTING',
+        'previous_summary_meta': {},
+        'config': _compaction_config(),
+    }
+
+    result = asyncio.run(compaction.compact_provider_payload(None, None, body, {'chat_id': 'chat'}, 'model', {}, state))
+
+    assert result['messages'] == body['messages']
+
+
 def test_stateful_continuation_sends_only_current_output():
     middleware = importlib.import_module('open_webui.utils.middleware')
     body = {
@@ -3660,20 +3877,27 @@ def test_projected_view_prevents_false_context_limit(monkeypatch):
     )
 
     assert result is body
+    assert state['pending_context_usage']['tokens'] <= 100
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(
-            compaction.compact_transient_provider_payload(
-                None,
-                None,
-                {'messages': copy.deepcopy(messages)},
-                {},
-                'model',
-                {},
-                {'config': dict(state['config'])},
-                projected_messages=None,
-            )
+    # Without the projection the raw tool text crosses the threshold, but the
+    # first turn has nothing to compact, so the request is still sent.
+    raw_body = {'messages': copy.deepcopy(messages)}
+    raw_state = {'config': dict(state['config'])}
+    raw_result = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            raw_body,
+            {},
+            'model',
+            {},
+            raw_state,
+            projected_messages=None,
         )
+    )
+
+    assert raw_result is raw_body
+    assert raw_state['pending_context_usage']['tokens'] > 100
 
 
 def test_round0_non_native_disables_continuation_capture():
@@ -6561,6 +6785,89 @@ def test_content_only_continuation_places_adoption_after_previous_text(monkeypat
     ]
     assert final['output'][0]['content'][0]['text'] == 'OLD'
     assert final['output'][2]['content'][0]['text'] == 'MORE'
+
+
+def test_continue_keeps_existing_summary_when_nested_prefix_has_nothing_new(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    old = {
+        'id': 'assistant',
+        'role': 'assistant',
+        'content': 'OLD',
+        'contextSummary': 'EXISTING',
+        'output': [
+            _adoption_item('EXISTING', 'cc_existing'),
+            {
+                'id': 'old_text',
+                'type': 'message',
+                'role': 'assistant',
+                'status': 'completed',
+                'content': [{'type': 'output_text', 'text': 'OLD'}],
+            },
+        ],
+    }
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[], existing_message=old)
+    current['replies'] = [current['text_response']('DONE')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'assistant_message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    generated = []
+
+    async def config():
+        return _compaction_config()
+
+    async def generate_summary(*args, **_kwargs):
+        generated.append(args[4])
+        return 'REGENERATED'
+
+    monkeypatch.setattr(compaction, '_load_config', config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+
+    async def run():
+        prepared, state = await compaction.prepare_compaction_messages(
+            [{'id': 'user', 'role': 'user', 'content': 'start'}, copy.deepcopy(old)], metadata
+        )
+        state['externalized_refs'] = {'enable': False}
+        ctx = _adoption_stream_ctx(tools, metadata, state=state)
+        ctx['form_data']['messages'] = middleware.process_messages_with_output(prepared)
+        ctx['assistant_message'] = copy.deepcopy(old)
+        ctx['event_emitter'] = current['emitter']
+
+        async def chunks():
+            for delta, finish in [
+                ({'content': 'MORE'}, None),
+                (
+                    {
+                        'tool_calls': [
+                            {
+                                'index': 0,
+                                'id': 'call-a',
+                                'type': 'function',
+                                'function': {'name': 'view_file', 'arguments': '{}'},
+                            }
+                        ]
+                    },
+                    'tool_calls',
+                ),
+            ]:
+                payload = {'choices': [{'delta': delta, 'finish_reason': finish}]}
+                yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        await middleware.streaming_chat_response_handler(
+            StreamingResponse(chunks(), media_type='text/event-stream'), ctx
+        )
+
+    asyncio.run(run())
+
+    assert generated == []
+    assert len(current['sent']) == 1
+    assert 'EXISTING' in current['sent'][0]['messages'][0]['content']
 
 
 def test_approval_pause_records_no_continuation_adoption(monkeypatch):

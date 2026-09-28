@@ -644,6 +644,13 @@ def _drop_rendered_summary_once(
     return messages
 
 
+def _has_new_compaction_content(messages: list[dict], state: dict) -> bool:
+    """False when the range holds only the carried summary, so summarizing it again adds nothing."""
+    return bool(
+        _drop_rendered_summary_once(messages, state.get('previous_summary'), state.get('previous_summary_meta'))
+    )
+
+
 def _summary_provider_messages(messages: list[dict]) -> list[dict]:
     return [{key: message[key] for key in _SUMMARY_MESSAGE_KEYS if key in message} for message in messages]
 
@@ -1170,6 +1177,14 @@ async def compact_provider_payload(
         if not largest or _checkpoint_for_boundary(state, working, largest) is None:
             return {**body, 'messages': _without_boundary_marker(messages)}
         boundary = largest
+    boundaries = [boundary]
+    if largest > boundary and _checkpoint_for_boundary(state, working, largest) is not None:
+        boundaries.append(largest)
+    boundaries = [
+        candidate for candidate in boundaries if _has_new_compaction_content(projected_working[:candidate], state)
+    ]
+    if not boundaries:
+        return {**body, 'messages': _without_boundary_marker(messages)}
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
         from open_webui.socket.main import get_event_emitter
@@ -1177,10 +1192,6 @@ async def compact_provider_payload(
         event_emitter = await get_event_emitter(metadata)
     await _emit_compaction_status(event_emitter, 'Compacting context', False)
     try:
-        boundaries = [boundary]
-        if largest > boundary and _checkpoint_for_boundary(state, working, largest) is not None:
-            boundaries.append(largest)
-
         compacted_body = None
         summary = None
         summary_meta = None
@@ -1240,15 +1251,14 @@ async def compact_provider_payload(
                 ],
             }
             after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
+            # The threshold only triggers compaction; when no candidate fits,
+            # the largest one is still sent rather than refusing the request.
+            selected_checkpoint = checkpoint
             if after <= threshold:
-                selected_checkpoint = checkpoint
                 break
-            compacted_body = None
 
-        if compacted_body is None or summary is None or summary_meta is None:
-            raise RuntimeError(
-                'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
-            )
+        if compacted_body is None:
+            raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
         if not checkpoint_already_saved:
             await _save_checkpoint(metadata['chat_id'], checkpoint_message_id, summary)
         state.update(
@@ -1411,6 +1421,8 @@ async def compact_transient_provider_payload(
         projected_recent = _without_boundary_marker(
             projected_working[working_start:], keep_transient=True
         )
+        if not _has_new_compaction_content(projected_compacted, state):
+            return body
         event_emitter = None
         if metadata.get('chat_id') and metadata.get('message_id'):
             from open_webui.socket.main import get_event_emitter
@@ -1461,11 +1473,6 @@ async def compact_transient_provider_payload(
                 ],
             }
             after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
-            if after > threshold:
-                raise RuntimeError(
-                    'Context limit remains exceeded after preserving the latest completed tool round; '
-                    'reduce the active input and retry'
-                )
             await _save_nested_checkpoint(
                 metadata['chat_id'],
                 metadata['message_id'],
@@ -1514,10 +1521,29 @@ async def compact_transient_provider_payload(
     if not boundary:
         boundary = largest
     if not boundary:
-        raise RuntimeError(
-            'Context limit reached, but no complete earlier user turn can be compacted; provider request was not sent'
+        latest_user = next(
+            (
+                index
+                for index in range(len(projected_working) - 1, -1, -1)
+                if projected_working[index].get('role') == 'user'
+                and not _is_transient_message(projected_working[index], config['transient_patterns'])
+            ),
+            0,
         )
-    boundaries = [boundary, *([largest] if largest > boundary else [])]
+        # The latest turn is the active input; only earlier history that cannot be cut blocks the send.
+        if _has_new_compaction_content(projected_working[:latest_user], state):
+            raise RuntimeError(
+                'Context limit reached, but no complete earlier user turn can be compacted; '
+                'provider request was not sent'
+            )
+        return body
+    boundaries = [
+        candidate
+        for candidate in (boundary, *([largest] if largest > boundary else []))
+        if _has_new_compaction_content(projected_working[:candidate], state)
+    ]
+    if not boundaries:
+        return body
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -1573,14 +1599,10 @@ async def compact_transient_provider_payload(
                 ],
             }
             after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
+            compacted_body = candidate
+            selected_after = after
             if after <= threshold:
-                compacted_body = candidate
-                selected_after = after
                 break
-        if compacted_body is None:
-            raise RuntimeError(
-                'Context limit remains exceeded after the largest safe compaction; reduce the active input and retry'
-            )
         ref_config = state.get('externalized_refs') or {}
         registry = ref_config.get('registry')
         history_entry = (
