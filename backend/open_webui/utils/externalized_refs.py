@@ -329,10 +329,17 @@ async def _capture_projections(
             else:
                 source_id = id(source)
                 if source_id not in classified_by_text_id:
+                    markers = _citation_marker_chars(
+                        source,
+                        threshold_tokens=threshold_tokens,
+                        count_tokens=count_tokens,
+                    )
+                    # A body past the byte cap is eligible whatever it holds, so only a shorter one is sliced off.
+                    short = len(source) - markers <= REF_EXEC_RESPONSE_MAX_BYTES
                     classified_by_text_id[source_id] = (
                         make_ref_entry(source, kind='tool')
                         if _is_externalization_eligible(
-                            source,
+                            source[markers:] if short else source,
                             threshold_tokens=threshold_tokens,
                             count_tokens=count_tokens,
                         )
@@ -1065,9 +1072,34 @@ def _preview_fits(
     return tokens is not None and tokens < threshold_tokens
 
 
-def _preview_at_retained(entry: RefEntry, retained_bytes: int) -> tuple[str | None, int, int]:
-    prefix_end, prefix_bytes = _utf8_prefix_end(entry.text, 0, retained_bytes // 2)
-    suffix_start = _utf8_suffix_start(entry, retained_bytes - prefix_bytes)
+def _citation_marker_chars(
+    text: str,
+    *,
+    threshold_tokens: int,
+    count_tokens: Callable[[str], int | None] | None,
+) -> int:
+    """Length of the citation markers Core prepended to a tool result.
+
+    The markers label the result rather than belong to it, so they stay whole and
+    outside the size budget: eligibility and the preview are judged on what follows.
+    A run that would not fit a preview of its own is ordinary text, which bounds
+    how much a result that merely starts like markers can keep raw.
+    """
+
+    end = 0
+    while end <= REF_EXEC_RESPONSE_MAX_BYTES and text.startswith('<source id="', end):
+        line_end = text.find('\n', end)
+        if line_end < 0 or not text.endswith('></source>', end, line_end):
+            break
+        end = line_end + 1
+    if not 0 < end <= REF_EXEC_RESPONSE_MAX_BYTES:
+        return 0
+    return end if _preview_fits(text[:end], threshold_tokens=threshold_tokens, count_tokens=count_tokens) else 0
+
+
+def _preview_at_retained(entry: RefEntry, retained_bytes: int, pinned_bytes: int) -> tuple[str | None, int, int]:
+    prefix_end, prefix_bytes = _utf8_prefix_end(entry.text, 0, pinned_bytes + retained_bytes // 2)
+    suffix_start = _utf8_suffix_start(entry, pinned_bytes + retained_bytes - prefix_bytes)
     return _preview_at(entry, prefix_end, suffix_start), prefix_end, suffix_start
 
 
@@ -1076,19 +1108,13 @@ def _polish_preview(
     best: str,
     prefix_end: int,
     suffix_start: int,
-    *,
-    threshold_tokens: int,
-    count_tokens: Callable[[str], int | None] | None,
+    fits: Callable[[str], bool],
 ) -> str:
     for _ in range(_PREVIEW_POLISH_MAX_ROUNDS):
         grew = False
         for ends in ((prefix_end + 1, suffix_start), (prefix_end, suffix_start - 1)):
             candidate = _preview_at(entry, *ends)
-            if candidate is not None and _preview_fits(
-                candidate,
-                threshold_tokens=threshold_tokens,
-                count_tokens=count_tokens,
-            ):
+            if candidate is not None and fits(candidate):
                 best, (prefix_end, suffix_start) = candidate, ends
                 grew = True
         if not grew:
@@ -1115,22 +1141,25 @@ def _render_ref_preview(
     if entry.utf8_bytes < 2:
         return None
 
+    pinned_chars = _citation_marker_chars(entry.text, threshold_tokens=threshold_tokens, count_tokens=count_tokens)
+    pinned_bytes = len(entry.text[:pinned_chars].encode('utf-8'))
+
     def fits(candidate: str) -> bool:
-        return _preview_fits(candidate, threshold_tokens=threshold_tokens, count_tokens=count_tokens)
+        return _preview_fits(candidate[pinned_chars:], threshold_tokens=threshold_tokens, count_tokens=count_tokens)
 
     # The marker varies only with the digit counts of N and M, both bounded by
     # the source size, so this overhead is an upper bound for every candidate.
     marker_overhead = len(
         _truncated_marker(f'tail -c +{entry.utf8_bytes + 1} {entry.ref} | head -c {entry.utf8_bytes}')
     ) + 1
-    high = min(entry.utf8_bytes - 1, REF_EXEC_RESPONSE_MAX_BYTES - marker_overhead)
+    high = min(entry.utf8_bytes - pinned_bytes - 1, REF_EXEC_RESPONSE_MAX_BYTES - marker_overhead)
     best: str | None = None
     best_prefix_end = 0
     best_suffix_start = len(entry.text)
     low = 0
     while low <= high:
         retained = (low + high) // 2
-        candidate, prefix_end, suffix_start = _preview_at_retained(entry, retained)
+        candidate, prefix_end, suffix_start = _preview_at_retained(entry, retained, pinned_bytes)
         if candidate is not None and fits(candidate):
             best, best_prefix_end, best_suffix_start = candidate, prefix_end, suffix_start
             low = retained + 1
@@ -1138,14 +1167,7 @@ def _render_ref_preview(
             high = retained - 1
     if best is None:
         return None
-    return _polish_preview(
-        entry,
-        best,
-        best_prefix_end,
-        best_suffix_start,
-        threshold_tokens=threshold_tokens,
-        count_tokens=count_tokens,
-    )
+    return _polish_preview(entry, best, best_prefix_end, best_suffix_start, fits)
 
 
 def _byte_range_marker(

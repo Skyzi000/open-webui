@@ -1137,6 +1137,96 @@ async def test_preview_uses_95_percent_of_the_real_token_budget():
     assert TOKEN_THRESHOLD * 0.95 <= tokens < TOKEN_THRESHOLD
 
 
+def _citation_markers(count: int) -> str:
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    return middleware.get_source_context(
+        [
+            {
+                'source': {
+                    'id': f'file-{index}',
+                    'name': f'第{index}四半期事業報告書_最終確定版.pdf',
+                    'type': 'file',
+                },
+                'document': [''],
+                'metadata': [{'source': f'file-{index}'}],
+            }
+            for index in range(count)
+        ],
+        {},
+        include_content=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'result',
+    [
+        'Realistic english sentences with several words each.\n' * 700,
+        '日本語の長いテキスト行を含む結果。\n' * 1200,
+    ],
+)
+async def test_citation_markers_stay_whole_without_shrinking_the_preview(result):
+    markers = _citation_markers(12)
+    body, registry, reader, ref = await _project(markers + result)
+
+    content = body['messages'][1]['content']
+    assert content.startswith(markers)
+    # The markers are not the tool's output, so its preview is as large as it is without them.
+    tokens = compaction.estimate_text_tokens(content[len(markers) :])
+    assert TOKEN_THRESHOLD * 0.95 <= tokens < TOKEN_THRESHOLD
+    prefix, command, suffix = _preview_parts(content)
+    middle, _pages = await _read_pages(reader, command)
+    assert prefix + middle + suffix == markers + result
+
+
+@pytest.mark.asyncio
+async def test_citation_markers_neither_trigger_nor_escape_externalization():
+    def count_tokens(text):
+        return len(text) // 4
+
+    async def project(source):
+        projected = await refs.project_tool_refs(
+            _body(source)['messages'],
+            threshold_tokens=1000,
+            count_tokens=count_tokens,
+        )
+        return projected[1]['content']
+
+    markers = _citation_markers(3)
+    assert await project(markers + 'x' * 3996) == markers + 'x' * 3996
+    assert (await project(markers + 'x' * 4000)).startswith(markers + 'x')
+
+    # A run too large for a preview of its own is ordinary text, so a result that
+    # merely starts like markers cannot keep an unbounded head raw.
+    oversized = _citation_markers(200)
+    content = await project(oversized + 'x')
+    assert '<auto_compact_ref_truncated>' in content
+    assert count_tokens(content) < 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('wrap', ['{}', '<source id="9" name="{}"></source>\n'])
+async def test_citation_markers_never_copy_a_giant_result(wrap):
+    size = 4 * 1024 * 1024
+    messages = _body(_citation_markers(3) + wrap.format('a' * size))['messages']
+
+    async def project():
+        return await refs.project_tool_refs(
+            messages,
+            threshold_tokens=TOKEN_THRESHOLD,
+            count_tokens=compaction.estimate_text_tokens,
+        )
+
+    await project()
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    projected = await project()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert '<auto_compact_ref_truncated>' in projected[1]['content']
+    assert peak < size // 4, peak
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     'source',

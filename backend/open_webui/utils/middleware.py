@@ -309,6 +309,7 @@ async def _function_call_output(request, result: dict, metadata: dict, user) -> 
         'call_id': result.get('tool_call_id', ''),
         'output': parts,
         'status': status,
+        **({'source_context': result['source_context']} if result.get('source_context') else {}),
         **({'files': display_files} if display_files else {}),
         **({'embeds': result.get('embeds')} if result.get('embeds') else {}),
     }
@@ -1024,6 +1025,7 @@ async def apply_source_context_to_messages(
     sources: list,
     user_message: str,
     include_content: bool = True,
+    source_ids: dict | None = None,
 ) -> list:
     """
     Build source context from citation sources and apply to messages.
@@ -1036,7 +1038,7 @@ async def apply_source_context_to_messages(
     if not sources or not user_message:
         return messages
 
-    context = get_source_context(sources, include_content=include_content)
+    context = get_source_context(sources, source_ids, include_content=include_content)
 
     context = context.strip()
     if not context:
@@ -2953,6 +2955,7 @@ async def process_chat_payload(
     chat_id = metadata.get('chat_id')
     user_message_id = metadata.get('user_message_id')
     compaction_state: dict = {'config': {'enable': False}}
+    stored_sources = []
 
     if is_saved_chat_id(chat_id) and user_message_id:
         db_messages = await load_messages_from_db(chat_id, user_message_id)
@@ -2962,6 +2965,7 @@ async def process_chat_payload(
             assistant_message_id = metadata.get('assistant_message_id')
             if assistant_message_id:
                 assistant_message = await Chats.get_message_by_id_and_message_id(chat_id, assistant_message_id)
+                stored_sources = (assistant_message or {}).get('sources') or []
                 if assistant_message and (assistant_message.get('content') or assistant_message.get('output')):
                     db_messages.append({k: v for k, v in assistant_message.items() if k in MESSAGE_REPLAY_KEYS})
 
@@ -3757,7 +3761,11 @@ async def process_chat_payload(
         )
     metadata['system_prompt'] = system_content or None
     metadata['user_prompt'] = get_last_persistent_user_message(form_data['messages'], transient_patterns)
-    metadata['sources'] = sources[:] if sources else []
+    # Continue keeps the message's stored sources, as the frontend does, so [N] has to index into
+    # that list: this run's sources are numbered after it and the ones it lacks are appended to it.
+    source_ids = {}
+    get_source_context(stored_sources, source_ids, include_content=False)
+    metadata['sources'] = [*stored_sources, *sources]
 
     if system_content:
         if get_system_message(form_data['messages']):
@@ -3767,7 +3775,9 @@ async def process_chat_payload(
 
     # If context is not empty, insert it into the messages
     if sources and prompt:
-        form_data['messages'] = await apply_source_context_to_messages(request, form_data['messages'], sources, prompt)
+        form_data['messages'] = await apply_source_context_to_messages(
+            request, form_data['messages'], sources, prompt, source_ids=source_ids
+        )
 
     # If there are citations, add them to the data_items
     sources = [
@@ -3776,7 +3786,11 @@ async def process_chat_payload(
         if source.get('source', {}).get('name', '') or source.get('source', {}).get('id', '')
     ]
 
-    if len(sources) > 0:
+    if stored_sources:
+        for source in sources:
+            if source not in stored_sources:
+                await event_emitter({'type': 'source', 'data': source})
+    elif len(sources) > 0:
         events.append({'sources': sources})
 
     if model_knowledge:
@@ -6612,24 +6626,17 @@ async def streaming_chat_response_handler(response, ctx):
                     CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS,
                 )
                 tool_call_sources = []  # Track citation sources from tool results
-                all_tool_call_sources = []  # Accumulated sources across all iterations
                 continuation_body = ctx['compaction_state']['canonical_body']
-                user_message = metadata.get('user_prompt') or get_last_user_message(continuation_body['messages'])
 
                 # Check if citations are enabled for this model
                 citations_enabled = (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get(
                     'citations', True
                 )
-
-                # Use the pre-RAG system content captured before the
-                # initial file-source injection in process_chat_payload.
-                # This ensures restore truly undoes the RAG template.
-                original_system_content = metadata.get('system_prompt')
-                if original_system_content is None:
-                    original_system_message = get_system_message(continuation_body['messages'])
-                    original_system_content = (
-                        get_content_from_message(original_system_message) if original_system_message else None
-                    )
+                # Core re-renders tool citation markers into the prompt every round, rewriting sent bytes.
+                # Ids are frozen in the same file-then-tool order instead, and each tool result carries its own.
+                citation_source_ids = {}
+                if citations_enabled:
+                    get_source_context(metadata.get('sources', []), citation_source_ids, include_content=False)
 
                 async def emit_output():
                     # Channels publish whole messages; Continue can merge into the preceding item.
@@ -6881,6 +6888,7 @@ async def streaming_chat_response_handler(response, ctx):
                         )
 
                         # Extract citation sources from tool results
+                        source_context = ''
                         if (
                             citations_enabled
                             and tool_function_name
@@ -6901,6 +6909,14 @@ async def streaming_chat_response_handler(response, ctx):
                                     tool_id=tool.get('tool_id', '') if tool else '',
                                 )
                                 tool_call_sources.extend(citation_sources)
+                                # Chunks of one file render identical tags; this result only needs each once.
+                                source_context = ''.join(
+                                    dict.fromkeys(
+                                        get_source_context(
+                                            citation_sources, citation_source_ids, include_content=False
+                                        ).splitlines(keepends=True)
+                                    )
+                                )
                             except Exception as e:
                                 log.exception(f'Error extracting citation source: {e}')
 
@@ -6908,6 +6924,7 @@ async def streaming_chat_response_handler(response, ctx):
                             {
                                 'tool_call_id': tool_call_id,
                                 'content': tool_result_content(tool_result),
+                                **({'source_context': source_context} if source_context else {}),
                                 **({'files': tool_result_files} if tool_result_files else {}),
                                 **({'embeds': tool_result_embeds} if tool_result_embeds else {}),
                             }
@@ -6932,78 +6949,6 @@ async def streaming_chat_response_handler(response, ctx):
                     if citations_enabled:
                         for source in tool_call_sources:
                             await event_emitter({'type': 'source', 'data': source})
-
-                        # Apply tool source context to messages for the model.
-                        # Restoring to pre-RAG original prevents duplicating
-                        # the RAG template across file and tool sources.
-                        all_tool_call_sources.extend(tool_call_sources)
-                        if all_tool_call_sources and user_message:
-                            # Restore pre-RAG message state before re-applying
-                            # to prevent RAG template duplication.
-                            original_user_message = metadata.get('user_prompt') or user_message
-                            last_user_message = get_last_user_message_item(continuation_body['messages'])
-                            last_user_content = (last_user_message or {}).get('content')
-                            last_user_is_summary = (
-                                isinstance(last_user_content, str)
-                                and last_user_content.startswith('<auto_compaction_context>')
-                                and last_user_content.endswith('</auto_compaction_context>')
-                            )
-                            if not last_user_is_summary:
-                                set_last_user_message_content(
-                                    original_user_message,
-                                    continuation_body['messages'],
-                                )
-                            if original_system_content is not None:
-                                if get_system_message(continuation_body['messages']):
-                                    replace_system_message_content(
-                                        original_system_content,
-                                        continuation_body['messages'],
-                                    )
-                                else:
-                                    continuation_body['messages'] = add_or_update_system_message(
-                                        original_system_content,
-                                        continuation_body['messages'],
-                                    )
-                            else:
-                                replace_system_message_content('', continuation_body['messages'])
-
-                            # Build context: file sources with content,
-                            # tool sources as citation markers only.
-                            source_ids = {}
-                            source_context = get_source_context(
-                                metadata.get('sources', []), source_ids
-                            ) + get_source_context(
-                                all_tool_call_sources,
-                                source_ids,
-                                include_content=False,
-                            )
-                            source_context = source_context.strip()
-                            if source_context:
-                                rag_content = await rag_template(
-                                    await Config.get('rag.template'),
-                                    source_context,
-                                    user_message,
-                                )
-                                if RAG_SYSTEM_CONTEXT:
-                                    continuation_body['messages'] = add_or_update_system_message(
-                                        rag_content,
-                                        continuation_body['messages'],
-                                        append=True,
-                                    )
-                                elif last_user_is_summary:
-                                    continuation_body['messages'].append(
-                                        {
-                                            'role': 'user',
-                                            'content': rag_content,
-                                            CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY: True,
-                                        }
-                                    )
-                                else:
-                                    continuation_body['messages'] = add_or_update_user_message(
-                                        rag_content,
-                                        continuation_body['messages'],
-                                        append=False,
-                                    )
                         tool_call_sources.clear()
 
                     await emit_output()

@@ -337,6 +337,8 @@ async def fetch_url(
 ) -> str:
     """
     Fetch and extract the main text content from a web page URL.
+    If the result begins with <source id="N"> tags, cite facts from it inline as [N];
+    ids are only valid within the answer that retrieved them.
 
     :param url: The URL to fetch content from
     :return: The extracted text content from the page
@@ -2517,6 +2519,8 @@ async def query_chat_files(
     """
     Search files attached to the current chat using semantic/vector search.
     Pass file_id from the attached_files block to search one file, or omit it to search all attached chat files.
+    If the result begins with <source id="N"> tags, cite facts from it inline as [N];
+    ids are only valid within the answer that retrieved them.
 
     :param query: The search query to find semantically relevant content
     :param file_id: Optional attached file ID to search within a single file
@@ -2760,6 +2764,8 @@ async def view_file(
 ) -> str:
     """
     Get the content of a file by its ID. Supports pagination for large files.
+    If the result begins with <source id="N"> tags, cite facts from it inline as [N];
+    ids are only valid within the answer that retrieved them.
 
     :param file_id: The ID of the file to retrieve
     :param offset: Character offset to start reading from (default: 0)
@@ -2872,6 +2878,8 @@ async def view_knowledge_file(
 ) -> str:
     """
     Get the content of a file from a knowledge base. Supports pagination for large files.
+    If the result begins with <source id="N"> tags, cite facts from it inline as [N];
+    ids are only valid within the answer that retrieved them.
 
     :param file_id: The ID of the file to retrieve
     :param offset: Character offset to start reading from (default: 0)
@@ -3160,6 +3168,8 @@ async def query_knowledge_files(
     Search knowledge base files using semantic/vector search. Searches across collections (KBs),
     individual files, and notes that the user has access to.
     Helpful for internal documentation, uploaded knowledge, and attached model knowledge.
+    If the result begins with <source id="N"> tags, cite facts from it inline as [N];
+    ids are only valid within the answer that retrieved them.
 
     :param query: The search query to find semantically relevant content
     :param knowledge_ids: Optional list of KB ids to limit search to specific knowledge bases

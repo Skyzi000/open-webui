@@ -425,7 +425,8 @@ def convert_output_to_messages(
         flush_pending()
         for output_item in pending_tool_outputs:
             output_parts = output_item.get('output', [])
-            content = ''
+            # Citation markers ride with their own result so earlier messages are never rewritten.
+            content = output_item.get('source_context', '')
             image_urls = []
             for part in output_parts:
                 if part.get('type') == 'input_text':
