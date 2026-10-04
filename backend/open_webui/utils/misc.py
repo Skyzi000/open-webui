@@ -618,9 +618,9 @@ def get_last_assistant_message(messages: list[dict]) -> str | None:
 
 
 def get_system_message(messages: list[dict]) -> dict | None:
-    for message in messages:
-        if message['role'] == 'system':
-            return message
+    # Only the leading message is the system prompt; later system messages stay where they were placed.
+    if messages and messages[0].get('role') == 'system':
+        return messages[0]
     return None
 
 
@@ -676,10 +676,9 @@ def update_message_content(message: dict, content: str, append: bool = True) -> 
 
 
 def replace_system_message_content(content: str, messages: list[dict]) -> dict:
-    for message in messages:
-        if message['role'] == 'system':
-            message['content'] = content
-            break
+    system_message = get_system_message(messages)
+    if system_message is not None:
+        system_message['content'] = content
     return messages
 
 
@@ -702,18 +701,27 @@ def add_or_update_system_message(content: str, messages: list[dict], append: boo
     return messages
 
 
+def get_latest_turn_index(messages: list[dict]) -> int:
+    # System messages placed after the latest turn do not end it.
+    index = len(messages) - 1
+    while index >= 0 and messages[index].get('role') == 'system':
+        index -= 1
+    return index
+
+
 def add_or_update_user_message(content: str, messages: list[dict], append: bool = True):
     """
     Adds a new user message at the end of the messages list
-    or updates the existing user message at the end.
+    or updates the existing user message at the end, ignoring trailing system messages.
 
     :param msg: The message to be added or appended.
     :param messages: The list of message dictionaries.
     :return: The updated list of message dictionaries.
     """
 
-    if messages and messages[-1].get('role') == 'user':
-        messages[-1] = update_message_content(messages[-1], content, append)
+    index = get_latest_turn_index(messages)
+    if index >= 0 and messages[index].get('role') == 'user':
+        messages[index] = update_message_content(messages[index], content, append)
     else:
         # Insert at the end
         messages.append({'role': 'user', 'content': content})

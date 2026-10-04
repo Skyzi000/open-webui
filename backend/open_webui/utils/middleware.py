@@ -139,6 +139,7 @@ from open_webui.utils.misc import (
     get_last_assistant_message,
     get_last_user_message,
     get_last_user_message_item,
+    get_latest_turn_index,
     get_message_list,
     get_output_text,
     get_response_error_detail,
@@ -147,7 +148,6 @@ from open_webui.utils.misc import (
     is_raster_image_content_type,
     is_string_allowed,
     merge_model_params,
-    merge_system_messages,
     prepend_to_first_user_message_content,
     replace_system_message_content,
     set_last_user_message_content,
@@ -225,8 +225,9 @@ def _is_tool_result_error(value: Any) -> bool:
 
 
 def normalize_messages_for_model(form_data: dict) -> dict:
-    form_data['messages'] = strip_empty_content_blocks(form_data.get('messages', []))
-    form_data['messages'] = merge_system_messages(form_data.get('messages', []))
+    messages = strip_empty_content_blocks(form_data.get('messages', []))
+    # System messages keep their positions; only empty ones are dropped, as the upstream merge did.
+    form_data['messages'] = [m for m in messages if m.get('role') != 'system' or get_content_from_message(m)]
     return form_data
 
 
@@ -1399,9 +1400,10 @@ async def chat_completion_tools_handler(
     def get_tools_function_calling_payload(messages, task_model_id, content):
         user_message = get_last_user_message(messages)
 
-        if user_message and messages and messages[-1]['role'] == 'user':
+        index = get_latest_turn_index(messages)
+        if user_message and index >= 0 and messages[index]['role'] == 'user':
             # Remove the last user message to avoid duplication
-            messages = messages[:-1]
+            messages = [*messages[:index], *messages[index + 1 :]]
 
         recent_messages = messages[-4:] if len(messages) > 4 else messages
         chat_history = '\n'.join(
@@ -2963,7 +2965,8 @@ async def process_chat_payload(
                 if assistant_message and (assistant_message.get('content') or assistant_message.get('output')):
                     db_messages.append({k: v for k, v in assistant_message.items() if k in MESSAGE_REPLAY_KEYS})
 
-            system_message = get_system_message(form_data.get('messages', []))
+            # DB history replaces the request's messages, so carry its first system message wherever it sits.
+            system_message = next((m for m in form_data.get('messages', []) if m.get('role') == 'system'), None)
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
 
     if is_saved_chat_id(chat_id) and user_message_id:

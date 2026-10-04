@@ -1296,7 +1296,8 @@ def convert_to_responses_payload(payload: dict) -> dict:
             input_items.extend(_normalize_stored_item(item) for item in stored_output)
             continue
 
-        if role == 'system':
+        # Only the leading system becomes instructions; later system messages stay in place as input items.
+        if role == 'system' and msg is messages[0]:
             if isinstance(content, str):
                 system_content = content
             elif isinstance(content, list):

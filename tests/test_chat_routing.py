@@ -384,6 +384,121 @@ def test_inlet_reroute_resolves_final_model_system(monkeypatch):
     assert captured['m1']['system_prompt'] == 'rerouted system'
 
 
+def test_inlet_mid_chain_system_reaches_provider_in_place(monkeypatch):
+    models_map = {'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}}}
+    model_infos = {'primary-model': _EntryModelInfo({'system': 'primary system'})}
+    captured, request, user, _ = _install_provider_sink_harness(monkeypatch, model_infos)
+
+    async def inserting_inlet(_request, form_data, _user, _models):
+        messages = form_data['messages']
+        form_data['messages'] = [*messages[:-1], {'role': 'system', 'content': 'turn note'}, messages[-1]]
+        return form_data
+
+    monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', inserting_inlet)
+    request.app.state.MODELS = models_map
+
+    _run_chat_completion(
+        request,
+        user,
+        _base_form_data(
+            'primary-model',
+            [{'model_id': 'primary-model', 'message_id': 'm1'}],
+            messages=[
+                {'role': 'user', 'content': 'old'},
+                {'role': 'assistant', 'content': 'answer'},
+                {'role': 'user', 'content': 'hi'},
+            ],
+        ),
+    )
+
+    assert [(m['role'], m['content']) for m in captured['m1']['messages']] == [
+        ('system', 'primary system'),
+        ('user', 'old'),
+        ('assistant', 'answer'),
+        ('system', 'turn note'),
+        ('user', 'hi'),
+    ]
+
+
+def test_rag_context_joins_latest_user_before_trailing_system(monkeypatch):
+    async def config_get(_key, default=None):
+        return 'template'
+
+    async def rag(_template, context, query):
+        return f'<context>{context.strip()}</context> for {query}'
+
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(middleware, 'rag_template', rag)
+    monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
+
+    messages = asyncio.run(
+        middleware.apply_source_context_to_messages(
+            None,
+            [
+                {'role': 'system', 'content': 'policy'},
+                {'role': 'user', 'content': 'hi'},
+                {'role': 'system', 'content': 'turn note'},
+            ],
+            [{'source': {'id': 'doc'}, 'document': ['fact'], 'metadata': [{}]}],
+            'hi',
+        )
+    )
+
+    assert [(m['role'], m['content']) for m in messages] == [
+        ('system', 'policy'),
+        ('user', '<context><source id="1" resource-id="doc">fact</source></context> for hi\nhi'),
+        ('system', 'turn note'),
+    ]
+
+
+def test_normalize_drops_only_empty_system_messages():
+    form_data = middleware.normalize_messages_for_model(
+        {
+            'messages': [
+                {'role': 'system', 'content': ''},
+                {'role': 'user', 'content': 'hi'},
+                {'role': 'system', 'content': 'turn note'},
+                {'role': 'system', 'content': [{'type': 'text', 'text': ''}]},
+            ]
+        }
+    )
+
+    assert form_data['messages'] == [{'role': 'user', 'content': 'hi'}, {'role': 'system', 'content': 'turn note'}]
+
+
+def test_tool_selection_prompt_drops_latest_user_before_trailing_system(monkeypatch):
+    captured = []
+
+    async def generate(_request, form_data, user=None, **_kwargs):
+        captured.append(form_data)
+        return {'choices': [{'message': {'content': ''}}]}
+
+    async def get_many(*_args, **_kwargs):
+        return {'task.tools.prompt_template': '{{TOOLS}}'}
+
+    monkeypatch.setattr(middleware, 'generate_chat_completion', generate)
+    monkeypatch.setattr(middleware.Config, 'get_many', get_many)
+    monkeypatch.setattr(middleware, 'get_task_model_id', lambda *_args, **_kwargs: 'task')
+    body = {
+        'model': 'model',
+        'messages': [
+            {'role': 'user', 'content': 'old'},
+            {'role': 'assistant', 'content': 'answer'},
+            {'role': 'user', 'content': 'hi'},
+            {'role': 'system', 'content': 'turn note'},
+        ],
+    }
+    extra_params = {'__event_call__': None, '__event_emitter__': None, '__metadata__': {}}
+
+    asyncio.run(
+        middleware.chat_completion_tools_handler(None, body, extra_params, None, {}, {'t': {'spec': {'name': 't'}}})
+    )
+
+    assert captured[0]['messages'][1]['content'] == (
+        'History:\nUSER: """old"""\nASSISTANT: """answer"""\nSYSTEM: """turn note"""\nQuery: hi'
+    )
+
+
 def test_zero_stream_delta_chunk_size_does_not_override_request(monkeypatch):
     models_map = {
         'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
@@ -1003,6 +1118,28 @@ def test_responses_tool_calls_keep_incomplete_finish_reason(reason, expected):
     function = choice['message']['tool_calls'][0]['function']
     assert function['name'] == 'lookup'
     assert json.loads(function['arguments']) == {'q': 'x'}
+
+
+def test_responses_payload_keeps_every_system_message():
+    payload = openai_router.convert_to_responses_payload(
+        {
+            'model': 'gpt',
+            'messages': [
+                {'role': 'system', 'content': 'primary'},
+                {'role': 'system', 'content': 'second'},
+                {'role': 'user', 'content': 'old'},
+                {'role': 'system', 'content': 'turn note'},
+                {'role': 'user', 'content': 'hi'},
+            ],
+        }
+    )
+    assert payload['instructions'] == 'primary'
+    assert [(item['role'], item['content'][0]['text']) for item in payload['input']] == [
+        ('system', 'second'),
+        ('user', 'old'),
+        ('system', 'turn note'),
+        ('user', 'hi'),
+    ]
 
 
 @pytest.mark.parametrize('saved', [False, True])

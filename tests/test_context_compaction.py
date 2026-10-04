@@ -547,6 +547,21 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
     assert compaction.find_safe_compaction_boundary(working[:2] + working[4:], 50) == 0
 
 
+def test_tool_round_boundary_skips_system_between_rounds():
+    messages = [
+        {'role': 'user', 'content': 'q0'},
+        {'role': 'assistant', 'content': 'a0'},
+        {'role': 'user', 'content': 'q'},
+        {'role': 'assistant', 'tool_calls': [{'id': 'a'}]},
+        {'role': 'tool', 'tool_call_id': 'a', 'content': 'a result'},
+        {'role': 'system', 'content': 'note'},
+        {'role': 'assistant', 'tool_calls': [{'id': 'b'}]},
+        {'role': 'tool', 'tool_call_id': 'b', 'content': 'b result'},
+    ]
+
+    assert compaction.find_safe_compaction_boundary(messages, maximize=True, allow_tool_rounds=True) == 6
+
+
 def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
     history_hashes = 0
     canonical_history_entry = compaction._canonical_history_entry
@@ -3069,12 +3084,84 @@ def test_transient_keeps_existing_summary_when_nothing_new_to_compact(monkeypatc
         assert result is body
 
 
+def test_transient_mid_chain_system_goes_only_to_summary_input(monkeypatch):
+    compacted_ranges = []
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted_messages, *_args, **_kwargs):
+        compacted_ranges.append([(message['role'], message['content']) for message in compacted_messages])
+        return 'SUMMARY'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'system', 'content': 'policy'},
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'assistant', 'content': 'a1'},
+        {'role': 'system', 'content': 'turn note'},
+        {'role': 'user', 'content': 'q2'},
+    ]
+    state = {'config': _compaction_config()}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert compacted_ranges == [[('user', 'q1'), ('assistant', 'a1'), ('system', 'turn note')]]
+    assert compacted['messages'][0] == {'role': 'system', 'content': 'policy'}
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
+    assert compacted['messages'][2:] == [{'role': 'user', 'content': 'q2'}]
+
+
+def test_transient_system_note_alone_is_not_new_compaction_content(monkeypatch):
+    summary_calls = []
+
+    async def generate_summary(*_args, **_kwargs):
+        summary_calls.append(True)
+        return 'NEW'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'system', 'content': 'policy'},
+        compaction.render_summary_message('PREV'),
+        {'role': 'system', 'content': 'turn note'},
+        {'role': 'user', 'content': 'q_latest'},
+    ]
+    state = {'config': _compaction_config(), 'previous_summary': 'PREV', 'previous_summary_meta': {}}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': copy.deepcopy(messages)},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert summary_calls == []
+    assert compacted['messages'] == messages
+
+
 def test_transient_stops_when_uncompacted_history_has_no_safe_cut(monkeypatch):
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
     messages = [
         {'role': 'user', 'content': 'q1'},
-        {'role': 'system', 'content': 'mid-conversation instruction'},
-        {'role': 'assistant', 'content': 'a1'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [{'id': 'open', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}],
+        },
         {'role': 'user', 'content': 'q2'},
     ]
 
@@ -3607,6 +3694,33 @@ def _approved_stored():
             }
         ]
     }
+
+
+def test_db_rebuild_keeps_request_system_that_is_not_leading(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+
+    async def load_messages(_chat_id, _message_id):
+        return [{'role': 'user', 'content': 'old'}, {'role': 'assistant', 'content': 'answer'}]
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    monkeypatch.setattr(middleware, 'load_messages_from_db', load_messages)
+    messages = [{'role': 'user', 'content': 'client copy'}, {'role': 'system', 'content': 'api policy'}]
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            messages,
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+        )
+    )
+
+    assert [(m['role'], m['content']) for m in send['messages']] == [
+        ('system', 'api policy'),
+        ('user', 'old'),
+        ('assistant', 'answer'),
+    ]
 
 
 def test_payload_send_carries_filter_marker_and_canonical_stays_clean(monkeypatch):
