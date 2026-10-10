@@ -1146,6 +1146,10 @@ async def get_event_emitter(request_info, update_db=True):
         if internal and event_data.get('type') == 'notification':
             return
 
+        # [N] opens the N-th source the message received, whoever emitted it, so the request keeps the same list.
+        if event_data.get('type') in ('source', 'citation') and isinstance(request_info.get('sources'), list):
+            request_info['sources'].append(event_data.get('data'))
+
         room = f'user:{user_id}'
         # Local rooms are authoritative; Redis may have listeners on another instance.
         if WEBSOCKET_MANAGER == 'redis' or room in sio.manager.rooms.get('/', {}):

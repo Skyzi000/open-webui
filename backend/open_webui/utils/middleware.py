@@ -1019,6 +1019,24 @@ def get_source_context(sources: list, source_ids: dict = None, include_content: 
     return context_string
 
 
+def number_sources(sources: list, source_ids: dict) -> None:
+    """Number sources as the frontend's citation list does: every document counts, with or without metadata."""
+    # ponytail: rescans the whole list on every call; keep a cursor if a message ever lists tens of thousands.
+    for source in sources:
+        try:
+            info, metadata = source.get('source'), source.get('metadata')
+            for index in range(len(source.get('document') or [])):
+                meta = metadata[index] if isinstance(metadata, list) and index < len(metadata) else None
+                listed = {
+                    'source': info if isinstance(info, dict) else {},
+                    'document': [''],
+                    'metadata': [meta if isinstance(meta, dict) else {}],
+                }
+                get_source_context([listed], source_ids, include_content=False)
+        except Exception:
+            continue  # not something the frontend can list either
+
+
 async def apply_source_context_to_messages(
     request: Request,
     messages: list,
@@ -3764,7 +3782,7 @@ async def process_chat_payload(
     # Continue keeps the message's stored sources, as the frontend does, so [N] has to index into
     # that list: this run's sources are numbered after it and the ones it lacks are appended to it.
     source_ids = {}
-    get_source_context(stored_sources, source_ids, include_content=False)
+    number_sources(stored_sources, source_ids)
     metadata['sources'] = [*stored_sources, *sources]
 
     if system_content:
@@ -6633,10 +6651,8 @@ async def streaming_chat_response_handler(response, ctx):
                     'citations', True
                 )
                 # Core re-renders tool citation markers into the prompt every round, rewriting sent bytes.
-                # Ids are frozen in the same file-then-tool order instead, and each tool result carries its own.
+                # Ids are frozen in the order the message received its sources, and each tool result carries its own.
                 citation_source_ids = {}
-                if citations_enabled:
-                    get_source_context(metadata.get('sources', []), citation_source_ids, include_content=False)
 
                 async def emit_output():
                     # Channels publish whole messages; Continue can merge into the preceding item.
@@ -6909,6 +6925,8 @@ async def streaming_chat_response_handler(response, ctx):
                                     tool_id=tool.get('tool_id', '') if tool else '',
                                 )
                                 tool_call_sources.extend(citation_sources)
+                                # Files and whatever other tools emitted are already listed ahead of these.
+                                number_sources(metadata.get('sources', []), citation_source_ids)
                                 # Chunks of one file render identical tags; this result only needs each once.
                                 source_context = ''.join(
                                     dict.fromkeys(

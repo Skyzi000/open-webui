@@ -3389,6 +3389,14 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     async def fetch_url():
         return 'result-b'
 
+    async def sub_agent():
+        # Extensions put their own sources on the message through the emitter Core hands to tools.
+        await (await real_emitter(current['metadata'], update_db=False))(
+            {'type': 'source', 'data': source_for('child')}
+        )
+        current['emitted'].append(source_for('child'))
+        return 'result-c'
+
     def source_for(name):
         # Two chunks of one source, as query tools return them.
         return {
@@ -3414,9 +3422,10 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
                 'spec': {'name': name, 'parameters': {'type': 'object', 'properties': {}}},
                 'callable': function,
             }
-            for name, function in (('view_file', view_file), ('fetch_url', fetch_url))
+            for name, function in (('view_file', view_file), ('fetch_url', fetch_url), ('sub_agent', sub_agent))
         }
         metadata = {
+            'user_id': 'user',
             'chat_id': 'chat',
             'message_id': 'assistant',
             'user_prompt': 'start',
@@ -3506,6 +3515,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
     socket_main = importlib.import_module('open_webui.socket.main')
+    real_emitter = socket_main.get_event_emitter
     monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
 
     async def emit(event, *_args, **_kwargs):
@@ -3515,6 +3525,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     async def run_case(enabled, replies, first=('call-a', 'view_file'), prepare=None):
         current.update(sent=[], saved=[], carrier_indices=[], replies=replies, emitted=[])
         ctx = make_ctx(enabled)
+        current['metadata'] = ctx['metadata']
         if prepare:
             prepare(ctx)
         ctx['event_emitter'] = emit
@@ -3549,10 +3560,10 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
         assert [message['content'][1]['image_url']['url'] for message in images] == [image]
 
     def assert_links(final, sources):
-        # Mirrors ContentRenderer: [N] opens the N-th distinct source name of the message.
+        # Mirrors Citations.svelte: [N] opens the N-th distinct source id of the message.
         names = list(
             dict.fromkeys(
-                meta.get('name') or source['source']['name'] for source in sources for meta in source['metadata']
+                meta.get('source') or source['source']['id'] for source in sources for meta in source['metadata']
             )
         )
         tool_text = ''.join(message['content'] for message in final if message['role'] == 'tool')
@@ -3650,6 +3661,25 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     ctx = make_ctx(False)
     resume(ctx)
     assert_links(final, ctx['metadata']['sources'] + resumed['emitted'])
+
+    # A source another tool emitted takes the next id, so Core's own markers count on from it.
+    foreign = asyncio.run(
+        run_case(
+            False,
+            [
+                tool_response('call-b', 'fetch_url'),
+                response({'choices': [{'delta': {'content': 'done'}, 'finish_reason': 'stop'}]}),
+            ],
+            first=('call-s', 'sub_agent'),
+        )
+    )
+    final = foreign['sent'][1]['messages']
+    assert [message['content'] for message in final if message['role'] == 'tool'] == [
+        'result-c',
+        f'{fetch_source}result-b',
+    ]
+    assert [source['source']['name'] for source in foreign['emitted']] == ['child', 'fetch_url']
+    assert_links(final, make_ctx(False)['metadata']['sources'] + foreign['emitted'])
 
 
 def test_transient_messages_use_core_provenance_before_regex_fallback():
@@ -3830,7 +3860,9 @@ def test_continue_numbers_retrieved_sources_after_the_stored_ones(monkeypatch):
             'metadata': [{'source': name}],
         }
 
-    stored = {'content': 'partial', 'sources': [source('a.pdf'), source('fetch_url')]}
+    # Tools emit sources as well, and the frontend lists a document without metadata under a fallback id.
+    loose = [{'document': ['x'], 'metadata': [None]}, {'source': {'id': 'memo'}, 'document': ['y']}]
+    stored = {'content': 'partial', 'sources': [source('a.pdf'), source('fetch_url'), *loose]}
 
     async def load_messages(_chat_id, _message_id):
         return [{'role': 'user', 'content': 'question'}]
@@ -3867,7 +3899,7 @@ def test_continue_numbers_retrieved_sources_after_the_stored_ones(monkeypatch):
 
     # [N] opens the N-th source of the message, and a continued message keeps the list it already has.
     context = send['messages'][-1]['content']
-    assert re.findall(r'<source id="(\d+)" name="([^"]+)"', context) == [('3', 'b.pdf'), ('1', 'a.pdf')]
+    assert re.findall(r'<source id="(\d+)" name="([^"]+)"', context) == [('5', 'b.pdf'), ('1', 'a.pdf')]
     assert [event['data'] for event in emitted if event.get('type') == 'source'] == [source('b.pdf')]
     assert not any('sources' in event for event in events)
     assert metadata['sources'] == [*stored['sources'], source('b.pdf'), source('a.pdf')]
