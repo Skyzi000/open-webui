@@ -645,9 +645,12 @@ def _drop_rendered_summary_once(
 
 
 def _has_new_compaction_content(messages: list[dict], state: dict) -> bool:
-    """False when the range holds only the carried summary, so summarizing it again adds nothing."""
-    return bool(
-        _drop_rendered_summary_once(messages, state.get('previous_summary'), state.get('previous_summary_meta'))
+    """False when the range holds only the carried summary and system messages, so summarizing it again adds nothing."""
+    return any(
+        message.get('role') != 'system'
+        for message in _drop_rendered_summary_once(
+            messages, state.get('previous_summary'), state.get('previous_summary_meta')
+        )
     )
 
 
@@ -2168,7 +2171,7 @@ def find_safe_compaction_boundary(
     maximize: bool = False,
     allow_tool_rounds: bool = False,
 ) -> int:
-    """Return a user-turn boundary that keeps system instructions and tool pairs intact."""
+    """Return a user-turn boundary that keeps tool pairs intact; system messages never block a cut."""
     retention_percentage = _clamp_retention_percentage(retention_percentage)
     keep_count = max(2, len(messages) * retention_percentage // 100)
     target = len(messages) - 1 if maximize else max(1, len(messages) - keep_count)
@@ -2212,12 +2215,13 @@ def find_safe_compaction_boundary(
         if invalid(tool_id)
     }
     persistent_users = 0
-    system_messages = 0
     selected = 0
     completed_round = 0
 
     def follows_complete_tool_round(boundary: int) -> bool:
         cursor = boundary - 1
+        while cursor >= 0 and messages[cursor].get('role') == 'system':
+            cursor -= 1
         completed: Counter[str] = Counter()
         while cursor >= 0 and messages[cursor].get('role') == 'tool':
             tool_id = messages[cursor].get('tool_call_id')
@@ -2236,12 +2240,7 @@ def find_safe_compaction_boundary(
     for boundary, message in enumerate(messages):
         if boundary > target:
             break
-        if (
-            persistent_users > 0
-            and events[boundary][2]
-            and system_messages == 0
-            and not invalid_ids
-        ):
+        if persistent_users > 0 and events[boundary][2] and not invalid_ids:
             selected = boundary
         if (
             allow_tool_rounds
@@ -2249,7 +2248,6 @@ def find_safe_compaction_boundary(
             and boundary > 0
             and message.get('role') == 'assistant'
             and follows_complete_tool_round(boundary)
-            and system_messages == 0
             and not invalid_ids
         ):
             completed_round = boundary
@@ -2264,8 +2262,6 @@ def find_safe_compaction_boundary(
                 invalid_ids.add(tool_id)
             else:
                 invalid_ids.discard(tool_id)
-        if message.get('role') == 'system':
-            system_messages += 1
         if persistent_user:
             persistent_users += 1
     return max(selected, completed_round)

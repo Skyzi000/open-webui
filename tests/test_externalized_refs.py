@@ -400,13 +400,14 @@ async def test_ineligible_text_is_not_hashed(monkeypatch):
         raise AssertionError('ineligible text must not be hashed')
 
     monkeypatch.setattr(refs.hashlib, 'sha256', unexpected_hash)
-    assert not await refs.externalize_refs(
+    assert await refs.externalize_refs(
         body,
         {},
         native=True,
         threshold_tokens=2,
         count_tokens=lambda _text: 1,
     )
+    assert body['messages'][1]['content'] == 'small raw result'
 
 
 @pytest.mark.asyncio
@@ -1068,7 +1069,7 @@ async def test_preview_boundary_below_at_and_above_threshold():
             threshold_tokens=1000,
             count_tokens=count_tokens,
         )
-        assert active is externalized, size
+        assert active is True
         if externalized:
             content = body['messages'][1]['content']
             assert count_tokens(content) < 1000
@@ -1135,6 +1136,96 @@ async def test_preview_uses_95_percent_of_the_real_token_budget():
     tokens = compaction.estimate_text_tokens(content)
     assert len(content.encode('utf-8')) < refs.REF_EXEC_RESPONSE_MAX_BYTES
     assert TOKEN_THRESHOLD * 0.95 <= tokens < TOKEN_THRESHOLD
+
+
+def _citation_markers(count: int) -> str:
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    return middleware.get_source_context(
+        [
+            {
+                'source': {
+                    'id': f'file-{index}',
+                    'name': f'第{index}四半期事業報告書_最終確定版.pdf',
+                    'type': 'file',
+                },
+                'document': [''],
+                'metadata': [{'source': f'file-{index}'}],
+            }
+            for index in range(count)
+        ],
+        {},
+        include_content=False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    'result',
+    [
+        'Realistic english sentences with several words each.\n' * 700,
+        '日本語の長いテキスト行を含む結果。\n' * 1200,
+    ],
+)
+async def test_citation_markers_stay_whole_without_shrinking_the_preview(result):
+    markers = _citation_markers(12)
+    body, registry, reader, ref = await _project(markers + result)
+
+    content = body['messages'][1]['content']
+    assert content.startswith(markers)
+    # The markers are not the tool's output, so its preview is as large as it is without them.
+    tokens = compaction.estimate_text_tokens(content[len(markers) :])
+    assert TOKEN_THRESHOLD * 0.95 <= tokens < TOKEN_THRESHOLD
+    prefix, command, suffix = _preview_parts(content)
+    middle, _pages = await _read_pages(reader, command)
+    assert prefix + middle + suffix == markers + result
+
+
+@pytest.mark.asyncio
+async def test_citation_markers_neither_trigger_nor_escape_externalization():
+    def count_tokens(text):
+        return len(text) // 4
+
+    async def project(source):
+        projected = await refs.project_tool_refs(
+            _body(source)['messages'],
+            threshold_tokens=1000,
+            count_tokens=count_tokens,
+        )
+        return projected[1]['content']
+
+    markers = _citation_markers(3)
+    assert await project(markers + 'x' * 3996) == markers + 'x' * 3996
+    assert (await project(markers + 'x' * 4000)).startswith(markers + 'x')
+
+    # A run too large for a preview of its own is ordinary text, so a result that
+    # merely starts like markers cannot keep an unbounded head raw.
+    oversized = _citation_markers(200)
+    content = await project(oversized + 'x')
+    assert '<auto_compact_ref_truncated>' in content
+    assert count_tokens(content) < 1000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('wrap', ['{}', '<source id="9" name="{}"></source>\n'])
+async def test_citation_markers_never_copy_a_giant_result(wrap):
+    size = 4 * 1024 * 1024
+    messages = _body(_citation_markers(3) + wrap.format('a' * size))['messages']
+
+    async def project():
+        return await refs.project_tool_refs(
+            messages,
+            threshold_tokens=TOKEN_THRESHOLD,
+            count_tokens=compaction.estimate_text_tokens,
+        )
+
+    await project()
+    tracemalloc.start()
+    tracemalloc.reset_peak()
+    projected = await project()
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert '<auto_compact_ref_truncated>' in projected[1]['content']
+    assert peak < size // 4, peak
 
 
 @pytest.mark.asyncio
@@ -1239,7 +1330,7 @@ async def test_uncountable_preview_is_not_adopted_or_cached():
 
     body = _body(source)
     registry = {}
-    assert not await refs.externalize_refs(
+    assert await refs.externalize_refs(
         body,
         registry,
         native=True,
@@ -1248,7 +1339,8 @@ async def test_uncountable_preview_is_not_adopted_or_cached():
         render_cache=cache,
     )
     assert body['messages'][1]['content'] == source
-    assert registry == {}
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__ == {}
+    assert cache == {}
 
     assert await refs.externalize_refs(
         body,

@@ -547,6 +547,21 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
     assert compaction.find_safe_compaction_boundary(working[:2] + working[4:], 50) == 0
 
 
+def test_tool_round_boundary_skips_system_between_rounds():
+    messages = [
+        {'role': 'user', 'content': 'q0'},
+        {'role': 'assistant', 'content': 'a0'},
+        {'role': 'user', 'content': 'q'},
+        {'role': 'assistant', 'tool_calls': [{'id': 'a'}]},
+        {'role': 'tool', 'tool_call_id': 'a', 'content': 'a result'},
+        {'role': 'system', 'content': 'note'},
+        {'role': 'assistant', 'tool_calls': [{'id': 'b'}]},
+        {'role': 'tool', 'tool_call_id': 'b', 'content': 'b result'},
+    ]
+
+    assert compaction.find_safe_compaction_boundary(messages, maximize=True, allow_tool_rounds=True) == 6
+
+
 def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
     history_hashes = 0
     canonical_history_entry = compaction._canonical_history_entry
@@ -2508,7 +2523,8 @@ def test_post_filter_payload_controls_ref_catalog():
     }
 
     assert asyncio.run(middleware.apply_externalized_refs(filtered_body, filtered_state)) is filtered_body
-    assert filtered_state['externalized_refs']['registry'] == {}
+    filtered_reader = filtered_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert filtered_reader.__externalized_ref_catalog__ == {}
 
     summary_text = f'preserve {visible.ref}'
     summary = compaction.render_summary_message(summary_text)
@@ -2554,7 +2570,8 @@ def test_post_filter_payload_controls_ref_catalog():
     }
 
     masked = asyncio.run(middleware.apply_externalized_refs(masked, masked_state))
-    assert masked_state['externalized_refs']['registry'] == {}
+    masked_reader = masked_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert masked_reader.__externalized_ref_catalog__ == {}
     assert '<history_ref>' not in masked['messages'][0]['content']
 
 
@@ -3069,12 +3086,84 @@ def test_transient_keeps_existing_summary_when_nothing_new_to_compact(monkeypatc
         assert result is body
 
 
+def test_transient_mid_chain_system_goes_only_to_summary_input(monkeypatch):
+    compacted_ranges = []
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted_messages, *_args, **_kwargs):
+        compacted_ranges.append([(message['role'], message['content']) for message in compacted_messages])
+        return 'SUMMARY'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'system', 'content': 'policy'},
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'assistant', 'content': 'a1'},
+        {'role': 'system', 'content': 'turn note'},
+        {'role': 'user', 'content': 'q2'},
+    ]
+    state = {'config': _compaction_config()}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': messages},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert compacted_ranges == [[('user', 'q1'), ('assistant', 'a1'), ('system', 'turn note')]]
+    assert compacted['messages'][0] == {'role': 'system', 'content': 'policy'}
+    assert _summary_content_of(compacted['messages']) is state['summary_message_content']
+    assert compacted['messages'][2:] == [{'role': 'user', 'content': 'q2'}]
+
+
+def test_transient_system_note_alone_is_not_new_compaction_content(monkeypatch):
+    summary_calls = []
+
+    async def generate_summary(*_args, **_kwargs):
+        summary_calls.append(True)
+        return 'NEW'
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
+    messages = [
+        {'role': 'system', 'content': 'policy'},
+        compaction.render_summary_message('PREV'),
+        {'role': 'system', 'content': 'turn note'},
+        {'role': 'user', 'content': 'q_latest'},
+    ]
+    state = {'config': _compaction_config(), 'previous_summary': 'PREV', 'previous_summary_meta': {}}
+
+    compacted = asyncio.run(
+        compaction.compact_transient_provider_payload(
+            None,
+            None,
+            {'messages': copy.deepcopy(messages)},
+            {'chat_id': 'local:unit'},
+            'model',
+            {},
+            state,
+        )
+    )
+
+    assert summary_calls == []
+    assert compacted['messages'] == messages
+
+
 def test_transient_stops_when_uncompacted_history_has_no_safe_cut(monkeypatch):
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body: 120)
     messages = [
         {'role': 'user', 'content': 'q1'},
-        {'role': 'system', 'content': 'mid-conversation instruction'},
-        {'role': 'assistant', 'content': 'a1'},
+        {
+            'role': 'assistant',
+            'content': '',
+            'tool_calls': [{'id': 'open', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}],
+        },
         {'role': 'user', 'content': 'q2'},
     ]
 
@@ -3267,8 +3356,14 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
         current['sent'].append(copy.deepcopy(candidate))
         return current['replies'].pop(0)
 
-    async def process_result(_request, _name, result, *_args):
-        return result, [], []
+    image = 'data:image/png;base64,AAAA'
+
+    async def process_result(_request, name, result, *_args):
+        # fetch_url returns an image, so the loop adds its own user message carrying it.
+        return result, [{'type': 'image', 'url': image}] if name == 'fetch_url' else [], []
+
+    async def keep_image(_request, url, *_args):
+        return url
 
     async def noop(*_args, **_kwargs):
         return None
@@ -3296,11 +3391,20 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     async def fetch_url():
         return 'result-b'
 
+    async def sub_agent():
+        # Extensions put their own sources on the message through the emitter Core hands to tools.
+        await (await real_emitter(current['metadata'], update_db=False))(
+            {'type': 'source', 'data': source_for('child')}
+        )
+        current['emitted'].append(source_for('child'))
+        return 'result-c'
+
     def source_for(name):
+        # Two chunks of one source, as query tools return them.
         return {
             'source': {'id': name, 'name': name, 'type': 'tool'},
-            'document': [f'document-{name}'],
-            'metadata': [{'source': name}],
+            'document': [f'document-{name}', f'document-{name}-2'],
+            'metadata': [{'source': name}, {'source': name}],
         }
 
     def estimate(body):
@@ -3320,14 +3424,22 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
                 'spec': {'name': name, 'parameters': {'type': 'object', 'properties': {}}},
                 'callable': function,
             }
-            for name, function in (('view_file', view_file), ('fetch_url', fetch_url))
+            for name, function in (('view_file', view_file), ('fetch_url', fetch_url), ('sub_agent', sub_agent))
         }
         metadata = {
+            'user_id': 'user',
             'chat_id': 'chat',
             'message_id': 'assistant',
             'user_prompt': 'start',
             'params': {'tool_approval_mode': 'full'},
             'tools': tools,
+            'sources': [
+                {
+                    'source': {'id': 'file-1', 'name': 'doc.pdf', 'type': 'file'},
+                    'document': ['file body'],
+                    'metadata': [{'source': 'doc.pdf'}],
+                }
+            ],
         }
         ctx = {
             'request': SimpleNamespace(
@@ -3343,7 +3455,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
             'user': SimpleNamespace(),
             'model': {'id': 'model', 'info': {'meta': {'capabilities': {'citations': True}}}},
             'metadata': metadata,
-            'events': [],
+            'events': [{'sources': metadata['sources']}],
             'tasks': {},
             'event_emitter': noop,
             'event_caller': None,
@@ -3384,6 +3496,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
     monkeypatch.setattr(middleware, 'generate_chat_completion', generate)
     monkeypatch.setattr(middleware, 'process_tool_result', process_result)
+    monkeypatch.setattr(middleware, 'store_tool_result_image', keep_image)
     monkeypatch.setattr(
         middleware,
         'get_citation_source_from_tool_result',
@@ -3404,25 +3517,62 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
     socket_main = importlib.import_module('open_webui.socket.main')
+    real_emitter = socket_main.get_event_emitter
     monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
 
-    async def run_case(enabled, replies):
-        current.update(sent=[], saved=[], carrier_indices=[], replies=replies)
-        await middleware.streaming_chat_response_handler(
-            tool_response('call-a', 'view_file'),
-            make_ctx(enabled),
-        )
+    async def emit(event, *_args, **_kwargs):
+        if event.get('type') == 'source':
+            current['emitted'].append(event['data'])
+
+    async def run_case(enabled, replies, first=('call-a', 'view_file'), prepare=None):
+        current.update(sent=[], saved=[], carrier_indices=[], replies=replies, emitted=[])
+        ctx = make_ctx(enabled)
+        current['metadata'] = ctx['metadata']
+        if prepare:
+            prepare(ctx)
+        ctx['event_emitter'] = emit
+        await middleware.streaming_chat_response_handler(tool_response(*first), ctx)
         return copy.deepcopy(current)
 
-    folded = asyncio.run(
-        run_case(
-            True,
-            [
-                tool_response('call-b', 'fetch_url'),
-                response({'choices': [{'delta': {'content': 'done'}, 'finish_reason': 'stop'}]}),
-            ],
+    def replies():
+        return [
+            tool_response('call-b', 'fetch_url'),
+            tool_response('call-c', 'view_file'),
+            response({'choices': [{'delta': {'content': 'done'}, 'finish_reason': 'stop'}]}),
+        ]
+
+    view_source = '<source id="2" name="view_file" resource-type="tool" resource-id="view_file"></source>\n'
+    fetch_source = '<source id="3" name="fetch_url" resource-type="tool" resource-id="fetch_url"></source>\n'
+
+    def assert_append_only(sent):
+        # Every leg must extend the previous one byte for byte, so the provider cache survives the loop.
+        assert len(sent) == 3
+        for previous, following in zip(sent, sent[1:]):
+            assert following['messages'][: len(previous['messages'])] == previous['messages']
+        assert not any('RAG[' in json.dumps(message['content']) for body in sent for message in body['messages'])
+
+    def assert_tool_markers(final):
+        tools = [message for message in final if message['role'] == 'tool']
+        assert [message['content'] for message in tools] == [
+            f'{view_source}result-a',
+            f'{fetch_source}result-b',
+            f'{view_source}result-a',
+        ]
+        images = [message for message in final if message['role'] == 'user' and isinstance(message['content'], list)]
+        assert [message['content'][1]['image_url']['url'] for message in images] == [image]
+
+    def assert_links(final, sources):
+        # Mirrors Citations.svelte: [N] opens the N-th distinct source id of the message.
+        names = list(
+            dict.fromkeys(
+                meta.get('source') or source['source']['id'] for source in sources for meta in source['metadata']
+            )
         )
-    )
+        tool_text = ''.join(message['content'] for message in final if message['role'] == 'tool')
+        markers = re.findall(r'<source id="(\d+)" name="([^"]+)"', tool_text)
+        assert markers and all(names[int(number) - 1] == name for number, name in markers)
+
+    folded = asyncio.run(run_case(True, replies()))
     assert folded['saved']
     assert any(
         item.get('contextSummary') == 'FOLDED'
@@ -3441,32 +3591,97 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
         ]
         for body in folded['sent']
     ]
-    assert len(summaries) == 2 and len(summaries[0]) == 1
-    assert summaries[1] == summaries[0]
-    rag_users = [
-        message
-        for message in folded['sent'][1]['messages']
-        if message.get('role') == 'user'
-        and isinstance(message.get('content'), str)
-        and message['content'].startswith('RAG[')
-    ]
-    assert len(rag_users) == 1
-    assert rag_users[0][compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY] is True
-    assert 'resource-id="view_file"' in rag_users[0]['content']
-    assert 'resource-id="fetch_url"' in rag_users[0]['content']
+    assert len(summaries[0]) == 1
+    assert summaries[2] == summaries[1] == summaries[0]
+    assert_append_only(folded['sent'])
+    assert_tool_markers(folded['sent'][2]['messages'])
+    assert_links(folded['sent'][2]['messages'], make_ctx(True)['metadata']['sources'] + folded['emitted'])
 
-    plain = asyncio.run(
+    plain = asyncio.run(run_case(False, replies()))
+    assert plain['sent'][0]['messages'][0] == {'role': 'user', 'content': 'start'}
+    assert_append_only(plain['sent'])
+    final = plain['sent'][2]['messages']
+    assert [message['role'] for message in final] == [
+        'user',
+        'assistant',
+        'tool',
+        'assistant',
+        'tool',
+        'user',
+        'assistant',
+        'tool',
+    ]
+    assert_tool_markers(final)
+    assert_links(final, make_ctx(False)['metadata']['sources'] + plain['emitted'])
+    assert {'sources': make_ctx(False)['metadata']['sources']} in plain['saved']
+    # The next turn rebuilds this response from storage; the markers must come back as the same bytes.
+    rebuilt = middleware.process_messages_with_output([{'role': 'assistant', 'output': plain['saved'][-1]['output']}])
+    assert [message for message in rebuilt if message['role'] == 'tool'] == [
+        message for message in final if message['role'] == 'tool'
+    ]
+
+    def resume(ctx):
+        prior = [
+            {
+                'type': 'function_call',
+                'id': 'fc_x',
+                'call_id': 'call-x',
+                'name': 'view_file',
+                'arguments': '{}',
+                'status': 'completed',
+            },
+            {
+                'type': 'function_call_output',
+                'id': 'fco_x',
+                'call_id': 'call-x',
+                'output': [{'type': 'input_text', 'text': 'result-a'}],
+                'status': 'completed',
+                'source_context': view_source,
+            },
+        ]
+        ctx['metadata']['assistant_message_id'] = 'assistant'
+        ctx['assistant_message'] = {'output': prior}
+        # The payload leg puts the message's stored sources ahead of this run's and sends no bulk event.
+        ctx['metadata']['sources'] = [*ctx['metadata']['sources'], source_for('view_file')]
+        ctx['events'] = []
+        ctx['form_data']['messages'] += middleware.convert_output_to_messages(copy.deepcopy(prior), raw=True)
+
+    # Continue keeps appending to the message's stored sources, so new ids follow the earlier segment's.
+    resumed = asyncio.run(
         run_case(
             False,
             [response({'choices': [{'delta': {'content': 'done'}, 'finish_reason': 'stop'}]})],
+            first=('call-b', 'fetch_url'),
+            prepare=resume,
         )
     )
-    expected = (
-        'RAG[<source id="1" name="view_file" resource-type="tool" resource-id="view_file"></source>]'
-        'PROMPT[start]\nstart'
+    final = resumed['sent'][0]['messages']
+    assert [message['content'] for message in final if message['role'] == 'tool'] == [
+        f'{view_source}result-a',
+        f'{fetch_source}result-b',
+    ]
+    ctx = make_ctx(False)
+    resume(ctx)
+    assert_links(final, ctx['metadata']['sources'] + resumed['emitted'])
+
+    # A source another tool emitted takes the next id, so Core's own markers count on from it.
+    foreign = asyncio.run(
+        run_case(
+            False,
+            [
+                tool_response('call-b', 'fetch_url'),
+                response({'choices': [{'delta': {'content': 'done'}, 'finish_reason': 'stop'}]}),
+            ],
+            first=('call-s', 'sub_agent'),
+        )
     )
-    assert plain['sent'][0]['messages'][0] == {'role': 'user', 'content': expected}
-    assert [message['role'] for message in plain['sent'][0]['messages']] == ['user', 'assistant', 'tool']
+    final = foreign['sent'][1]['messages']
+    assert [message['content'] for message in final if message['role'] == 'tool'] == [
+        'result-c',
+        f'{fetch_source}result-b',
+    ]
+    assert [source['source']['name'] for source in foreign['emitted']] == ['child', 'fetch_url']
+    assert_links(final, make_ctx(False)['metadata']['sources'] + foreign['emitted'])
 
 
 def test_transient_messages_use_core_provenance_before_regex_fallback():
@@ -3566,7 +3781,7 @@ def _seed_state_on_capture(monkeypatch, middleware, seed):
     monkeypatch.setattr(middleware, '_capture_pre_filter_tool_refs', wrapper)
 
 
-def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None):
+def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None, file_context=False):
     request = SimpleNamespace(
         state=SimpleNamespace(direct=False),
         app=SimpleNamespace(state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)),
@@ -3590,7 +3805,7 @@ def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None,
     }
     if form_tool_ids is not None:
         form_data['tool_ids'] = form_tool_ids
-    model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': False}}}}
+    model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': file_context}}}}
     return middleware.process_chat_payload(request, form_data, None, metadata, model)
 
 
@@ -3607,6 +3822,89 @@ def _approved_stored():
             }
         ]
     }
+
+
+def test_db_rebuild_keeps_request_system_that_is_not_leading(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+
+    async def load_messages(_chat_id, _message_id):
+        return [{'role': 'user', 'content': 'old'}, {'role': 'assistant', 'content': 'answer'}]
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    monkeypatch.setattr(middleware, 'load_messages_from_db', load_messages)
+    messages = [{'role': 'user', 'content': 'client copy'}, {'role': 'system', 'content': 'api policy'}]
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            messages,
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+        )
+    )
+
+    assert [(m['role'], m['content']) for m in send['messages']] == [
+        ('system', 'api policy'),
+        ('user', 'old'),
+        ('assistant', 'answer'),
+    ]
+
+
+def test_continue_numbers_retrieved_sources_after_the_stored_ones(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    emitted = []
+
+    def source(name):
+        return {
+            'source': {'id': name, 'name': name, 'type': 'file'},
+            'document': [f'body of {name}'],
+            'metadata': [{'source': name}],
+        }
+
+    # Tools emit sources as well, and the frontend lists a document without metadata under a fallback id.
+    loose = [{'document': ['x'], 'metadata': [None]}, {'source': {'id': 'memo'}, 'document': ['y']}]
+    stored = {'content': 'partial', 'sources': [source('a.pdf'), source('fetch_url'), *loose]}
+
+    async def load_messages(_chat_id, _message_id):
+        return [{'role': 'user', 'content': 'question'}]
+
+    async def retrieve(_request, body, _extra_params, _user):
+        # Continue searches again, and the queries now see the partial answer.
+        return body, {'sources': [source('b.pdf'), source('a.pdf')]}
+
+    async def emitter(_metadata):
+        async def emit(event):
+            emitted.append(event)
+
+        return emit
+
+    async def rag(_template, context, query):
+        return f'{context}\n{query}'
+
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, stored)
+    monkeypatch.setattr(middleware, 'load_messages_from_db', load_messages)
+    monkeypatch.setattr(middleware, 'chat_completion_files_handler', retrieve)
+    monkeypatch.setattr(middleware, 'get_event_emitter', emitter)
+    monkeypatch.setattr(middleware, 'rag_template', rag)
+    monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
+
+    send, metadata, events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'question'}],
+            seeded_metadata={'user_message_id': 'u1'},
+            file_context=True,
+        )
+    )
+
+    # [N] opens the N-th source of the message, and a continued message keeps the list it already has.
+    context = send['messages'][-1]['content']
+    assert re.findall(r'<source id="(\d+)" name="([^"]+)"', context) == [('5', 'b.pdf'), ('1', 'a.pdf')]
+    assert [event['data'] for event in emitted if event.get('type') == 'source'] == [source('b.pdf')]
+    assert not any('sources' in event for event in events)
+    assert metadata['sources'] == [*stored['sources'], source('b.pdf'), source('a.pdf')]
 
 
 def test_payload_send_carries_filter_marker_and_canonical_stays_clean(monkeypatch):
@@ -3778,8 +4076,8 @@ def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
     registry = state['externalized_refs']['registry']
-    assert refs.REF_EXEC_TOOL_NAME not in registry
-    assert 'tools' not in metadata
+    assert entry.ref not in registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
+    assert metadata['tools'] is registry
     assert all(message.get('role') != 'tool' for message in send['messages'])
     assert state['canonical_body']['messages'][2]['content'] is big
 
@@ -3794,7 +4092,7 @@ def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
     calls = []
 
     async def sentinel_filter(body, __metadata__=None):
-        calls.append(1)
+        calls.append(__metadata__.get('tools'))
         if len(calls) == 1:
             __metadata__['tools'] = sentinel
             return body
@@ -3819,8 +4117,10 @@ def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
 
     _send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
 
-    assert metadata['tools'] == sentinel
-    assert refs.REF_EXEC_TOOL_NAME not in state['externalized_refs']['registry']
+    assert calls[1] is sentinel
+    registry = state['externalized_refs']['registry']
+    assert metadata['tools'] is registry
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__ == {}
     assert state['summary_message_content'] is held
 
 
@@ -4427,13 +4727,61 @@ def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch,
     assert not any(entry.ref in contents for contents in seen)
     if advanced:
         assert ctx['compaction_state'].get('compacted') is True
-        assert refs.REF_EXEC_TOOL_NAME in registry
-        catalog = registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
-        assert entry.ref not in catalog
-    else:
-        assert refs.REF_EXEC_TOOL_NAME not in registry
+    assert entry.ref not in registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
     for sent in current['sent']:
         assert all(message.get('role') != 'tool' for message in sent['messages'])
+
+
+def test_reader_is_offered_on_the_first_request(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, None)
+
+    send, metadata, _events, _state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'hello'}])
+    )
+
+    assert send['tools'] == [refs.REF_EXEC_TOOL_SPEC]
+    assert refs.is_owned_ref_reader(metadata['tools'])
+
+
+def test_tool_definitions_stay_identical_when_a_result_is_externalized(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'raw output with several words per line\n' * 300
+    tools = _plain_tools(view_result='small', fetch_result=big)
+    specs = [{'type': 'function', 'function': tool['spec']} for tool in tools.values()]
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(
+        metadata,
+        compaction_enabled=False,
+        refs={'enable': True, 'native': True, 'threshold': 1000, 'registry': tools, 'metadata': metadata},
+    )
+    ctx['form_data']['tools'] = copy.deepcopy(specs)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    small_round, big_round = current['sent']
+    assert small_round['messages'][-1]['content'] == 'small'
+    assert '<auto_compact_ref_truncated>' in big_round['messages'][-1]['content']
+    assert small_round['tools'] == big_round['tools'] == [*specs, refs.REF_EXEC_TOOL_SPEC]
 
 
 def test_zero_filter_continuation_bodies_match_fixed_shape(monkeypatch):
@@ -5539,6 +5887,32 @@ def test_adoption_output_item_is_invisible_to_provider_conversion():
             assert misc.convert_output_to_messages(base, flatten_tool_images=flatten) == (
                 misc.convert_output_to_messages(with_record, flatten_tool_images=flatten)
             )
+
+
+def test_stored_tool_rounds_convert_as_the_loop_sent_them():
+    misc = importlib.import_module('open_webui.utils.misc')
+
+    def call(call_id):
+        return {'type': 'function_call', 'call_id': call_id, 'name': 'lookup', 'arguments': '{}', 'status': 'completed'}
+
+    def result(call_id):
+        return {
+            'type': 'function_call_output',
+            'call_id': call_id,
+            'output': [{'type': 'input_text', 'text': f'result-{call_id}'}],
+        }
+
+    rounds = [
+        [call('a'), result('a')],
+        [call('b'), call('c'), result('b'), result('c')],
+        [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'checking'}]}, call('d'), result('d')],
+        [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'done'}]}],
+    ]
+    sent_by_loop = [message for items in rounds for message in misc.convert_output_to_messages(items, raw=True)]
+    stored = [*rounds[0], _adoption_item('SUMMARY'), *rounds[1], *rounds[2], *rounds[3]]
+
+    assert misc.convert_output_to_messages(stored, raw=True) == sent_by_loop
+    assert [len(message.get('tool_calls', [])) for message in sent_by_loop] == [1, 0, 2, 0, 0, 1, 0, 0]
 
 
 def test_code_interpreter_survives_adoption_output_item():
