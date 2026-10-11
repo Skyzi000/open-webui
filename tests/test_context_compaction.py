@@ -2523,7 +2523,8 @@ def test_post_filter_payload_controls_ref_catalog():
     }
 
     assert asyncio.run(middleware.apply_externalized_refs(filtered_body, filtered_state)) is filtered_body
-    assert filtered_state['externalized_refs']['registry'] == {}
+    filtered_reader = filtered_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert filtered_reader.__externalized_ref_catalog__ == {}
 
     summary_text = f'preserve {visible.ref}'
     summary = compaction.render_summary_message(summary_text)
@@ -2569,7 +2570,8 @@ def test_post_filter_payload_controls_ref_catalog():
     }
 
     masked = asyncio.run(middleware.apply_externalized_refs(masked, masked_state))
-    assert masked_state['externalized_refs']['registry'] == {}
+    masked_reader = masked_state['externalized_refs']['registry'][middleware.REF_EXEC_TOOL_NAME]['callable']
+    assert masked_reader.__externalized_ref_catalog__ == {}
     assert '<history_ref>' not in masked['messages'][0]['content']
 
 
@@ -4074,8 +4076,8 @@ def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
     registry = state['externalized_refs']['registry']
-    assert refs.REF_EXEC_TOOL_NAME not in registry
-    assert 'tools' not in metadata
+    assert entry.ref not in registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
+    assert metadata['tools'] is registry
     assert all(message.get('role') != 'tool' for message in send['messages'])
     assert state['canonical_body']['messages'][2]['content'] is big
 
@@ -4090,7 +4092,7 @@ def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
     calls = []
 
     async def sentinel_filter(body, __metadata__=None):
-        calls.append(1)
+        calls.append(__metadata__.get('tools'))
         if len(calls) == 1:
             __metadata__['tools'] = sentinel
             return body
@@ -4115,8 +4117,10 @@ def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
 
     _send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
 
-    assert metadata['tools'] == sentinel
-    assert refs.REF_EXEC_TOOL_NAME not in state['externalized_refs']['registry']
+    assert calls[1] is sentinel
+    registry = state['externalized_refs']['registry']
+    assert metadata['tools'] is registry
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__ == {}
     assert state['summary_message_content'] is held
 
 
@@ -4723,13 +4727,61 @@ def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch,
     assert not any(entry.ref in contents for contents in seen)
     if advanced:
         assert ctx['compaction_state'].get('compacted') is True
-        assert refs.REF_EXEC_TOOL_NAME in registry
-        catalog = registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
-        assert entry.ref not in catalog
-    else:
-        assert refs.REF_EXEC_TOOL_NAME not in registry
+    assert entry.ref not in registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__
     for sent in current['sent']:
         assert all(message.get('role') != 'tool' for message in sent['messages'])
+
+
+def test_reader_is_offered_on_the_first_request(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, None)
+
+    send, metadata, _events, _state = asyncio.run(
+        _run_payload_leg(middleware, [{'role': 'user', 'content': 'hello'}])
+    )
+
+    assert send['tools'] == [refs.REF_EXEC_TOOL_SPEC]
+    assert refs.is_owned_ref_reader(metadata['tools'])
+
+
+def test_tool_definitions_stay_identical_when_a_result_is_externalized(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    big = 'raw output with several words per line\n' * 300
+    tools = _plain_tools(view_result='small', fetch_result=big)
+    specs = [{'type': 'function', 'function': tool['spec']} for tool in tools.values()]
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(
+        metadata,
+        compaction_enabled=False,
+        refs={'enable': True, 'native': True, 'threshold': 1000, 'registry': tools, 'metadata': metadata},
+    )
+    ctx['form_data']['tools'] = copy.deepcopy(specs)
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            current['tool_response']('call-a', 'view_file'),
+            ctx,
+        )
+    )
+
+    small_round, big_round = current['sent']
+    assert small_round['messages'][-1]['content'] == 'small'
+    assert '<auto_compact_ref_truncated>' in big_round['messages'][-1]['content']
+    assert small_round['tools'] == big_round['tools'] == [*specs, refs.REF_EXEC_TOOL_SPEC]
 
 
 def test_zero_filter_continuation_bodies_match_fixed_shape(monkeypatch):

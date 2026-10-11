@@ -400,13 +400,14 @@ async def test_ineligible_text_is_not_hashed(monkeypatch):
         raise AssertionError('ineligible text must not be hashed')
 
     monkeypatch.setattr(refs.hashlib, 'sha256', unexpected_hash)
-    assert not await refs.externalize_refs(
+    assert await refs.externalize_refs(
         body,
         {},
         native=True,
         threshold_tokens=2,
         count_tokens=lambda _text: 1,
     )
+    assert body['messages'][1]['content'] == 'small raw result'
 
 
 @pytest.mark.asyncio
@@ -1068,7 +1069,7 @@ async def test_preview_boundary_below_at_and_above_threshold():
             threshold_tokens=1000,
             count_tokens=count_tokens,
         )
-        assert active is externalized, size
+        assert active is True
         if externalized:
             content = body['messages'][1]['content']
             assert count_tokens(content) < 1000
@@ -1329,7 +1330,7 @@ async def test_uncountable_preview_is_not_adopted_or_cached():
 
     body = _body(source)
     registry = {}
-    assert not await refs.externalize_refs(
+    assert await refs.externalize_refs(
         body,
         registry,
         native=True,
@@ -1338,7 +1339,8 @@ async def test_uncountable_preview_is_not_adopted_or_cached():
         render_cache=cache,
     )
     assert body['messages'][1]['content'] == source
-    assert registry == {}
+    assert registry[refs.REF_EXEC_TOOL_NAME]['callable'].__externalized_ref_catalog__ == {}
+    assert cache == {}
 
     assert await refs.externalize_refs(
         body,

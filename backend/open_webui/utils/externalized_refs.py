@@ -503,11 +503,8 @@ async def externalize_refs(
         not history_entry.ref.startswith('history:') or not _valid_ref(history_entry.ref)
     ):
         return False
-    if not projections and history_entry is None and not seeds:
-        # Stateful continuations carry no new externalizable content, but the
-        # trimmed body still needs the owned reader schema re-attached.
-        if reader is None or not body.get('previous_response_id'):
-            return False
+    # The reader is offered even while nothing is externalized: a tool list that
+    # grew mid-chat would invalidate the provider's prompt cache from there on.
     if not _projections_are_current(messages, projections):
         return False
 
