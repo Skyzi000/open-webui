@@ -2320,6 +2320,9 @@ async def _generate_summary(
 ) -> str:
     from open_webui.utils.chat import generate_chat_completion
 
+    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
+        models = {**dict(models.items()), request.state.model['id']: request.state.model}
+
     task_config = await Config.get_many(
         'task.model.params',
         'chat.context_compaction.model',
@@ -2366,9 +2369,22 @@ async def _generate_summary(
         get_last_persistent_user_message(prompt_all_messages, transient_patterns) or '',
     )
     if custom_prompt:
-        prompt = replace_messages_variable(prompt, prompt_all_messages)
-        prompt = replace_messages_variable(prompt, prompt_compacted_messages, 'COMPACTED_MESSAGES')
-        prompt = replace_messages_variable(prompt, recent_messages, 'RECENT_MESSAGES')
+
+        def with_tool_calls(messages: list[dict]) -> list[dict]:
+            # The text-only prompt formatter otherwise omits tool names and arguments.
+            return [
+                {
+                    **message,
+                    'content': f'{get_content_from_message(message) or ""}\n[TOOL CALLS] {JSONCodec.dumps(message["tool_calls"])}',
+                }
+                if message.get('tool_calls')
+                else message
+                for message in messages
+            ]
+
+        prompt = replace_messages_variable(prompt, with_tool_calls(prompt_all_messages))
+        prompt = replace_messages_variable(prompt, with_tool_calls(prompt_compacted_messages), 'COMPACTED_MESSAGES')
+        prompt = replace_messages_variable(prompt, with_tool_calls(recent_messages), 'RECENT_MESSAGES')
         prompt = prompt_variables_template(prompt, {'{{PREVIOUS_SUMMARY}}': previous_summary or ''})
     if legacy_transcript_prompt and previous_summary and '{{PREVIOUS_SUMMARY}}' not in custom_prompt:
         prompt = f'{render_summary_message(previous_summary, previous_summary_meta)["content"]}\n\n{prompt}'

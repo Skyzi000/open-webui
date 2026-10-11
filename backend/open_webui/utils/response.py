@@ -224,11 +224,8 @@ def convert_response_ollama_to_openai(ollama_response: dict) -> dict:
     response = openai_chat_completion_message_template(
         model, message_content, reasoning_content, openai_tool_calls, usage
     )
-    done_reason = data.get('done_reason')
-    if not openai_tool_calls and (data.get('done') is False or done_reason not in (None, 'stop')):
-        response['choices'][0]['finish_reason'] = (
-            done_reason if done_reason in {'length', 'content_filter'} else 'length'
-        )
+    if not openai_tool_calls and ollama_response.get('done_reason'):
+        response['choices'][0]['finish_reason'] = ollama_response['done_reason']
     return response
 
 
@@ -252,6 +249,7 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
             has_tool_calls = True
 
         done = data.get('done', False)
+        done_reason = data.get('done_reason')
 
         usage = None
         if done:
@@ -268,6 +266,8 @@ async def convert_streaming_response_ollama_to_openai(ollama_streaming_response)
 
         if done and has_tool_calls:
             data['choices'][0]['finish_reason'] = 'tool_calls'
+        elif done_reason:
+            data['choices'][0]['finish_reason'] = done_reason
 
         line = f'data: {JSONCodec.dumps(data)}\n\n'
         yield line

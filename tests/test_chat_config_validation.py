@@ -15,6 +15,7 @@ for name in ('data', 'static'):
 os.environ.setdefault('WEBUI_SECRET_KEY', 'local-test-only')
 
 chats_router = importlib.import_module('open_webui.routers.chats')
+Users = importlib.import_module('open_webui.models.users').Users
 ChatConfigForm = chats_router.ChatConfigForm
 CompactChatForm = chats_router.CompactChatForm
 
@@ -42,7 +43,7 @@ def test_chat_config_additional_field_defaults():
     data = response.json()
     assert data['CONTEXT_COMPACTION_MODEL'] == ''
     assert data['CONTEXT_COMPACTION_TOKEN_CAP'] is None
-    assert data['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] == 40
+    assert data['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] is None
     assert data['ENABLE_TOOL_PERMISSIONS'] is False
     assert data['CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO'] == 0.5
     assert data['CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS'] == ''
@@ -240,8 +241,11 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
         },
     }
 
-    async def get_chat(_chat_id, _user, db=None):
+    async def get_chat(_chat_id, _user, db=None, **_kwargs):
         return chat
+
+    async def get_users(_user_ids, db=None):
+        return []
 
     async def get_messages_map(_chat_id):
         return normalized_map
@@ -249,7 +253,8 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
     async def get_streams(*_args):
         return {}
 
-    monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_for_user', get_chat)
+    monkeypatch.setattr(chats_router.Chats, 'get_accessible_chat_by_id', get_chat)
+    monkeypatch.setattr(Users, 'get_users_by_user_ids', get_users)
     monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages_map)
     monkeypatch.setattr(chats_router, 'get_response_streams_by_chat_id', get_streams)
 

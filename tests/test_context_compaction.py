@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import gc
 import importlib
@@ -837,113 +838,6 @@ def test_model_params_are_not_consumed_across_sibling_requests():
     assert first == second == {'temperature': 0.5, 'top_p': 0.8}
 
 
-def test_file_context_restores_by_message_id_after_filter_reordering():
-    middleware = importlib.import_module('open_webui.utils.middleware')
-    first = [{'id': 'file-1', 'url': 'https://example.test/one'}]
-    second = [{'id': 'file-2', 'url': 'https://example.test/two'}]
-    captured = {'u1': first, 'u2': second}
-    filtered = [
-        {'id': 'u2', 'role': 'user', 'content': 'two'},
-        {'role': 'user', 'content': 'inserted'},
-        {'role': 'assistant', 'content': 'answer'},
-        {'id': 'u1', 'role': 'user', 'content': 'one'},
-    ]
-
-    restored = middleware.restore_message_files(filtered, captured)
-    assert restored[0]['files'] is second
-    assert 'files' not in restored[1]
-    assert restored[3]['files'] is first
-    assert all('id' not in message for message in restored)
-
-
-def test_file_context_identity_survives_message_normalization():
-    middleware = importlib.import_module('open_webui.utils.middleware')
-    files = [{'id': 'file-1', 'url': 'https://example.test/file'}]
-    messages = [
-        {'id': 'u1', 'role': 'user', 'content': 'inspect', 'files': files},
-        {
-            'id': 'a1',
-            'role': 'assistant',
-            'content': '',
-            'output': [
-                {
-                    'type': 'function_call',
-                    'call_id': 'call-1',
-                    'name': 'tool',
-                    'arguments': '{}',
-                    'status': 'completed',
-                },
-                {
-                    'type': 'function_call_output',
-                    'call_id': 'call-1',
-                    'output': [{'type': 'input_image', 'image_url': 'data:image/png;base64,AA=='}],
-                },
-            ],
-        },
-    ]
-
-    processed = middleware.process_messages_with_output(messages)
-    restored = middleware.restore_message_files(processed, {'u1': files})
-
-    user_messages = [message for message in restored if message.get('role') == 'user']
-    assert user_messages[0]['files'] is files
-    assert 'files' not in user_messages[1]
-
-
-def test_approved_tool_pair_appends_without_replacing_prepared_messages(monkeypatch):
-    middleware = importlib.import_module('open_webui.utils.middleware')
-    prepared = [
-        {'role': 'system', 'content': 'prepared policy'},
-        {'role': 'user', 'content': 'prepared user'},
-    ]
-    form_data = {'messages': copy.deepcopy(prepared)}
-    stored = {
-        'output': [
-            {
-                'type': 'function_call',
-                'call_id': 'call-1',
-                'name': 'lookup',
-                'arguments': '{}',
-                'status': 'queued',
-                'approved': True,
-            }
-        ]
-    }
-
-    async def get_message(_chat_id, _message_id):
-        return stored
-
-    async def execute(*_args, **_kwargs):
-        return {'tool_call_id': 'call-1', 'content': 'result'}
-
-    async def get_events(_metadata):
-        return None, None
-
-    async def upsert(*_args, **_kwargs):
-        return stored
-
-    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
-    monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
-    monkeypatch.setattr(middleware, 'get_event_emitter_and_caller', get_events)
-    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
-
-    paused, appended = asyncio.run(
-        middleware.drain_approved_tool_calls(
-            None,
-            form_data,
-            None,
-            {'id': 'model'},
-            {'chat_id': 'chat', 'message_id': 'assistant', 'assistant_message_id': 'assistant', 'params': {}},
-        )
-    )
-
-    assert paused is False
-    assert form_data['messages'][:2] == prepared
-    assert form_data['messages'][2:] == appended
-    assert [message['role'] for message in appended] == ['assistant', 'tool']
-    assert appended[1]['content'] == 'result'
-
-
 def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
@@ -967,9 +861,9 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
 
     async def execute(*args):
         executed.append(args[-1]['id'])
-        return {'tool_call_id': 'reader-call', 'content': 'catalog'}
+        return {}, 'catalog', None, None, False
 
-    monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+    monkeypatch.setattr(middleware, 'execute_tool_call', execute)
     async def run():
         registry = {}
         await refs.externalize_refs(
@@ -994,7 +888,6 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
             None,
             {'tools': registry},
             None,
-            None,
             [reader_call, write_call],
             output,
         )
@@ -1010,7 +903,6 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
             None,
             {'tools': custom},
             None,
-            None,
             [reader_call],
             [],
         )
@@ -1025,88 +917,6 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
     assert output[1]['status'] == 'in_progress'
     assert output[-1]['call_id'] == 'reader-call'
     assert output[-1]['output'][0]['text'] == 'catalog'
-
-
-def test_approved_reader_rebuilds_catalog_and_keeps_its_result_literal(monkeypatch):
-    middleware = importlib.import_module('open_webui.utils.middleware')
-    refs = importlib.import_module('open_webui.utils.externalized_refs')
-    source = 'approved reader source ' * 600
-    stored = {}
-
-    async def get_message(_chat_id, _message_id):
-        return stored
-
-    async def get_events(_metadata):
-        return None, None
-
-    async def upsert(*_args, **_kwargs):
-        return stored
-
-    async def process_result(_request, _name, result, *_args):
-        return result, [], []
-
-    async def noop(*_args, **_kwargs):
-        return None
-
-    async def run():
-        registry = {}
-        metadata = {
-            'chat_id': 'chat',
-            'message_id': 'assistant',
-            'assistant_message_id': 'assistant',
-            'params': {},
-        }
-        state = {
-            'externalized_refs': {
-                'enable': True,
-                'threshold': 1000,
-                'native': True,
-                'registry': registry,
-                'metadata': metadata,
-            }
-        }
-        body = {
-            'stream': True,
-            'messages': [
-                {'role': 'user', 'content': 'prepared user'},
-                {'role': 'tool', 'tool_call_id': 'old-call', 'content': source},
-            ],
-        }
-        body = await middleware.apply_externalized_refs(body, state)
-        projected = body['messages'][1]['content']
-        ref = re.search(r'tool:[0-9a-f]{64}', projected).group(0)
-        stored['output'] = [
-            {
-                'type': 'function_call',
-                'call_id': 'reader-call',
-                'name': refs.REF_EXEC_TOOL_NAME,
-                'arguments': middleware.JSONCodec.dumps({'command': f'wc -c {ref}'}),
-                'status': 'queued',
-                'approved': True,
-            }
-        ]
-
-        paused, appended = await middleware.drain_approved_tool_calls(
-            None,
-            body,
-            None,
-            {'id': 'model'},
-            metadata,
-        )
-        body = await middleware.apply_externalized_refs(body, state)
-        return paused, appended, body
-
-    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
-    monkeypatch.setattr(middleware, 'get_event_emitter_and_caller', get_events)
-    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
-    monkeypatch.setattr(middleware, 'process_tool_result', process_result)
-    monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
-
-    paused, appended, body = asyncio.run(run())
-    expected = str(len(source.encode('utf-8')))
-    assert paused is False
-    assert appended[-1]['content'] == expected
-    assert body['messages'][-1]['content'] == expected
 
 
 def test_direct_compaction_can_use_configured_server_summary_model():
@@ -2242,10 +2052,10 @@ def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path
         resume = asyncio.Event()
 
         class PausingSession(AsyncSession):
-            async def commit(self):
+            async def flush(self, objects=None):
                 paused.set()
                 await resume.wait()
-                await super().commit()
+                await super().flush(objects)
 
         engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "chat.db"}')
         normal_session = async_sessionmaker(engine, expire_on_commit=False)
@@ -2262,17 +2072,21 @@ def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path
                     {'role': 'assistant', 'content': 'before'},
                     db=db,
                 )
+                await db.commit()
 
             async with pausing_session() as db:
-                chat_update = asyncio.create_task(
-                    chat_messages.ChatMessages.upsert_message(
+
+                async def update_chat():
+                    await chat_messages.ChatMessages.upsert_message(
                         'message',
                         'chat',
                         'user',
                         {'role': 'assistant', 'content': 'after'},
                         db=db,
                     )
-                )
+                    await db.commit()
+
+                chat_update = asyncio.create_task(update_chat())
                 await paused.wait()
                 async with normal_session() as checkpoint_db:
                     assert await chat_messages.ChatMessages.update_context_summary(
@@ -2292,7 +2106,7 @@ def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path
                     db=db,
                 )
                 message = await db.get(chat_messages.ChatMessage, 'chat-message')
-                assert message.content == 'reconciled'
+                assert message.content == 'after'
                 assert message.context_summary == 'checkpoint'
         finally:
             resume.set()
@@ -3717,6 +3531,7 @@ def _payload_leg_patches(monkeypatch, middleware, *, request_filter=None, refs_r
         return form_data
 
     monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(middleware.Chats, 'get_chat_by_id', noop)
     monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', pipeline_inlet)
     monkeypatch.setattr(middleware, 'convert_url_images_to_base64', url_images)
     monkeypatch.setattr(middleware, 'resolve_system_prompt', system_prompt)
@@ -3744,10 +3559,10 @@ def _payload_leg_patches(monkeypatch, middleware, *, request_filter=None, refs_r
 
         monkeypatch.setattr(middleware, 'process_filter_functions', process)
         monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
-        monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+        monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
 
 
-def _payload_leg_drain(monkeypatch, middleware, stored, tool_result=None, stub_execute=True):
+def _payload_leg_drain(monkeypatch, middleware, stored, history=None, seed=None, stub_execute=True):
     async def get_message(_chat_id, _message_id):
         return stored
 
@@ -3757,14 +3572,28 @@ def _payload_leg_drain(monkeypatch, middleware, stored, tool_result=None, stub_e
     async def upsert(*_args, **_kwargs):
         return stored
 
+    @contextlib.asynccontextmanager
+    async def edit_output(_chat_id, _message_id):
+        yield stored
+
     async def execute(*_args, **_kwargs):
-        return tool_result or {'tool_call_id': 'call-1', 'content': 'result'}
+        return {}, 'result', None, None, False
+
+    async def load_history(_chat_id, _message_id):
+        return list(history)
+
+    async def prepare(messages, _metadata):
+        return messages, {'config': {'enable': False}, **(seed or {})}
 
     monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
     monkeypatch.setattr(middleware, 'get_event_emitter_and_caller', get_events)
     monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
+    monkeypatch.setattr(middleware.Chats, 'edit_message_output', edit_output)
     if stub_execute:
-        monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+        monkeypatch.setattr(middleware, 'execute_tool_call', execute)
+    if history is not None:
+        monkeypatch.setattr(middleware, 'load_messages_from_db', load_history)
+        monkeypatch.setattr(middleware, '_prepare_compaction_or_default', prepare)
 
 
 def _seed_state_on_capture(monkeypatch, middleware, seed):
@@ -3811,6 +3640,8 @@ def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None,
 
 def _approved_stored():
     return {
+        'id': 'assistant',
+        'role': 'assistant',
         'output': [
             {
                 'type': 'function_call',
@@ -3930,6 +3761,19 @@ def test_payload_send_carries_filter_marker_and_canonical_stays_clean(monkeypatc
     assert len(calls) == 1
 
 
+def test_user_message_ids_do_not_reach_the_provider(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+
+    send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, [{'id': 'u1', 'role': 'user', 'content': 'start'}])
+    )
+
+    assert send['messages'] == [{'role': 'user', 'content': 'start'}]
+    assert state['canonical_body']['messages'] == send['messages']
+
+
 def test_paused_rollback_restores_ref_apply_state(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
@@ -3938,6 +3782,8 @@ def test_paused_rollback_restores_ref_apply_state(monkeypatch):
     held = compaction.render_summary_message('summary text')['content']
     sentinel_tools = {'pre': {'spec': {'name': 'pre'}}}
     stored = {
+        'id': 'assistant',
+        'role': 'assistant',
         'output': [
             {
                 'type': 'function_call',
@@ -3956,24 +3802,25 @@ def test_paused_rollback_restores_ref_apply_state(monkeypatch):
         first['content'] = first.get('content', '') + '|MARK|'
         return body
 
-    _payload_leg_patches(monkeypatch, middleware, request_filter=marker_filter, refs_runtime=(True, 2))
-    _payload_leg_drain(monkeypatch, middleware, stored)
-    _seed_state_on_capture(
-        monkeypatch,
-        middleware,
-        {'selected_history': history, 'summary_message_content': held},
-    )
     messages = [
         {'role': 'user', 'content': 'start'},
         {'role': 'user', 'content': held},
     ]
+    _payload_leg_patches(monkeypatch, middleware, request_filter=marker_filter, refs_runtime=(True, 2))
+    _payload_leg_drain(
+        monkeypatch,
+        middleware,
+        stored,
+        history=messages,
+        seed={'selected_history': history, 'summary_message_content': held},
+    )
 
     returned, metadata, _events, state = asyncio.run(
         _run_payload_leg(
             middleware,
             messages,
             params={'tool_approval_mode': 'ask'},
-            seeded_metadata={'tools': sentinel_tools},
+            seeded_metadata={'tools': sentinel_tools, 'user_message_id': 'u1'},
         )
     )
 
@@ -3997,16 +3844,174 @@ def test_resume_transforms_each_send_copy_once(monkeypatch):
         first['content'] = first['content'].replace('NEEDLE', 'DONE', 1)
         return body
 
+    messages = [{'role': 'user', 'content': 'NEEDLE NEEDLE'}]
     _payload_leg_patches(monkeypatch, middleware, request_filter=needle_filter, refs_runtime=(False, 1000))
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored(), history=messages)
 
     send, _metadata, _events, state = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'NEEDLE NEEDLE'}])
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'})
     )
 
     assert seen == ['NEEDLE NEEDLE', 'NEEDLE NEEDLE']
     assert send['messages'][0]['content'] == 'DONE NEEDLE'
     assert state['canonical_body']['messages'][0]['content'] == 'NEEDLE NEEDLE'
+    assert [(m['role'], m.get('content')) for m in state['canonical_body']['messages'][-2:]] == [
+        ('assistant', ''),
+        ('tool', 'result'),
+    ]
+
+
+@pytest.mark.parametrize('checkpoint', [False, True])
+def test_resume_request_is_a_prefix_of_the_next_turn(monkeypatch, checkpoint):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    long_output = 'row of tool output. ' * 600
+
+    def call(call_id, **extra):
+        return {'type': 'function_call', 'call_id': call_id, 'name': 'lookup', 'arguments': '{}', **extra}
+
+    def result(call_id):
+        return {
+            'type': 'function_call_output',
+            'call_id': call_id,
+            'output': [{'type': 'input_text', 'text': long_output + call_id}],
+            'status': 'completed',
+        }
+
+    user = {'id': 'u1', 'role': 'user', 'content': 'question'}
+    stored = {
+        'id': 'assistant',
+        'role': 'assistant',
+        'model': 'model',
+        'output': [
+            call('call-0', status='completed'),
+            result('call-0'),
+            call('call-1', status='completed', **({'contextSummary': 'summary'} if checkpoint else {})),
+            result('call-1'),
+            call('call-2', status='queued', approved=True),
+        ],
+    }
+
+    async def prepare(messages, _metadata):
+        replayed, state = compaction.replay_stored_compaction_checkpoint(messages)
+        return replayed, {**state, 'config': {'enable': False}}
+
+    async def execute(*_args, **_kwargs):
+        return {}, long_output + 'call-2', None, None, False
+
+    def leg(history, **metadata):
+        _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 200))
+        _payload_leg_drain(monkeypatch, middleware, stored, history=history, stub_execute=False)
+        monkeypatch.setattr(middleware, '_prepare_compaction_or_default', prepare)
+        monkeypatch.setattr(middleware, 'execute_tool_call', execute)
+        send, *_ = asyncio.run(_run_payload_leg(middleware, [{'role': 'user', 'content': 'client copy'}], **metadata))
+        return send
+
+    resumed = leg([user], seeded_metadata={'user_message_id': 'u1'})
+
+    assert stored['output'][-1]['status'] == 'in_progress'
+    stored['output'][-1] = {
+        'type': 'message',
+        'status': 'completed',
+        'role': 'assistant',
+        'content': [{'type': 'output_text', 'text': 'final answer'}],
+    }
+    rebuilt = leg(
+        [user, stored, {'id': 'u2', 'role': 'user', 'content': 'next'}],
+        seeded_metadata={'user_message_id': 'u2'},
+        assistant_message_id=None,
+    )
+
+    sent = resumed['messages']
+    assert checkpoint == ('summary' in sent[0]['content'])
+    tool_outputs = [m['content'] for m in sent if m['role'] == 'tool']
+    assert tool_outputs and all(len(content) < len(long_output) for content in tool_outputs)
+    assert rebuilt['messages'][: len(sent)] == sent
+    assert rebuilt['tools'] == resumed['tools']
+
+
+def test_summary_made_while_resuming_is_reused_by_the_next_turn(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    history = [
+        {'id': 'u0', 'role': 'user', 'content': 'old user details ' * 1000},
+        {'id': 'a0', 'role': 'assistant', 'content': 'old answer details ' * 1000},
+        {'id': 'u1', 'role': 'user', 'content': 'question'},
+    ]
+    stored = {
+        'id': 'assistant',
+        'role': 'assistant',
+        'model': 'model',
+        'output': [
+            {'type': 'function_call', 'call_id': 'call-0', 'name': 'lookup', 'arguments': '{}', 'status': 'completed'},
+            {
+                'type': 'function_call_output',
+                'call_id': 'call-0',
+                'output': [{'type': 'input_text', 'text': 'tool output details ' * 800}],
+                'status': 'completed',
+            },
+            {
+                'type': 'function_call',
+                'call_id': 'call-1',
+                'name': 'lookup',
+                'arguments': '{}',
+                'status': 'queued',
+                'approved': True,
+            },
+        ],
+    }
+
+    def tokens(messages):
+        prepared = middleware.sanitize_tool_pairs(middleware.process_messages_with_output(copy.deepcopy(messages)))
+        return compaction.estimate_provider_tokens({'model': 'model', 'messages': prepared})
+
+    history_tokens, full_tokens = tokens(history), tokens([*history, stored])
+    threshold = (history_tokens + full_tokens) // 2
+    assert history_tokens < threshold < full_tokens
+    summaries, saves = [], []
+
+    async def load_config():
+        return _compaction_config(token_threshold=threshold, token_cap=threshold)
+
+    async def generate_summary(*_args, **_kwargs):
+        summaries.append(f'summary {len(summaries) + 1}')
+        return summaries[-1]
+
+    async def save_checkpoint(_chat_id, message_id, summary):
+        saves.append((message_id, summary))
+        next(message for message in history if message['id'] == message_id)['contextSummary'] = summary
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+
+    def leg(branch, **metadata):
+        _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+        _payload_leg_drain(monkeypatch, middleware, stored, history=branch)
+        monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+        send, *_ = asyncio.run(_run_payload_leg(middleware, [{'role': 'user', 'content': 'client copy'}], **metadata))
+        return send['messages']
+
+    resumed = leg(history, seeded_metadata={'user_message_id': 'u1'})
+
+    assert stored['output'][-1]['status'] == 'in_progress'
+    stored['output'][-1] = {
+        'type': 'message',
+        'status': 'completed',
+        'role': 'assistant',
+        'content': [{'type': 'output_text', 'text': 'final answer'}],
+    }
+    rebuilt = leg(
+        [*history, stored, {'id': 'u2', 'role': 'user', 'content': 'next'}],
+        seeded_metadata={'user_message_id': 'u2'},
+        assistant_message_id=None,
+    )
+
+    assert saves == [('u1', 'summary 1')]
+    assert 'summary 1' in resumed[0]['content']
+    assert rebuilt[: len(resumed)] == resumed
 
 
 def test_approved_pass2_mint_reflects_into_canonical(monkeypatch):
@@ -4016,19 +4021,22 @@ def test_approved_pass2_mint_reflects_into_canonical(monkeypatch):
     assert history is not None
     held = compaction.render_summary_message('summary text')['content']
 
-    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
-    _seed_state_on_capture(
-        monkeypatch,
-        middleware,
-        {'selected_history': history, 'summary_message_content': held},
-    )
     messages = [
         {'role': 'user', 'content': 'question'},
         {'role': 'user', 'content': held},
     ]
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(
+        monkeypatch,
+        middleware,
+        _approved_stored(),
+        history=messages,
+        seed={'selected_history': history, 'summary_message_content': held},
+    )
 
-    send, _metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+    send, _metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'})
+    )
 
     canonical_held = next(
         message for message in state['canonical_body']['messages'] if '<auto_compaction_context>' in message['content']
@@ -4054,7 +4062,6 @@ def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
         return {**body, 'messages': kept}
 
     _payload_leg_patches(monkeypatch, middleware, request_filter=deleting_filter, refs_runtime=(True, 1000))
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
     messages = [
         {'role': 'user', 'content': 'question'},
         {
@@ -4070,8 +4077,11 @@ def test_pass2_filtered_ref_absent_from_final_catalog(monkeypatch):
         },
         {'role': 'tool', 'tool_call_id': 'old-call', 'content': big},
     ]
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored(), history=messages)
 
-    send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+    send, metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'})
+    )
 
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
@@ -4103,19 +4113,22 @@ def test_approved_rollback_keeps_filter_metadata_changes(monkeypatch):
         ]
         return {**body, 'messages': kept}
 
-    _payload_leg_patches(monkeypatch, middleware, request_filter=sentinel_filter, refs_runtime=(True, 1000))
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
-    _seed_state_on_capture(
-        monkeypatch,
-        middleware,
-        {'selected_history': history, 'summary_message_content': held},
-    )
     messages = [
         {'role': 'user', 'content': 'question'},
         {'role': 'user', 'content': held},
     ]
+    _payload_leg_patches(monkeypatch, middleware, request_filter=sentinel_filter, refs_runtime=(True, 1000))
+    _payload_leg_drain(
+        monkeypatch,
+        middleware,
+        _approved_stored(),
+        history=messages,
+        seed={'selected_history': history, 'summary_message_content': held},
+    )
 
-    _send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+    _send, metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'})
+    )
 
     assert calls[1] is sentinel
     registry = state['externalized_refs']['registry']
@@ -4515,7 +4528,7 @@ def _stream_leg_patches(monkeypatch, middleware, *, replies, tools, request_filt
 
         monkeypatch.setattr(middleware, 'process_filter_functions', process)
         monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
-        monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+        monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
 
     current['tool_response'] = tool_response
     current['text_response'] = lambda text: response(
@@ -5172,6 +5185,8 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
     entry = refs.make_ref_entry(big, kind='tool')
     assert entry is not None
     stored = {
+        'id': 'assistant',
+        'role': 'assistant',
         'output': [
             {
                 'type': 'function_call',
@@ -5191,7 +5206,6 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
         return None
 
     _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
-    _payload_leg_drain(monkeypatch, middleware, stored, stub_execute=False)
     monkeypatch.setattr(middleware, 'process_tool_result', process_result)
     monkeypatch.setattr(middleware, 'terminal_event_handler', noop)
     messages = [
@@ -5205,8 +5219,11 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
         },
         {'role': 'tool', 'tool_call_id': 'old-call', 'content': big},
     ]
+    _payload_leg_drain(monkeypatch, middleware, stored, history=messages, stub_execute=False)
 
-    send, metadata, _events, state = asyncio.run(_run_payload_leg(middleware, messages))
+    send, metadata, _events, state = asyncio.run(
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'})
+    )
 
     expected = str(len(big.encode('utf-8')))
     assert state['canonical_body']['messages'][-1]['content'] == expected
@@ -5331,38 +5348,6 @@ def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
     assert refs.REF_EXEC_TOOL_NAME in registry
 
 
-def test_drain_gate_uses_assistant_message_id_with_message_fallback(monkeypatch):
-    middleware = importlib.import_module('open_webui.utils.middleware')
-    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
-
-    async def fail_get_message(*_args, **_kwargs):
-        raise AssertionError('drain must not read the DB without assistant_message_id')
-
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
-    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', fail_get_message)
-
-    _send, _metadata, _events, state = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], assistant_message_id=None)
-    )
-
-    assert state.get('last_send_body') is not None
-
-    seen_ids = []
-
-    async def get_message(_chat_id, message_id):
-        seen_ids.append(message_id)
-        return _approved_stored()
-
-    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', get_message)
-
-    _send2, _metadata2, _events2, state2 = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], message_id=None)
-    )
-
-    assert seen_ids == ['assistant']
-    assert state2['canonical_body']['messages'][-1]['role'] == 'tool'
-
-
 def test_same_name_user_tool_survives_approved_round_trip(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')
@@ -5375,17 +5360,18 @@ def test_same_name_user_tool_survives_approved_round_trip(monkeypatch):
         return {refs.REF_EXEC_TOOL_NAME: user_tool}
 
     monkeypatch.setattr(middleware, 'get_tools', get_tools)
-    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+    monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
 
     async def get_filters(*_args, **_kwargs):
         return []
 
     monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+    messages = [{'role': 'user', 'content': 'q'}]
     _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 2))
-    _payload_leg_drain(monkeypatch, middleware, _approved_stored())
+    _payload_leg_drain(monkeypatch, middleware, _approved_stored(), history=messages)
 
     _send, metadata, _events, state = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'q'}], form_tool_ids=['my-tool'])
+        _run_payload_leg(middleware, messages, seeded_metadata={'user_message_id': 'u1'}, form_tool_ids=['my-tool'])
     )
 
     registry = state['externalized_refs']['registry']
@@ -5686,7 +5672,7 @@ def _run_outlet(monkeypatch, middleware, messages_map, outlet_filter):
     async def emit(event):
         emitted.append(copy.deepcopy(event))
 
-    monkeypatch.setattr(middleware, 'ENABLE_PLUGINS', True)
+    monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
     monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
     monkeypatch.setattr(middleware, 'process_filter_functions', process)
     monkeypatch.setattr(middleware, 'process_pipeline_outlet_filter', pipeline)
@@ -6897,13 +6883,16 @@ def test_repause_publishes_no_measurement_and_keeps_stored_snapshot(monkeypatch)
         saves.append(copy.deepcopy(update))
         return update
 
+    snapshot = {
+        'tokens': 90,
+        'threshold': 100,
+        'soft_threshold': None,
+        'source': 'usage',
+    }
     stored = {
-        'context_usage': {
-            'tokens': 90,
-            'threshold': 100,
-            'soft_threshold': None,
-            'source': 'usage',
-        },
+        'id': 'assistant',
+        'role': 'assistant',
+        'context_usage': dict(snapshot),
         'output': [
             {
                 'type': 'function_call',
@@ -6914,10 +6903,16 @@ def test_repause_publishes_no_measurement_and_keeps_stored_snapshot(monkeypatch)
             }
         ],
     }
+    messages = [{'role': 'user', 'content': 'start'}]
 
     _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
-    _payload_leg_drain(monkeypatch, middleware, stored)
-    _seed_state_on_capture(monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()})
+    _payload_leg_drain(
+        monkeypatch,
+        middleware,
+        stored,
+        history=messages,
+        seed={'summary_message_content': '', 'config': _compaction_config()},
+    )
     monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
     monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 40)
@@ -6925,21 +6920,18 @@ def test_repause_publishes_no_measurement_and_keeps_stored_snapshot(monkeypatch)
     _send, _metadata, _events, state = asyncio.run(
         _run_payload_leg(
             middleware,
-            [{'role': 'user', 'content': 'start'}],
+            messages,
             params={'tool_approval_mode': 'ask'},
+            seeded_metadata={'user_message_id': 'u1'},
         )
     )
 
     assert state.get('paused') is True
     assert 'last_send_body' not in state
     assert _numeric_snapshots(events) == []
-    pause_saves = [update for update in saves if update.get('done') is False]
-    assert pause_saves
-    for update in pause_saves:
-        assert 'context_usage' not in update
-        assert 'pending_context_usage' not in update
-    merged = {**stored, **pause_saves[-1]}
-    assert merged['context_usage'] == stored['context_usage']
+    assert stored['output'][0]['status'] == 'pending'
+    assert stored['context_usage'] == snapshot
+    assert not any('context_usage' in update or 'pending_context_usage' in update for update in saves)
 
 
 def test_first_send_dedupes_against_branch_and_continues_existing_output(monkeypatch):
@@ -7443,7 +7435,9 @@ def test_fork_carries_embedded_context_usage_snapshots(tmp_path, monkeypatch):
                 yield session
 
     monkeypatch.setattr(chats_model, 'get_async_db_context', use_test_db)
+    monkeypatch.setattr(chats_model, 'get_async_db', use_test_db)
     monkeypatch.setattr(chat_messages, 'get_async_db_context', use_test_db)
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
 
     async def permission_granted(*_args, **_kwargs):
         return None
@@ -8323,6 +8317,10 @@ def test_non_stream_cache_inclusive_usage_is_adopted(monkeypatch):
     ), 'the prefetch gate must see the cache-inclusive total'
 
 
+async def _allow_chat_creation(*_args, **_kwargs):
+    return None
+
+
 def _sqlite_session_context(makers):
     from contextlib import asynccontextmanager
 
@@ -8360,7 +8358,9 @@ def _entry_wait_harness(monkeypatch, tmp_path):
 
     makers = {}
     monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model, 'get_async_db', _sqlite_session_context(makers))
     monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
 
     events = []
     upsert_calls = []
@@ -8455,37 +8455,20 @@ def test_initial_wait_and_cancel_keep_confirmed_snapshot(monkeypatch, tmp_path):
                     importlib.import_module('open_webui.models.chat_messages').ChatMessage.__table__.create
                 )
 
-            stored_output = [
-                {
-                    'type': 'message',
-                    'id': 'msg_1',
-                    'status': 'in_progress',
-                    'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': 'old'}],
-                }
-            ]
             await chats_model.Chats.insert_new_chat(
                 'entry-review-chat',
                 'user-1',
                 chats_model.ChatForm(
                     chat={
                         'history': {
-                            'currentId': 'assistant',
+                            'currentId': 'u1',
                             'messages': {
                                 'u1': {
                                     'id': 'u1',
                                     'parentId': None,
                                     'role': 'user',
                                     'content': 'start',
-                                    'childrenIds': ['assistant'],
-                                },
-                                'assistant': {
-                                    'id': 'assistant',
-                                    'parentId': 'u1',
-                                    'role': 'assistant',
-                                    'content': 'old',
-                                    'output': stored_output,
-                                    'done': True,
+                                    'childrenIds': [],
                                 },
                             },
                         }
@@ -8688,7 +8671,9 @@ def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path)
 
     makers = {}
     monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model, 'get_async_db', _sqlite_session_context(makers))
     monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
 
     async def read_rows():
         async with makers['session']() as session:

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import copy
 import importlib
 import json
@@ -56,6 +57,7 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
         'models.default_params': {},
         'chat.tool_permissions.enable': False,
         'ui.default_models': 'fallback-model',
+        'user.permissions': {},
         **(config_values or {}),
     }
 
@@ -68,7 +70,7 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
             'params': copy.deepcopy(metadata.get('params')),
             'params_ref': metadata.get('params'),
             'options_ref': form_data.get('stream_options'),
-            'system_prompt': metadata.get('system_prompt'),
+            'system_prompt': metadata.get('base_system_prompt'),
             'messages': copy.deepcopy(form_data.get('messages')),
         }
         if form_data.get('stream'):
@@ -225,6 +227,46 @@ def test_fanout_target_without_values_falls_to_core_defaults(monkeypatch):
     assert bare['reasoning_tags'] is None
     assert bare['stream_delta_chunk_size'] is None
     assert bare['function_calling'] == 'native'
+
+
+def test_model_controls_reach_each_column(monkeypatch):
+    def controls(**extra):
+        options = {name: {'label': name, 'params': {'reasoning_effort': name}} for name in ('low', 'high')}
+        return {'effort': {'label': 'Effort', 'options': options, **extra}}
+
+    models_map = {
+        'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
+        'sibling-model': {'id': 'sibling-model', 'owned_by': 'openai', 'info': {}},
+    }
+    model_infos = {
+        'primary-model': _EntryModelInfo({'model_controls': controls()}),
+        'sibling-model': _EntryModelInfo({'model_controls': controls(default='low')}),
+    }
+    _captured, request, user, _seen_keys = _install_provider_sink_harness(monkeypatch, model_infos)
+    request.app.state.MODELS = models_map
+    bodies = {}
+
+    async def sink(request=None, form_data=None, user=None):
+        bodies[form_data['metadata']['message_id']] = form_data
+        return {'choices': [{'message': {'content': 'ok'}}]}
+
+    monkeypatch.setattr(chat, 'generate_openai_chat_completion', sink)
+
+    _run_chat_completion(
+        request,
+        user,
+        _base_form_data(
+            'primary-model',
+            [
+                {'model_id': 'primary-model', 'message_id': 'm1'},
+                {'model_id': 'sibling-model', 'message_id': 'm2'},
+            ],
+            params={'model_controls': {'primary-model': {'effort': 'high'}}},
+        ),
+    )
+
+    assert bodies['m1']['reasoning_effort'] == 'high'
+    assert bodies['m2']['reasoning_effort'] == 'low'
 
 
 def test_caller_stream_restored_per_column(monkeypatch):
@@ -1149,6 +1191,7 @@ def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatc
     request.app.state.MODELS = {'model': {'id': 'model', 'owned_by': 'openai', 'info': {}}}
     original = {
         'id': 'm1',
+        'parentId': 'u1',
         'role': 'assistant',
         'content': 'OLD',
         'output': [
@@ -1179,7 +1222,17 @@ def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatc
         return stored
 
     async def execute(*args, **kwargs):
-        return {'tool_call_id': 'call', 'content': 'RESULT'}
+        return {}, 'RESULT', None, None, False
+
+    @contextlib.asynccontextmanager
+    async def edit_output(*args, **kwargs):
+        yield stored
+
+    async def get_chat(*args, **kwargs):
+        return SimpleNamespace(id='saved', user_id=user.id)
+
+    async def load_history(*args, **kwargs):
+        return [{'id': 'u1', 'role': 'user', 'content': 'start'}]
 
     async def build(*args, **kwargs):
         ctx = await real_build(*args, **kwargs)
@@ -1196,7 +1249,10 @@ def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatc
         monkeypatch.setattr(main.Chats, name, noop)
     monkeypatch.setattr(main.Chats, 'get_message_by_id_and_message_id', get_message)
     monkeypatch.setattr(main.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
-    monkeypatch.setattr(middleware, 'execute_tool_call_for_output', execute)
+    monkeypatch.setattr(main.Chats, 'edit_message_output', edit_output)
+    monkeypatch.setattr(main.Chats, 'get_accessible_chat_by_id', get_chat)
+    monkeypatch.setattr(middleware, 'execute_tool_call', execute)
+    monkeypatch.setattr(middleware, 'load_messages_from_db', load_history)
     monkeypatch.setattr(main, 'build_chat_response_context', build)
     monkeypatch.setattr(middleware, 'get_event_emitter', noop)
     monkeypatch.setattr(middleware, 'get_event_call', noop)
@@ -1262,6 +1318,21 @@ def test_ollama_task_generation_explicit_limit_maps_to_num_predict(monkeypatch, 
 
     assert len(captured) == 1
     assert _ollama_token_limits(captured[0]) == {'options.num_predict': 65536}
+
+
+@pytest.mark.parametrize(
+    ('kind', 'expected'),
+    [('normal_chat', ['MODEL SYSTEM']), ('title', ['MODEL SYSTEM']), ('summary', [])],
+)
+def test_ollama_model_system_prompt_reaches_the_wire_once(monkeypatch, kind, expected):
+    model_params = {'system': 'MODEL SYSTEM'}
+    captured = _install_task_wire_harness(monkeypatch, model_params=model_params)
+    request = _task_wire_request('llama3.1', model_params, owned_by='ollama')
+
+    _run_task_generation(kind, request, _task_wire_user(), 'llama3.1')
+
+    assert len(captured) == 1
+    assert [m['content'] for m in captured[0]['messages'] if m['role'] == 'system'] == expected
 
 
 @pytest.mark.parametrize('kind', ['normal_chat', 'follow_up'])
