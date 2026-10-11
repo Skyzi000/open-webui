@@ -389,6 +389,51 @@ def test_provider_estimate_uses_exact_input_anchor_plus_new_suffix():
     assert compaction.estimate_provider_tokens(body) == 1_000 + suffix - 3
 
 
+@pytest.mark.parametrize('tool_round', [False, True])
+def test_reply_usage_anchors_the_estimate_only_when_it_measured_one_model_call(monkeypatch, tool_round):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    tool_items = [
+        {'type': 'function_call', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}', 'status': 'completed'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-1',
+            'output': [{'type': 'input_text', 'text': 'tool output ' * 2_000}],
+            'status': 'completed',
+        },
+    ]
+    answer = {
+        'type': 'message',
+        'role': 'assistant',
+        'status': 'completed',
+        'content': [{'type': 'output_text', 'text': 'answer'}],
+    }
+    messages = [
+        {'id': 'u1', 'role': 'user', 'content': 'already measured ' * 2_000},
+        {
+            'id': 'a1',
+            'role': 'assistant',
+            'content': 'answer',
+            'output': [*(tool_items if tool_round else []), answer],
+            'usage': {'prompt_tokens': 1_000, 'completion_tokens': 5},
+        },
+        {'id': 'u2', 'role': 'user', 'content': 'new input'},
+    ]
+
+    async def load_config():
+        return _compaction_config(token_threshold=1_000_000, token_cap=1_000_000)
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    prepared, _state = asyncio.run(compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'}))
+    body = {'messages': middleware.process_messages_with_output(prepared)}
+
+    expected = (
+        compaction.estimate_body_tokens(body)
+        if tool_round
+        else 1_000 + compaction.estimate_body_tokens({'messages': body['messages'][1:]}) - 3
+    )
+    assert compaction.estimate_provider_tokens(body) == expected
+
+
 def test_body_estimate_includes_extras_and_bounds_large_payload_encoding(monkeypatch):
     base = {'messages': [{'role': 'user', 'content': 'hello'}]}
     base_tokens = compaction.estimate_body_tokens(base)

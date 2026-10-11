@@ -879,7 +879,12 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
             break
         input_tokens = _strict_usage_input_tokens(usage)
         if input_tokens is not None:
-            message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY] = input_tokens
+            # merge_usage keeps one prompt size per reply, so a reply with tool rounds cannot say which call it measured.
+            if not any(
+                isinstance(item, dict) and item.get('type') == 'function_call_output'
+                for item in message.get('output') or []
+            ):
+                message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY] = input_tokens
             break
     boundary = await asyncio.to_thread(
         find_safe_compaction_boundary,
