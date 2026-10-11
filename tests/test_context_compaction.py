@@ -5889,6 +5889,32 @@ def test_adoption_output_item_is_invisible_to_provider_conversion():
             )
 
 
+def test_stored_tool_rounds_convert_as_the_loop_sent_them():
+    misc = importlib.import_module('open_webui.utils.misc')
+
+    def call(call_id):
+        return {'type': 'function_call', 'call_id': call_id, 'name': 'lookup', 'arguments': '{}', 'status': 'completed'}
+
+    def result(call_id):
+        return {
+            'type': 'function_call_output',
+            'call_id': call_id,
+            'output': [{'type': 'input_text', 'text': f'result-{call_id}'}],
+        }
+
+    rounds = [
+        [call('a'), result('a')],
+        [call('b'), call('c'), result('b'), result('c')],
+        [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'checking'}]}, call('d'), result('d')],
+        [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'done'}]}],
+    ]
+    sent_by_loop = [message for items in rounds for message in misc.convert_output_to_messages(items, raw=True)]
+    stored = [*rounds[0], _adoption_item('SUMMARY'), *rounds[1], *rounds[2], *rounds[3]]
+
+    assert misc.convert_output_to_messages(stored, raw=True) == sent_by_loop
+    assert [len(message.get('tool_calls', [])) for message in sent_by_loop] == [1, 0, 2, 0, 0, 1, 0, 0]
+
+
 def test_code_interpreter_survives_adoption_output_item():
     misc = importlib.import_module('open_webui.utils.misc')
 

@@ -471,10 +471,9 @@ def convert_output_to_messages(
     for item in output:
         item_type = item.get('type', '')
         if item_type == 'open_webui:context_compaction':
-            # Display-only record; skipping before the flushes keeps the
-            # assistant/tool batching of adjacent tool rounds unchanged.
+            # Display-only record; it never becomes a message.
             continue
-        if item_type not in {'function_call', 'function_call_output'}:
+        if item_type != 'function_call_output':
             flush_tool_outputs()
             flush_tool_images()
 
