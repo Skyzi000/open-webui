@@ -1136,11 +1136,25 @@ async def compact_provider_payload(
     _record_pending_context_usage(state, before, threshold, config)
     if before <= threshold:
         soft_ratio = config['soft_trigger_ratio']
+        cut = None
+        latest = 0
         if (
-            boundary
-            and soft_ratio > 0
+            soft_ratio > 0
             and before >= int(threshold * soft_ratio)
             and not isinstance(state.get('prefetch_task'), asyncio.Task)
+        ):
+            latest = await asyncio.to_thread(
+                find_safe_compaction_boundary,
+                projected_working,
+                config['retention_percentage'],
+                config['transient_patterns'],
+                maximize=True,
+            )
+        # This summary is adopted a turn later, so it folds every completed turn instead of keeping the retention share.
+        if (
+            latest
+            and (checkpoint := _checkpoint_for_boundary(state, working, latest)) is not None
+            and _has_new_compaction_content(projected_working[:latest], state)
         ):
             # ponytail: duplicate cross-worker prefetches are harmless; add Redis
             # dedup only if measured summary cost warrants the coordination.
@@ -1164,8 +1178,10 @@ async def compact_provider_payload(
                     metadata,
                     state,
                     config,
-                    _without_boundary_marker(projected_working[:boundary], keep_transient=True),
-                    _without_boundary_marker(projected_working[boundary:], keep_transient=True),
+                    _without_boundary_marker(projected_working[:latest], keep_transient=True),
+                    _without_boundary_marker(projected_working[latest:], keep_transient=True),
+                    checkpoint_history=checkpoint[0],
+                    absorbed_files=checkpoint[1],
                 )
             )
             task = asyncio.create_task(
@@ -1173,7 +1189,12 @@ async def compact_provider_payload(
             )
             task.add_done_callback(_prefetch_done)
             state['prefetch_task'] = task
-        return {**body, 'messages': _without_boundary_marker(messages)}
+            state['prefetch_absorbed_files'] = checkpoint[1]
+            cut = len(messages) - len(working) + latest
+        cleaned = _without_boundary_marker(messages)
+        if cut is not None:
+            state['prefetch_cut_message'] = cleaned[cut]
+        return {**body, 'messages': cleaned}
 
     largest = find_safe_compaction_boundary(
         projected_working,
@@ -1205,8 +1226,6 @@ async def compact_provider_payload(
         summary_meta = None
         history_entry = None
         selected_checkpoint = None
-        prefetch_task = state.pop('prefetch_task', None)
-        checkpoint_already_saved = False
         for candidate_boundary in boundaries:
             compacted_messages = _without_boundary_marker(
                 projected_working[:candidate_boundary],
@@ -1220,24 +1239,19 @@ async def compact_provider_payload(
             checkpoint = _checkpoint_for_boundary(state, working, candidate_boundary)
             if checkpoint is None:
                 continue
-            if candidate_boundary == boundary and isinstance(prefetch_task, asyncio.Task):
-                summary, summary_meta, history_entry, checkpoint_message_id = await prefetch_task
-                checkpoint_already_saved = True
-            else:
-                checkpoint_already_saved = False
-                summary, summary_meta, history_entry, checkpoint_message_id = await _generate_checkpoint(
-                    request,
-                    user,
-                    model_id,
-                    models,
-                    metadata,
-                    state,
-                    config,
-                    compacted_messages,
-                    projected_recent,
-                    checkpoint_history=checkpoint[0],
-                    absorbed_files=checkpoint[1],
-                )
+            summary, summary_meta, history_entry, checkpoint_message_id = await _generate_checkpoint(
+                request,
+                user,
+                model_id,
+                models,
+                metadata,
+                state,
+                config,
+                compacted_messages,
+                projected_recent,
+                checkpoint_history=checkpoint[0],
+                absorbed_files=checkpoint[1],
+            )
             # The held identity must track the candidate actually returned to
             # the provider; the projected copy below is estimation-only and its
             # separate render must never become the held reference.
@@ -1267,8 +1281,7 @@ async def compact_provider_payload(
 
         if compacted_body is None:
             raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
-        if not checkpoint_already_saved:
-            await _save_checkpoint(metadata['chat_id'], checkpoint_message_id, summary)
+        await _save_checkpoint(metadata['chat_id'], checkpoint_message_id, summary)
         state.update(
             {
                 'summary': summary,
@@ -1375,6 +1388,147 @@ async def _nested_checkpoint_history(
     return history, position, summary_meta
 
 
+async def _status_emitter(metadata: dict):
+    if not (metadata.get('chat_id') and metadata.get('message_id')):
+        return None
+    from open_webui.socket.main import get_event_emitter
+
+    return await get_event_emitter(metadata)
+
+
+def _background_summary(state: dict, messages: list[dict]) -> dict | None:
+    """The summary being prepared in the background and the index of the first message it leaves in place."""
+    record = state.get('background_summary')
+    cut_message = state.pop('prefetch_cut_message', None)
+    if record is None and cut_message is not None:
+        cut = next((index for index, message in enumerate(messages) if message is cut_message), 0)
+        if cut:
+            record = state['background_summary'] = {
+                'task': state['prefetch_task'],
+                'cut': cut,
+                'absorbed_files': state.pop('prefetch_absorbed_files', []),
+            }
+    return record
+
+
+_BACKGROUND_SUMMARIES: set[asyncio.Task] = set()
+
+
+async def _summarize_in_background(event_emitter, generation, metadata: dict, carrier: dict) -> str:
+    try:
+        summary = await generation
+    except Exception:
+        await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True, phase='prefetch')
+        raise
+    # The turn may end before another request can adopt this, so the stored reply carries it for the next one.
+    carrier['contextSummary'] = summary
+    try:
+        async with Chats.edit_message_output(metadata['chat_id'], metadata['message_id']) as stored:
+            for item in (stored or {}).get('output') or []:
+                if carrier.get('id') is not None and item.get('id') == carrier['id']:
+                    item['contextSummary'] = summary
+    except Exception:
+        log.exception('Context compaction checkpoint prepared in the background could not be saved')
+    await _emit_compaction_status(event_emitter, 'Summary ready', True, phase='prefetch')
+    return summary
+
+
+async def _adopt_background_summary(
+    record: dict,
+    body: dict,
+    metadata: dict,
+    state: dict,
+    config: dict,
+    checkpoint_output: list[dict] | None,
+    projected_messages: list[dict],
+) -> tuple[dict, list[dict], int, dict] | None:
+    try:
+        result = await record['task']
+    except Exception:
+        return None
+    messages = body['messages']
+    cut = record['cut']
+    carrier = record.get('carrier')
+    event = {}
+    if carrier is None:
+        summary, summary_meta, history_entry, checkpoint_message_id = result
+        updates = {
+            'selected_history': history_entry,
+            'checkpoint_history': history_entry,
+            'absorbed_files': record['absorbed_files'],
+        }
+        event = {'message_id': checkpoint_message_id, 'summary': summary}
+    else:
+        carrier = next(
+            (
+                item
+                for item in checkpoint_output or []
+                if item is carrier or (carrier.get('id') is not None and item.get('id') == carrier['id'])
+            ),
+            None,
+        )
+        nested_checkpoint = _nested_checkpoint(metadata, messages, checkpoint_output, carrier, cut)
+        if nested_checkpoint is None:
+            return None
+        carrier_index = nested_checkpoint[3]
+        summary = result
+        history, position, summary_meta = await _nested_checkpoint_history(
+            state,
+            metadata['message_id'],
+            checkpoint_output,
+            carrier_index,
+            config['transient_patterns'],
+        )
+        await _save_nested_checkpoint(
+            metadata['chat_id'],
+            metadata['message_id'],
+            checkpoint_output,
+            carrier,
+            carrier_index,
+            summary,
+        )
+        updates = {
+            'selected_checkpoint_message_id': metadata['message_id'],
+            'selected_checkpoint_output_index': carrier_index,
+            'selected_history': position,
+            'checkpoint_history': position,
+            'checkpoint_messages': history,
+            'active_offset': len(history) - 1,
+            'compacted': True,
+        }
+    # The held identity must track the candidate actually returned to the
+    # provider; the projected copy's separate render must never become it.
+    summary_message = render_summary_message(summary, summary_meta)
+    state.update(
+        {
+            'summary': summary,
+            'summary_meta': summary_meta,
+            'previous_summary': summary,
+            'previous_summary_meta': summary_meta,
+            'durable_compacted': True,
+            'summary_message_content': summary_message['content'],
+            **updates,
+        }
+    )
+    system_messages, _ = _split_leading_system_messages(messages)
+    projected_system, projected_working = _split_leading_system_messages(projected_messages)
+    kept = cut - len(system_messages)
+    candidate = {
+        **body,
+        'messages': [
+            *system_messages,
+            summary_message,
+            *_without_boundary_marker(messages[cut:], keep_transient=True),
+        ],
+    }
+    projected = [
+        *projected_system,
+        render_summary_message(summary, summary_meta),
+        *_without_boundary_marker(projected_working[kept:], keep_transient=True),
+    ]
+    return candidate, projected, kept - 1, event
+
+
 async def compact_transient_provider_payload(
     request,
     user,
@@ -1410,8 +1564,36 @@ async def compact_transient_provider_payload(
     before = await asyncio.to_thread(estimate_provider_tokens, projected_body)
     threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
     _record_pending_context_usage(state, before, threshold, config)
-    if before <= threshold:
-        return body
+    record = _background_summary(state, messages)
+    # A prepared summary is adopted as soon as it exists; the threshold only decides whether to wait for it.
+    if record is not None and (record['task'].done() or before > threshold):
+        state.pop('background_summary', None)
+        event_emitter = await _status_emitter(metadata)
+        try:
+            adopted = await _adopt_background_summary(
+                record, body, metadata, state, config, checkpoint_output, projected_body['messages']
+            )
+        except Exception:
+            await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
+            raise
+        if adopted is not None:
+            candidate, projected_candidate, shift, event = adopted
+            await _emit_compaction_status(event_emitter, 'Context compacted', True, **event)
+            return await compact_transient_provider_payload(
+                request,
+                user,
+                candidate,
+                metadata,
+                model_id,
+                models,
+                state,
+                checkpoint_output=checkpoint_output,
+                checkpoint_carrier=checkpoint_carrier,
+                checkpoint_message_start=(
+                    checkpoint_message_start - shift if isinstance(checkpoint_message_start, int) else None
+                ),
+                projected_messages=projected_candidate,
+            )
 
     nested_checkpoint = _nested_checkpoint(
         metadata,
@@ -1420,6 +1602,51 @@ async def compact_transient_provider_payload(
         checkpoint_carrier,
         checkpoint_message_start,
     )
+    if before <= threshold:
+        soft_ratio = config['soft_trigger_ratio']
+        if (
+            nested_checkpoint is not None
+            and soft_ratio > 0
+            and before >= int(threshold * soft_ratio)
+            and state.get('background_summary') is None
+        ):
+            working_start = len(nested_checkpoint[1])
+            projected_compacted = _without_boundary_marker(projected_working[:working_start], keep_transient=True)
+            if _has_new_compaction_content(projected_compacted, state):
+                event_emitter = await _status_emitter(metadata)
+                await _emit_compaction_status(event_emitter, 'Generating summary in advance', False, phase='prefetch')
+                task = asyncio.create_task(
+                    _summarize_in_background(
+                        event_emitter,
+                        _generate_summary(
+                            request,
+                            user,
+                            model_id,
+                            models,
+                            projected_compacted,
+                            _without_boundary_marker(projected_working[working_start:], keep_transient=True),
+                            state.get('previous_summary'),
+                            config['prompt_template'],
+                            config['transient_patterns'],
+                            previous_summary_meta=state.get('previous_summary_meta'),
+                            externalized_refs_enable=config.get('externalized_refs_enable', False),
+                            externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
+                            message_id=metadata.get('message_id'),
+                        ),
+                        metadata,
+                        checkpoint_carrier,
+                    )
+                )
+                _BACKGROUND_SUMMARIES.add(task)
+                task.add_done_callback(_BACKGROUND_SUMMARIES.discard)
+                task.add_done_callback(_prefetch_done)
+                state['background_summary'] = {
+                    'task': task,
+                    'cut': checkpoint_message_start,
+                    'carrier': checkpoint_carrier,
+                }
+        return body
+
     if nested_checkpoint is not None:
         system_messages, compacted_messages, recent_messages, carrier_index = nested_checkpoint
         working_start = len(compacted_messages)
@@ -1814,6 +2041,15 @@ def start_completed_turn_compaction_prefetch(
     state: dict,
     usage: dict | None,
 ) -> asyncio.Task | None:
+    pending = state.get('background_summary')
+    started = pending['task'] if pending is not None else state.get('prefetch_task')
+    # A summary started with this request and not adopted yet is picked up by the next one; summarizing again repeats it.
+    if (
+        isinstance(started, asyncio.Task)
+        and (pending is not None or not state.get('durable_compacted'))
+        and not (started.done() and (started.cancelled() or started.exception() is not None))
+    ):
+        return None
     config = state.get('config') or {}
     if (
         not config.get('enable')

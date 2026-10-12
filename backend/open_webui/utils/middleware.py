@@ -3834,7 +3834,11 @@ async def process_chat_payload(
         'metadata': metadata,
     }
 
+    cut_id = (compaction_state.get('prefetch_cut_message') or {}).get('id')
     for message in form_data.get('messages', []):
+        # A pipeline filter returns rebuilt messages, so the background summary's cut is found again by id before ids go.
+        if cut_id is not None and message.get('id') == cut_id:
+            compaction_state['prefetch_cut_message'] = message
         message.pop('id', None)
 
     # Check if file context extraction is enabled for this model (default True)

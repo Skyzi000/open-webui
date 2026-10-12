@@ -210,6 +210,29 @@ class ChatMessageModel(BaseModel):
 ####################
 
 
+def _keep_output_checkpoints(stored, incoming):
+    """A checkpoint saved after a writer last read the reply survives that writer's older copy while the items it summarizes are unchanged."""
+    if not isinstance(stored, list) or not isinstance(incoming, list):
+        return incoming
+    marker_keys = ('contextSummary', 'context_summary')
+
+    def without_marker(item):
+        return {key: value for key, value in item.items() if key not in marker_keys} if isinstance(item, dict) else item
+
+    kept = list(incoming)
+    for index, (old, new) in enumerate(zip(stored, incoming)):
+        if (
+            isinstance(old, dict)
+            and isinstance(new, dict)
+            and 'contextSummary' in old
+            and not any(key in new for key in marker_keys)
+        ):
+            kept[index] = {**new, 'contextSummary': old['contextSummary']}
+        if without_marker(old) != without_marker(new):
+            break
+    return kept
+
+
 class ChatMessageTable:
     @staticmethod
     def _apply_message_data(message: ChatMessage, data: dict, now: int) -> None:
@@ -221,7 +244,7 @@ class ChatMessageTable:
         if 'content' in data:
             message.content = data.get('content')
         if 'output' in data:
-            message.output = data.get('output')
+            message.output = _keep_output_checkpoints(message.output, data.get('output'))
         if 'model_id' in data or 'model' in data:
             message.model_id = data.get('model_id') or data.get('model')
         if 'files' in data:
