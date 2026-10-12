@@ -203,7 +203,7 @@
 						type="button"
 						on:click={() => {
 							params.compact_token_threshold =
-								(params?.compact_token_threshold ?? null) === null ? 80000 : null;
+								(params?.compact_token_threshold ?? null) === null ? 180000 : null;
 						}}
 					>
 						{#if (params?.compact_token_threshold ?? null) === null}

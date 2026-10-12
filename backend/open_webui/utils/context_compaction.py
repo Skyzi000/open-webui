@@ -2099,7 +2099,7 @@ async def _load_config() -> dict:
         'chat.externalized_refs.enable',
         'chat.externalized_refs.token_threshold',
     )
-    token_threshold = _parse_positive_int(values.get('chat.context_compaction.token_threshold')) or 80000
+    token_threshold = _parse_positive_int(values.get('chat.context_compaction.token_threshold')) or 180000
     enabled = bool(values.get('chat.context_compaction.enable', False))
     return {
         'enable': enabled,

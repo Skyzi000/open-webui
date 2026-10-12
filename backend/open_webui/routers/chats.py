@@ -299,7 +299,7 @@ async def get_chat_config_values() -> dict:
     if config.get('CONTEXT_COMPACTION_MODEL') is None:
         config['CONTEXT_COMPACTION_MODEL'] = ''
     if config.get('CONTEXT_COMPACTION_TOKEN_CAP') is None:
-        config['CONTEXT_COMPACTION_TOKEN_CAP'] = config.get('CONTEXT_COMPACTION_TOKEN_THRESHOLD', 80000)
+        config['CONTEXT_COMPACTION_TOKEN_CAP'] = config.get('CONTEXT_COMPACTION_TOKEN_THRESHOLD', 180000)
     if config.get('CONTEXT_COMPACTION_RETENTION_PERCENTAGE') is None:
         config['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] = 40
     if config.get('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO') is None:
