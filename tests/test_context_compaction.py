@@ -2928,6 +2928,76 @@ def test_request_start_summary_is_tracked_through_the_payload_path(monkeypatch, 
     assert summarized == [['old user', 'old answ']]
 
 
+def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    attachment = {'type': 'file', 'id': 'f1', 'name': 'big.txt'}
+    history = [
+        {'id': 'u0', 'role': 'user', 'content': 'old user details ' * 300, 'files': [attachment]},
+        {'id': 'a0', 'role': 'assistant', 'content': 'old answer details ' * 300},
+        {'id': 'u1', 'role': 'user', 'content': 'question'},
+    ]
+    retrieved = []
+    summary_requests = []
+
+    async def load_config():
+        return _compaction_config(token_threshold=100, token_cap=100, soft_trigger_ratio=0)
+
+    async def retrieve(_request, body, _extra_params, _user):
+        retrieved.append([(item['id'], item.get('context')) for item in body['metadata'].get('files') or []])
+        found = {
+            'source': {'id': 'f1', 'name': 'big.txt', 'type': 'file'},
+            'document': ['FILE BODY'],
+            'metadata': [{'source': 'big.txt'}],
+        }
+        return body, {'sources': [found]}
+
+    async def summarize(_request, form_data=None, user=None, **_kwargs):
+        summary_requests.append(json.dumps(form_data['messages']))
+        return {'choices': [{'message': {'content': 'summary'}, 'finish_reason': 'stop'}]}
+
+    async def get_many(*_keys):
+        return {}
+
+    async def passthrough(prompt, _user):
+        return prompt
+
+    async def rag(_template, context, query):
+        return f'{context}\n{query}'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(compaction, 'prompt_template', passthrough)
+    monkeypatch.setattr(chat_module, 'generate_chat_completion', summarize)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history)
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+    monkeypatch.setattr(middleware, 'chat_completion_files_handler', retrieve)
+    monkeypatch.setattr(middleware, 'rag_template', rag)
+    monkeypatch.setattr(middleware, 'RAG_SYSTEM_CONTEXT', False)
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+            file_context=True,
+            files=[dict(attachment)],
+        )
+    )
+
+    assert len(summary_requests) == 1
+    assert 'FILE BODY' not in summary_requests[0]
+    assert retrieved == [[('f1', None)]]
+    assert 'FILE BODY' in send['messages'][-1]['content']
+
+
 def _tool_loop_rounds(count):
     items = [
         {'type': 'function_call', 'id': f'fc_{index}', 'call_id': f'call-{index}', 'name': 'lookup', 'arguments': '{}'}
@@ -4074,10 +4144,12 @@ def _seed_state_on_capture(monkeypatch, middleware, seed):
     monkeypatch.setattr(middleware, '_capture_pre_filter_tool_refs', wrapper)
 
 
-def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None, file_context=False):
+def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None, file_context=False, files=None):
     request = SimpleNamespace(
         state=SimpleNamespace(direct=False),
         app=SimpleNamespace(state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)),
+        scope={'type': 'http', 'state': {}},
+        receive=None,
     )
     metadata = {
         'chat_id': 'chat',
@@ -4098,6 +4170,8 @@ def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None,
     }
     if form_tool_ids is not None:
         form_data['tool_ids'] = form_tool_ids
+    if files is not None:
+        form_data['files'] = files
     model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': file_context}}}}
     return middleware.process_chat_payload(request, form_data, None, metadata, model)
 
@@ -6477,6 +6551,36 @@ def test_prefetch_finalize_notifies_phase_and_boundary(monkeypatch):
             'phase': 'prefetch',
         }
     ]
+
+
+@pytest.mark.parametrize('listed', [True, False])
+def test_summary_made_after_a_turn_reads_the_attachment_list_its_request_sent(monkeypatch, listed):
+    attached = {'type': 'file', 'id': 'file-1', 'url': 'file-1', 'name': 'spec.pdf'}
+    messages = [
+        {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'keep this for later', 'files': [attached]},
+        {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'noted'},
+    ]
+    summarized = []
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted, *_args, **_kwargs):
+        summarized.append(compacted[0]['content'])
+        return 'summary'
+
+    async def saved(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(compaction, '_save_checkpoint', saved)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+
+    metadata = {'chat_id': 'chat', 'message_id': 'a1', 'include_file_context': listed}
+    asyncio.run(
+        compaction._completed_turn_checkpoint(
+            None, None, copy.deepcopy(messages), metadata, 'model', {}, _compaction_config()
+        )
+    )
+
+    assert [('name="spec.pdf"' in content) for content in summarized] == [listed]
+    assert summarized[0].endswith('keep this for later')
 
 
 def test_completed_turn_prefetch_notifies_only_when_generating(monkeypatch):
@@ -9452,12 +9556,11 @@ def test_terminal_instructions_survive_compaction_and_count_towards_budget(monke
     assert compaction._split_leading_system_messages([transient]) == ([], [transient])
 
 
-def test_svg_attachments_remain_text_files_for_compaction():
+def test_svg_attachments_are_not_sent_as_images():
     middleware = importlib.import_module('open_webui.utils.middleware')
     svg = {'id': 'svg', 'content_type': 'image/svg+xml', 'url': '/svg'}
     png = {'id': 'png', 'content_type': 'image/png', 'url': '/png'}
     message = {'role': 'user', 'content': 'files', 'files': [svg, png]}
-    assert compaction._non_image_files([message]) == [svg]
     projected = middleware.inject_message_file_images([message])[0]
     assert projected['content'] == [
         {'type': 'text', 'text': 'files'},

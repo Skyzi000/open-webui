@@ -27,7 +27,6 @@ from open_webui.utils.misc import (
     convert_output_to_messages,
     get_content_from_message,
     get_message_list,
-    is_raster_image_content_type,
 )
 from open_webui.utils.payload import apply_params_to_form_data
 from open_webui.utils.task import (
@@ -122,25 +121,6 @@ Summarize the conversation history that will be compacted out of the active chat
 The preceding messages are the exact checkpoint source. If they include an
 existing <auto_compaction_context>, merge it with the newer messages. Output
 only the reusable continuity summary. Do not continue the conversation or call tools."""
-
-
-def _non_image_files(messages: list[dict]) -> list[dict]:
-    files: dict[str, dict] = {}
-    for message in messages:
-        for item in message.get('files') or []:
-            if not isinstance(item, dict):
-                continue
-            if item.get('type') == 'image' or is_raster_image_content_type(item.get('content_type')):
-                continue
-            file_id = item.get('id')
-            if isinstance(file_id, str) and file_id:
-                files.setdefault(file_id, item)
-    return list(files.values())
-
-
-def _absorbed_files(prefix: list[dict], recent: list[dict]) -> list[dict]:
-    retained_ids = {item['id'] for item in _non_image_files(recent)}
-    return [item for item in _non_image_files(prefix) if item['id'] not in retained_ids]
 
 
 def _xml_cdata(value: str) -> str:
@@ -897,10 +877,6 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         active_messages[boundary][_BOUNDARY_KEY] = True
         raw_boundary = active_offset + boundary
         state['checkpoint_history'] = (checkpoint_messages, raw_boundary)
-        state['absorbed_files'] = _absorbed_files(
-            active_messages[:boundary],
-            active_messages[boundary:],
-        )
 
     if previous_summary:
         summary_message = render_summary_message(previous_summary, summary_meta)
@@ -947,7 +923,6 @@ async def _generate_checkpoint(
     recent_messages: list[dict],
     *,
     checkpoint_history: tuple[list[dict[str, Any]], int] | None = None,
-    absorbed_files: list[dict] | None = None,
 ) -> tuple[str, dict[str, Any], tuple[list[dict[str, Any]], int], str]:
     checkpoint_history = _history_source(checkpoint_history or state.get('checkpoint_history'))
     if checkpoint_history and checkpoint_history[1] > 0:
@@ -978,7 +953,6 @@ async def _generate_checkpoint(
         state.get('previous_summary'),
         config['prompt_template'],
         config['transient_patterns'],
-        state.get('absorbed_files') if absorbed_files is None else absorbed_files,
         previous_summary_meta=state.get('previous_summary_meta'),
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
@@ -1073,7 +1047,7 @@ def _checkpoint_for_boundary(
     state: dict,
     working: list[dict],
     boundary: int,
-) -> tuple[tuple[list[dict[str, Any]], int], list[dict]] | None:
+) -> tuple[list[dict[str, Any]], int] | None:
     default = _history_source(state.get('checkpoint_history'))
     history = default[0] if default is not None else state.get('checkpoint_messages')
     if not isinstance(history, list):
@@ -1087,13 +1061,7 @@ def _checkpoint_for_boundary(
     )
     if raw_boundary is None or raw_boundary <= 0:
         return None
-    active_offset = state.get('active_offset')
-    if not isinstance(active_offset, int) or not 0 <= active_offset < raw_boundary:
-        active_offset = 0
-    return (
-        (history, raw_boundary),
-        _absorbed_files(history[active_offset:raw_boundary], history[raw_boundary:]),
-    )
+    return history, raw_boundary
 
 
 async def compact_provider_payload(
@@ -1180,8 +1148,7 @@ async def compact_provider_payload(
                     config,
                     _without_boundary_marker(projected_working[:latest], keep_transient=True),
                     _without_boundary_marker(projected_working[latest:], keep_transient=True),
-                    checkpoint_history=checkpoint[0],
-                    absorbed_files=checkpoint[1],
+                    checkpoint_history=checkpoint,
                 )
             )
             task = asyncio.create_task(
@@ -1189,7 +1156,6 @@ async def compact_provider_payload(
             )
             task.add_done_callback(_prefetch_done)
             state['prefetch_task'] = task
-            state['prefetch_absorbed_files'] = checkpoint[1]
             cut = len(messages) - len(working) + latest
         cleaned = _without_boundary_marker(messages)
         if cut is not None:
@@ -1225,7 +1191,6 @@ async def compact_provider_payload(
         summary = None
         summary_meta = None
         history_entry = None
-        selected_checkpoint = None
         for candidate_boundary in boundaries:
             compacted_messages = _without_boundary_marker(
                 projected_working[:candidate_boundary],
@@ -1249,8 +1214,7 @@ async def compact_provider_payload(
                 config,
                 compacted_messages,
                 projected_recent,
-                checkpoint_history=checkpoint[0],
-                absorbed_files=checkpoint[1],
+                checkpoint_history=checkpoint,
             )
             # The held identity must track the candidate actually returned to
             # the provider; the projected copy below is estimation-only and its
@@ -1275,7 +1239,6 @@ async def compact_provider_payload(
             after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
             # The threshold only triggers compaction; when no candidate fits,
             # the largest one is still sent rather than refusing the request.
-            selected_checkpoint = checkpoint
             if after <= threshold:
                 break
 
@@ -1290,7 +1253,6 @@ async def compact_provider_payload(
                 'previous_summary_meta': summary_meta,
                 'selected_history': history_entry,
                 'checkpoint_history': history_entry,
-                'absorbed_files': selected_checkpoint[1],
                 'durable_compacted': True,
                 'summary_message_content': summary_message['content'],
             }
@@ -1403,11 +1365,7 @@ def _background_summary(state: dict, messages: list[dict]) -> dict | None:
     if record is None and cut_message is not None:
         cut = next((index for index, message in enumerate(messages) if message is cut_message), 0)
         if cut:
-            record = state['background_summary'] = {
-                'task': state['prefetch_task'],
-                'cut': cut,
-                'absorbed_files': state.pop('prefetch_absorbed_files', []),
-            }
+            record = state['background_summary'] = {'task': state['prefetch_task'], 'cut': cut}
     return record
 
 
@@ -1452,11 +1410,7 @@ async def _adopt_background_summary(
     event = {}
     if carrier is None:
         summary, summary_meta, history_entry, checkpoint_message_id = result
-        updates = {
-            'selected_history': history_entry,
-            'checkpoint_history': history_entry,
-            'absorbed_files': record['absorbed_files'],
-        }
+        updates = {'selected_history': history_entry, 'checkpoint_history': history_entry}
         event = {'message_id': checkpoint_message_id, 'summary': summary}
     else:
         carrier = next(
@@ -1899,7 +1853,6 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
     recent_source = active_messages[-1:]
     if not compacted_source or not recent_source:
         return {'ok': True, 'compacted': False, 'reason': 'too_short'}
-    absorbed_files = _absorbed_files(compacted_source, recent_source)
     model = models.get(model_id, {})
     compacted_messages, recent_messages = await asyncio.gather(
         _completed_turn_provider_messages(compacted_source, user, model),
@@ -1918,7 +1871,6 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         previous_summary,
         config['prompt_template'],
         config['transient_patterns'],
-        absorbed_files,
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
         message_id=current_id,
@@ -1939,6 +1891,7 @@ async def _completed_turn_provider_messages(
     messages: list[dict],
     user: Any,
     model: dict,
+    include_file_context: bool = False,
 ) -> list[dict]:
     from open_webui.utils.middleware import (
         convert_url_images_to_base64,
@@ -1954,6 +1907,7 @@ async def _completed_turn_provider_messages(
             prepared,
             reasoning_format=get_reasoning_format(model),
             mark_transient=True,
+            include_file_context=include_file_context,
         )
         return sanitize_tool_pairs(prepared)
 
@@ -1990,9 +1944,11 @@ async def _completed_turn_checkpoint(
     )
     try:
         model = models.get(model_id, {})
+        # The request that just finished decided whether its messages list attachments; the summary reads the same.
+        attachment_list = bool(metadata.get('include_file_context'))
         compacted_messages, recent_messages = await asyncio.gather(
-            _completed_turn_provider_messages(compacted_source, user, model),
-            _completed_turn_provider_messages(recent_source, user, model),
+            _completed_turn_provider_messages(compacted_source, user, model, attachment_list),
+            _completed_turn_provider_messages(recent_source, user, model, attachment_list),
         )
         summary = await _generate_summary(
             request,
@@ -2004,7 +1960,6 @@ async def _completed_turn_checkpoint(
             previous_summary,
             config['prompt_template'],
             config['transient_patterns'],
-            _absorbed_files(compacted_source, recent_source),
             previous_summary_meta={},
             externalized_refs_enable=config.get('externalized_refs_enable', False),
             externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
@@ -2508,31 +2463,6 @@ def find_safe_compaction_boundary(
     return max(selected, completed_round)
 
 
-async def _summary_file_sources(request, user, model_id: str, messages: list[dict], files: list[dict]) -> list[dict]:
-    from open_webui.utils.middleware import chat_completion_files_handler
-
-    async def discard_event(_event: Any) -> None:
-        pass
-
-    items = await asyncio.to_thread(copy.deepcopy, files)
-    for item in items:
-        item['context'] = 'full'
-    _, flags = await chat_completion_files_handler(
-        request,
-        {
-            'model': model_id,
-            'messages': messages,
-            'metadata': {'files': items},
-        },
-        {'__event_emitter__': discard_event},
-        user,
-    )
-    sources = flags.get('sources') or []
-    if not sources:
-        raise RuntimeError('Context compaction could not read files that would be removed from active context')
-    return sources
-
-
 def _inherit_model_max_tokens(task_model_params: dict, model: dict) -> dict:
     if task_model_params:
         return task_model_params
@@ -2552,7 +2482,6 @@ async def _generate_summary(
     previous_summary: str | None,
     summary_prompt_template: str,
     transient_patterns: tuple[re.Pattern[str], ...] = (),
-    absorbed_files: list[dict] | None = None,
     *,
     previous_summary_meta: dict | None = None,
     externalized_refs_enable: bool = False,
@@ -2640,17 +2569,6 @@ async def _generate_summary(
         if previous_summary:
             summary_messages.insert(0, render_summary_message(previous_summary, previous_summary_meta))
         summary_messages.append({'role': 'user', 'content': prompt})
-    if absorbed_files:
-        from open_webui.utils.middleware import apply_source_context_to_messages
-
-        sources = await _summary_file_sources(request, user, task_model_id, summary_messages, absorbed_files)
-        summary_messages = await apply_source_context_to_messages(
-            request,
-            summary_messages,
-            sources,
-            prompt,
-        )
-
     task_model_params = task_config.get('task.model.params') or {}
     if not isinstance(task_model_params, dict):
         task_model_params = {}

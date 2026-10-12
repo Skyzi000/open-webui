@@ -2705,21 +2705,6 @@ def _rollback_ref_apply_state(state: dict, snapshot: dict) -> None:
     state['summary_message_content'] = snapshot['held']
 
 
-def _drop_absorbed_request_files(body: dict, state: dict) -> dict:
-    if not state.get('durable_compacted'):
-        return body
-    absorbed_ids = {
-        item.get('id')
-        for item in state.get('absorbed_files') or []
-        if isinstance(item, dict) and isinstance(item.get('id'), str)
-    }
-    files = body.get('files')
-    if not absorbed_ids or not isinstance(files, list):
-        return body
-    retained = [item for item in files if not isinstance(item, dict) or item.get('id') not in absorbed_ids]
-    return {**body, 'files': retained}
-
-
 async def _compact_final_provider_payload(
     request,
     user,
@@ -3088,7 +3073,6 @@ async def process_chat_payload(
         )
         if pending_tail:
             form_data['messages'] = form_data['messages'][: -len(pending_tail)]
-        form_data = _drop_absorbed_request_files(form_data, compaction_state)
 
     event_emitter = await get_event_emitter(metadata)
     event_caller = await get_event_call(metadata)
