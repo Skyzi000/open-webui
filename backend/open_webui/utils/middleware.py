@@ -2547,9 +2547,7 @@ def _post_filter_ref_state(
             pending.extend(value)
         elif isinstance(value, str) and 'tool:' in value:
             visible_refs.update(
-                match.group(0)
-                for match in _TOOL_REF_TOKEN_RE.finditer(value)
-                if match.group(0) in seeds_by_ref
+                match.group(0) for match in _TOOL_REF_TOKEN_RE.finditer(value) if match.group(0) in seeds_by_ref
             )
     return tuple(entry for entry in seed_entries if entry.ref in visible_refs), has_summary
 
@@ -2617,9 +2615,7 @@ async def _capture_pre_filter_tool_refs(
     if (
         not isinstance(messages, list)
         or config.get('externalized_refs_enable') is not True
-        or not (
-            native if native is not None else _can_install_externalized_ref_reader(metadata, payload_tools)
-        )
+        or not (native if native is not None else _can_install_externalized_ref_reader(metadata, payload_tools))
         or not can_externalize_refs(body, native=True, registry={})
     ):
         return None
@@ -2640,9 +2636,7 @@ def _send_copy(body: dict) -> dict:
     # a type-based copy is safe; metadata is Core's request-scoped control plane
     # (mcp clients, callables) and must stay shared, never deep-copied.
     return {
-        key: (
-            value if key == 'metadata' or not isinstance(value, (dict, list)) else copy.deepcopy(value)
-        )
+        key: (value if key == 'metadata' or not isinstance(value, (dict, list)) else copy.deepcopy(value))
         for key, value in body.items()
     }
 
@@ -2886,14 +2880,10 @@ async def process_chat_payload(
             'reasoning_tags': target_merged.get('reasoning_tags'),
             'compact_token_threshold': target_merged.get('compact_token_threshold'),
             'function_calling': (
-                (request_params or {}).get('function_calling')
-                or target_base.get('function_calling')
-                or 'native'
+                (request_params or {}).get('function_calling') or target_base.get('function_calling') or 'native'
             ),
             'tool_approval_mode': (
-                'full'
-                if forced_tool_approval_full
-                else (target_merged.get('tool_approval_mode') or 'full')
+                'full' if forced_tool_approval_full else (target_merged.get('tool_approval_mode') or 'full')
             ),
             'model_controls': (metadata.get('params') or {}).get('model_controls', {}),
         }
@@ -2916,9 +2906,7 @@ async def process_chat_payload(
         if bound_call and resolved_model_capabilities is not None:
             capability_usage = resolved_model_capabilities.get('usage')
         else:
-            capability_usage = (
-                ((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}
-            ).get('usage')
+            capability_usage = (((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}).get('usage')
         if not form_data.get('stream'):
             form_data.pop('stream_options', None)
         elif capability_usage:
@@ -5040,12 +5028,7 @@ async def non_streaming_chat_response_handler(response, ctx):
                     # then helper-validated totals; anything else keeps prior values
                     # and must not feed zero-filled totals to the prefetch gate.
                     if usage and has_valid_token_measurement(raw_usage):
-                        if (
-                            apply_response_usage_to_context_usage(
-                                ctx.get('compaction_state') or {}, usage
-                            )
-                            is not None
-                        ):
+                        if apply_response_usage_to_context_usage(ctx.get('compaction_state') or {}, usage) is not None:
                             single_usage = usage
                     context_usage = (ctx.get('compaction_state') or {}).get('context_usage')
                     if continuing:
@@ -6004,9 +5987,7 @@ async def streaming_chat_response_handler(response, ctx):
                                                 )
                                                 if updated_context_usage is not None:
                                                     response_usage = single_usage
-                                                    await _emit_context_usage(
-                                                        event_emitter, updated_context_usage
-                                                    )
+                                                    await _emit_context_usage(event_emitter, updated_context_usage)
                                                     unsaved_context_usage = True
                                             response_metadata['usage'] = usage
 
@@ -6060,9 +6041,7 @@ async def streaming_chat_response_handler(response, ctx):
                                             )
                                             if updated_context_usage is not None:
                                                 response_usage = single_usage
-                                                await _emit_context_usage(
-                                                    event_emitter, updated_context_usage
-                                                )
+                                                await _emit_context_usage(event_emitter, updated_context_usage)
                                                 unsaved_context_usage = True
                                         await event_emitter(
                                             {

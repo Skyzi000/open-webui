@@ -1316,11 +1316,7 @@ async def chat_completion(
         tool_approval_mode = (
             'full'
             if forced_by_context
-            else (
-                form_data.get('params', {}).get('tool_approval_mode')
-                if tool_permissions_enabled
-                else 'full'
-            )
+            else (form_data.get('params', {}).get('tool_approval_mode') if tool_permissions_enabled else 'full')
             or 'full'
         )
 
@@ -1665,9 +1661,7 @@ async def chat_completion(
             target.pop('stream', None)
         if caller_has_stream_options:
             target['stream_options'] = (
-                {**caller_stream_options}
-                if isinstance(caller_stream_options, dict)
-                else caller_stream_options
+                {**caller_stream_options} if isinstance(caller_stream_options, dict) else caller_stream_options
             )
         else:
             target.pop('stream_options', None)

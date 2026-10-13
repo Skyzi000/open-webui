@@ -221,9 +221,7 @@ class ChatConfigForm(BaseModel):
     TOOL_SEARCH_DEFER_THRESHOLD: int = 400
     TOOL_SEARCH_ALWAYS_LOADED: list[str] = []
     TOOL_SEARCH_DEFER_BUILTIN_TOOLS: bool = True
-    CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO: float = Field(
-        default=0.5, ge=0, lt=1, allow_inf_nan=False
-    )
+    CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO: float = Field(default=0.5, ge=0, lt=1, allow_inf_nan=False)
     CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS: str = ''
     ENABLE_EXTERNALIZED_REFS: bool = False
     # The floor also keeps the on-demand reader response budget large enough
@@ -240,9 +238,7 @@ class ChatConfigForm(BaseModel):
             try:
                 re.compile(pattern)
             except re.error as exc:
-                raise ValueError(
-                    f'Invalid transient message regex on line {line_number}: {exc}'
-                ) from exc
+                raise ValueError(f'Invalid transient message regex on line {line_number}: {exc}') from exc
         return value
 
 
@@ -314,9 +310,7 @@ async def get_chat_config_values() -> dict:
         # Normalize pre-floor DB/env values so the ge=1000 response model
         # cannot turn a persisted 1-999 into a response-validation 500.
         try:
-            config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = max(
-                1000, int(config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'])
-            )
+            config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = max(1000, int(config['EXTERNALIZED_REFS_TOKEN_THRESHOLD']))
         except (TypeError, ValueError):
             config['EXTERNALIZED_REFS_TOKEN_THRESHOLD'] = 10000
     return config

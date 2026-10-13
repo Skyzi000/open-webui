@@ -291,12 +291,7 @@ def can_externalize_refs(
     registry: dict[str, Any],
 ) -> bool:
     """Return whether this Core request can safely expose the ref reader."""
-    return (
-        native
-        and body.get('stream') is True
-        and _reader_is_selectable(body)
-        and not _has_collision(body, registry)
-    )
+    return native and body.get('stream') is True and _reader_is_selectable(body) and not _has_collision(body, registry)
 
 
 async def _capture_projections(
@@ -717,10 +712,7 @@ def _parse_command(command: str) -> tuple[_Stage, ...]:
         raise RefExecError(REF_EXEC_USAGE_ERROR) from exc
     if len(encoded) > REF_EXEC_COMMAND_MAX_BYTES:
         raise RefExecError('Error: command exceeds the 1,024 UTF-8 byte parser limit')
-    return tuple(
-        _parse_stage(stage, source=index == 0)
-        for index, stage in enumerate(_split_pipeline(command.strip()))
-    )
+    return tuple(_parse_stage(stage, source=index == 0) for index, stage in enumerate(_split_pipeline(command.strip())))
 
 
 def _iter_text_lines(
@@ -748,9 +740,7 @@ def _iter_text_lines(
 
 
 def _iter_source_lines(entry: RefEntry) -> Iterator[_Line]:
-    yield from _iter_text_lines(
-        entry.text, source_offsets=True, byte_index=entry.byte_index
-    )
+    yield from _iter_text_lines(entry.text, source_offsets=True, byte_index=entry.byte_index)
 
 
 def _head(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
@@ -759,9 +749,7 @@ def _head(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
 
 def _check_tail_count(count: int) -> None:
     if count > REF_EXEC_RESPONSE_MAX_BYTES:
-        raise RefExecError(
-            f'Error: tail line count exceeds the {REF_EXEC_RESPONSE_MAX_BYTES:,} line limit'
-        )
+        raise RefExecError(f'Error: tail line count exceeds the {REF_EXEC_RESPONSE_MAX_BYTES:,} line limit')
 
 
 def _tail_lines(entry: RefEntry, count: int) -> Iterator[_Line]:
@@ -904,9 +892,7 @@ def _grep_matches(line: _Line, spans: Iterable[tuple[int, int]], ordinal: int, s
     previous_start = 0
     for start, end in spans:
         if source_byte_start is not None:
-            source_byte_start += _span_bytes(
-                source, byte_index, base + previous_start, base + start
-            )
+            source_byte_start += _span_bytes(source, byte_index, base + previous_start, base + start)
             previous_start = start
         yield _Line(
             source=source,
@@ -1146,9 +1132,9 @@ def _render_ref_preview(
 
     # The marker varies only with the digit counts of N and M, both bounded by
     # the source size, so this overhead is an upper bound for every candidate.
-    marker_overhead = len(
-        _truncated_marker(f'tail -c +{entry.utf8_bytes + 1} {entry.ref} | head -c {entry.utf8_bytes}')
-    ) + 1
+    marker_overhead = (
+        len(_truncated_marker(f'tail -c +{entry.utf8_bytes + 1} {entry.ref} | head -c {entry.utf8_bytes}')) + 1
+    )
     high = min(entry.utf8_bytes - pinned_bytes - 1, REF_EXEC_RESPONSE_MAX_BYTES - marker_overhead)
     best: str | None = None
     best_prefix_end = 0
@@ -1228,9 +1214,7 @@ def _page_source(
                 requested_start=requested + 1,
                 requested_end=None if end is None else effective_end,
                 actual_start=None if emitted == 0 else actual_start + 1,
-                actual_end=(
-                    None if end is None or emitted == 0 else actual_start + emitted
-                ),
+                actual_end=(None if end is None or emitted == 0 else actual_start + emitted),
             )
         if response_fits(complete):
             return complete
@@ -1272,9 +1256,11 @@ def _render_lines(
             # and at most its first REF_EXEC_RESPONSE_MAX_BYTES characters can survive.
             if not pieces and line.match_start is not None and line.match_end is not None:
                 return _grep_excerpt(line, response_fits)
-            head = separator + line.display_prefix + line.source[
-                line.start : min(line.start + REF_EXEC_RESPONSE_MAX_BYTES, line.end_offset)
-            ]
+            head = (
+                separator
+                + line.display_prefix
+                + line.source[line.start : min(line.start + REF_EXEC_RESPONSE_MAX_BYTES, line.end_offset)]
+            )
             return _truncate_rendered(
                 ''.join(pieces) + head,
                 _truncated_marker('wc|grep|head|tail|sed'),
@@ -1324,12 +1310,8 @@ def _grep_excerpt(line: _Line, response_fits: Callable[[str], bool]) -> str:
         if line.source_byte_start is None:
             marker = _truncated_marker('wc|grep|head|tail|sed')
         else:
-            left_context_bytes = _span_bytes(
-                source, byte_index, base + left, base + match_start
-            )
-            right_context_bytes = _span_bytes(
-                source, byte_index, base + match_end, base + right
-            )
+            left_context_bytes = _span_bytes(source, byte_index, base + left, base + match_start)
+            right_context_bytes = _span_bytes(source, byte_index, base + match_end, base + right)
             match_byte_start = line.source_byte_start + before_match_bytes
             metadata = {
                 'match_byte_start': match_byte_start,
@@ -1404,9 +1386,7 @@ def _tail_bytes(lines: Iterable[_Line], count: int) -> Iterator[_Line]:
         if line.has_newline:
             retained.append(0x0A)
         expected_source_start = (
-            line_source_start + len(encoded) + int(line.has_newline)
-            if line_source_start is not None
-            else None
+            line_source_start + len(encoded) + int(line.has_newline) if line_source_start is not None else None
         )
         if len(retained) > count:
             removed = len(retained) - count
@@ -1628,11 +1608,7 @@ async def _load_catalog_refs(
     for requested in requests:
         loaded = await loader(requested)
         for entry in loaded or ():
-            if (
-                isinstance(entry, RefEntry)
-                and _valid_ref(entry.ref)
-                and _needs_body(catalog.get(entry.ref))
-            ):
+            if isinstance(entry, RefEntry) and _valid_ref(entry.ref) and _needs_body(catalog.get(entry.ref)):
                 catalog[entry.ref] = entry
 
 

@@ -154,9 +154,7 @@ def test_direct_manual_compact_preserves_websocket_metadata(monkeypatch):
 
     request = SimpleNamespace(
         state=SimpleNamespace(),
-        app=SimpleNamespace(
-            state=SimpleNamespace(MODELS={'server-model': {'id': 'server-model'}}, redis=None)
-        ),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS={'server-model': {'id': 'server-model'}}, redis=None)),
     )
     form = CompactChatForm(
         model='direct-model',

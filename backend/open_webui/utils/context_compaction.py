@@ -207,11 +207,7 @@ def _canonical_direct_history_message(message: Any) -> dict[str, Any] | None:
     role = message.get('role')
     if not isinstance(role, str):
         return None
-    return {
-        key: _canonical_history_content(value)
-        for key, value in message.items()
-        if key not in _HISTORY_DB_KEYS
-    }
+    return {key: _canonical_history_content(value) for key, value in message.items() if key not in _HISTORY_DB_KEYS}
 
 
 def _canonical_output_messages(output: Any) -> list[dict[str, Any]]:
@@ -358,9 +354,7 @@ def restore_nested_checkpoint_markers(
             return item
         return {key: value for key, value in item.items() if key not in marker_keys}
 
-    if [without_marker(item) for item in output] != [
-        without_marker(item) for item in original
-    ]:
+    if [without_marker(item) for item in output] != [without_marker(item) for item in original]:
         return
 
     for _, output_index, summary in _checkpoint_positions([baseline]):
@@ -691,22 +685,19 @@ async def replay_cached_compaction_messages(messages: list[dict], state: dict) -
             return messages
         carrier = output[carrier_output_index]
         carrier_summary = (
-            carrier.get('contextSummary') or carrier.get('context_summary')
-            if isinstance(carrier, dict)
-            else None
+            carrier.get('contextSummary') or carrier.get('context_summary') if isinstance(carrier, dict) else None
         )
         if not isinstance(carrier_summary, str) or carrier_summary.strip() != summary.strip():
             return messages
     active_messages = _messages_from_checkpoint(raw_messages, carrier_index, carrier_output_index)
-    summary_message = render_summary_message(
-        summary, summary_meta if isinstance(summary_meta, dict) else {}
-    )
+    summary_message = render_summary_message(summary, summary_meta if isinstance(summary_meta, dict) else {})
     state['summary_message_content'] = summary_message['content']
     return [
         *system_messages,
         summary_message,
         *active_messages,
     ]
+
 
 def set_summary_history_ref(body: dict, ref: str | None, state: dict | None = None) -> dict:
     if not isinstance(ref, str) or re.fullmatch(r'history:[0-9a-f]{64}', ref) is None:
@@ -793,11 +784,7 @@ def replay_stored_compaction_checkpoint(messages: list[dict]) -> tuple[list[dict
     system, history, active, message_index, output_index, summary = _stored_checkpoint_view(messages)
     if message_index is None or not isinstance(summary, str):
         return messages, {}
-    position = (
-        (history, message_index, output_index)
-        if output_index is not None
-        else (history, message_index)
-    )
+    position = (history, message_index, output_index) if output_index is not None else (history, message_index)
     summary_message = render_summary_message(summary)
     state = {
         'active_offset': message_index,
@@ -1153,9 +1140,7 @@ async def compact_provider_payload(
                     checkpoint_history=checkpoint,
                 )
             )
-            task = asyncio.create_task(
-                _finalize_prefetch_checkpoint(generation, metadata['chat_id'], event_emitter)
-            )
+            task = asyncio.create_task(_finalize_prefetch_checkpoint(generation, metadata['chat_id'], event_emitter))
             task.add_done_callback(_prefetch_done)
             state['prefetch_task'] = task
             cut = len(messages) - len(working) + latest
@@ -1610,12 +1595,8 @@ async def compact_transient_provider_payload(
     if nested_checkpoint is not None:
         system_messages, compacted_messages, recent_messages, carrier_index = nested_checkpoint
         working_start = len(compacted_messages)
-        projected_compacted = _without_boundary_marker(
-            projected_working[:working_start], keep_transient=True
-        )
-        projected_recent = _without_boundary_marker(
-            projected_working[working_start:], keep_transient=True
-        )
+        projected_compacted = _without_boundary_marker(projected_working[:working_start], keep_transient=True)
+        projected_recent = _without_boundary_marker(projected_working[working_start:], keep_transient=True)
         if not _has_new_compaction_content(projected_compacted, state):
             return body
         event_emitter = None
@@ -2117,12 +2098,7 @@ def _resolve_token_threshold(global_threshold: int, global_cap: int, metadata: d
 
 
 def _valid_token_number(value: Any) -> bool:
-    return (
-        not isinstance(value, bool)
-        and isinstance(value, (int, float))
-        and math.isfinite(value)
-        and value >= 0
-    )
+    return not isinstance(value, bool) and isinstance(value, (int, float)) and math.isfinite(value) and value >= 0
 
 
 _TOKEN_COUNTER_KEYS = (
@@ -2231,8 +2207,10 @@ def _split_leading_system_messages(messages: list[dict]) -> tuple[list[dict], li
 
 
 def _is_merged_cache_usage(usage: Any) -> bool:
-    return isinstance(usage, dict) and 'prompt_tokens' in usage and any(
-        key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')
+    return (
+        isinstance(usage, dict)
+        and 'prompt_tokens' in usage
+        and any(key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens'))
     )
 
 
@@ -2411,11 +2389,7 @@ def find_safe_compaction_boundary(
             or (right_request and left_result)
         )
 
-    invalid_ids = {
-        tool_id
-        for tool_id in right_requested.keys() | right_completed.keys()
-        if invalid(tool_id)
-    }
+    invalid_ids = {tool_id for tool_id in right_requested.keys() | right_completed.keys() if invalid(tool_id)}
     persistent_users = 0
     selected = 0
     completed_round = 0

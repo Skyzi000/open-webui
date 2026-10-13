@@ -190,9 +190,7 @@ def test_fanout_sibling_controls_reach_provider(monkeypatch):
     assert primary['params']['function_calling'] == 'native'
 
     # The compaction threshold reader consumes exactly this per-call block.
-    assert (
-        compaction._resolve_token_threshold(80000, 80000, {'params': sibling['params']}) == 32000
-    )
+    assert compaction._resolve_token_threshold(80000, 80000, {'params': sibling['params']}) == 32000
 
     assert sibling['params_ref'] is not primary['params_ref']
     assert sibling['params_ref'] is not request.state.metadata['params']
@@ -335,7 +333,7 @@ def test_stream_options_rebuilt_per_column(monkeypatch):
                 {'model_id': 'capable-sibling', 'message_id': 'm3'},
             ],
             stream_options=original_options,
-        )
+        ),
     )
 
     assert captured['m2']['stream_options'] == {'custom': 1}
@@ -861,10 +859,13 @@ def test_chat_merge_keeps_state_authority_except_per_call_params(monkeypatch):
     assert captured['metadata']['params'] is state_params
 
 
-@pytest.mark.parametrize('marker_key', [
-    compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
-    compaction.CONTEXT_COMPACTION_PREFIX_MARKER_KEY,
-])
+@pytest.mark.parametrize(
+    'marker_key',
+    [
+        compaction.CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
+        compaction.CONTEXT_COMPACTION_PREFIX_MARKER_KEY,
+    ],
+)
 def test_generate_chat_completion_strips_markers_without_mutating_canonical_body(monkeypatch, marker_key):
     models_map = {
         'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
@@ -897,8 +898,7 @@ def test_generate_chat_completion_strips_markers_without_mutating_canonical_body
     assert sink_messages
     assert all(marker_key not in message for message in sink_messages)
     assert any(
-        message.get('role') == 'user' and message.get('content') == 'please summarize'
-        for message in sink_messages
+        message.get('role') == 'user' and message.get('content') == 'please summarize' for message in sink_messages
     )
 
     canonical = captured['ctx']['compaction_state']['canonical_body']['messages']
@@ -1076,9 +1076,7 @@ def _run_task_generation(kind, request, user, model_id):
         )
     if kind == 'summary':
         summary = asyncio.run(
-            compaction._generate_summary(
-                request, user, model_id, _summary_models(request), messages, [], None, ''
-            )
+            compaction._generate_summary(request, user, model_id, _summary_models(request), messages, [], None, '')
         )
         assert summary == 'ok'
         return summary
@@ -1284,9 +1282,7 @@ def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatc
         ('max_output_tokens', 'gpt-4.1', 'responses', 'max_output_tokens'),
     ],
 )
-def test_task_generation_native_limit_fields_not_overwritten(
-    monkeypatch, kind, field, model_id, api_type, wire_key
-):
+def test_task_generation_native_limit_fields_not_overwritten(monkeypatch, kind, field, model_id, api_type, wire_key):
     model_params = {'custom_params': {field: 65536}}
     captured = _install_task_wire_harness(monkeypatch, model_params=model_params, api_type=api_type)
     request = _task_wire_request(model_id, model_params)

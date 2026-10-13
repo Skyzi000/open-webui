@@ -58,12 +58,7 @@ def test_usage_total_tokens_shares_prefetch_trigger_accounting():
     assert compaction._usage_total_tokens('x') is None
     assert compaction._usage_total_tokens({'total_tokens': True}) is None
     assert compaction._usage_total_tokens({'total_tokens': 'big'}) is None
-    assert (
-        compaction._usage_total_tokens(
-            {'prompt_tokens': 100, 'completion_tokens': 50, 'total_tokens': 150}
-        )
-        == 150
-    )
+    assert compaction._usage_total_tokens({'prompt_tokens': 100, 'completion_tokens': 50, 'total_tokens': 150}) == 150
     assert (
         compaction._usage_total_tokens(
             {
@@ -722,8 +717,7 @@ def _summary_content_of(messages):
     return next(
         message['content']
         for message in messages
-        if isinstance(message.get('content'), str)
-        and message['content'].startswith('<auto_compaction_context>')
+        if isinstance(message.get('content'), str) and message['content'].startswith('<auto_compaction_context>')
     )
 
 
@@ -909,6 +903,7 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
         return {}, 'catalog', None, None, False
 
     monkeypatch.setattr(middleware, 'execute_tool_call', execute)
+
     async def run():
         registry = {}
         await refs.externalize_refs(
@@ -1527,9 +1522,7 @@ def test_canonical_history_projects_core_fields_and_ignores_metadata():
     assert provider_extension.ref != plain.ref
     assert 'provider_extension' in provider_extension.text
 
-    plain_part = compaction._canonical_history_entry(
-        [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]}]
-    )
+    plain_part = compaction._canonical_history_entry([{'role': 'user', 'content': [{'type': 'text', 'text': 'hello'}]}])
     part_with_metadata = compaction._canonical_history_entry(
         [{'role': 'user', 'content': [{'type': 'text', 'text': 'hello', 'cache_control': {}}]}]
     )
@@ -1594,9 +1587,7 @@ def test_responses_history_uses_core_projection_for_unknown_shapes():
         },
     ]
 
-    assert compaction._canonical_output_messages(output) == [
-        {'role': 'assistant', 'content': 'answer continued'}
-    ]
+    assert compaction._canonical_output_messages(output) == [{'role': 'assistant', 'content': 'answer continued'}]
 
 
 def test_history_ancestor_resolution_lists_metadata_and_serves_bodies_on_demand():
@@ -1682,9 +1673,7 @@ def _canonical_ancestors(messages, selected_index, selected_output_index):
     ]
     expected = []
     for position in reversed(positions):
-        ancestor = compaction._canonical_history_entry(
-            compaction._history_prefix_messages(messages, *position)
-        )
+        ancestor = compaction._canonical_history_entry(compaction._history_prefix_messages(messages, *position))
         if not (ancestor.text and selected.text.startswith(ancestor.text)):
             break
         expected.append(ancestor)
@@ -1704,9 +1693,7 @@ def test_history_listing_matches_canonical_prefixes_with_nested_checkpoints():
     assert [item.ref for item in listed] == [item.ref for item in expected]
     for item, want in zip(listed, expected):
         assert (item.utf8_bytes, item.line_count) == (want.utf8_bytes, want.line_count)
-        assert asyncio.run(entry.load_history(item.ref)) == (
-            compaction.replace(want, load_history=entry.load_history),
-        )
+        assert asyncio.run(entry.load_history(item.ref)) == (compaction.replace(want, load_history=entry.load_history),)
 
 
 def test_history_listing_peak_memory_stays_below_one_prefix():
@@ -1716,9 +1703,7 @@ def test_history_listing_peak_memory_stays_below_one_prefix():
         if index % 2 == 0:
             messages.append({'role': 'user', 'content': f'u{index} {body}'})
         else:
-            messages.append(
-                {'role': 'assistant', 'content': f'a{index} {body}', 'contextSummary': f's{index}'}
-            )
+            messages.append({'role': 'assistant', 'content': f'a{index} {body}', 'contextSummary': f's{index}'})
     entry = compaction._history_entry_at(messages, len(messages) - 1)
     assert entry is not None and entry.load_history is not None
 
@@ -1946,9 +1931,7 @@ def test_manual_compact_excludes_tip_tool_round_from_summary_input(monkeypatch):
     assert 'lookup' in recent_text
     assert 'tool result' in recent_text
 
-    replayed, replay_state = compaction.replay_stored_compaction_checkpoint(
-        compaction.get_message_list(messages, 'a2')
-    )
+    replayed, replay_state = compaction.replay_stored_compaction_checkpoint(compaction.get_message_list(messages, 'a2'))
     assert _summary_content_of(replayed) is replay_state['summary_message_content']
     expanded = middleware.process_messages_with_output(replayed)
     tool_calls = [call for message in expanded for call in (message.get('tool_calls') or [])]
@@ -2192,9 +2175,7 @@ def test_reply_takes_an_image_and_a_status_after_its_summary_was_saved_in_the_ba
             await compaction._summarize_in_background(
                 None, summary(), {'chat_id': 'chat', 'message_id': 'a1'}, dict(output[0])
             )
-            emitter = await socket_main.get_event_emitter(
-                {'user_id': 'user-1', 'chat_id': 'chat', 'message_id': 'a1'}
-            )
+            emitter = await socket_main.get_event_emitter({'user_id': 'user-1', 'chat_id': 'chat', 'message_id': 'a1'})
             await emitter({'type': 'status', 'data': {'description': 'searching', 'done': True}})
             result = await builtin.generate_image(
                 'a cat', __request__=object(), __chat_id__='chat', __message_id__='a1'
@@ -2341,6 +2322,7 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
                 }
             },
         )
+
     monkeypatch.setattr(compaction.asyncio, 'to_thread', to_thread)
     monkeypatch.setattr(compaction, '_load_config', load_config)
     asyncio.run(run())
@@ -2882,7 +2864,7 @@ def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
             'prompt_template': '',
             'soft_trigger_ratio': 0.5,
             'transient_patterns': (),
-        }
+        },
     }
 
     async def run():
@@ -3400,8 +3382,7 @@ def _estimate_compacted_when_summarized(body):
     return (
         20
         if any(
-            isinstance(message.get('content'), str)
-            and message['content'].startswith('<auto_compaction_context>')
+            isinstance(message.get('content'), str) and message['content'].startswith('<auto_compaction_context>')
             for message in body['messages']
         )
         else 120
@@ -3886,8 +3867,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
         return (
             20
             if any(
-                isinstance(message.get('content'), str)
-                and message['content'].startswith('<auto_compaction_context>')
+                isinstance(message.get('content'), str) and message['content'].startswith('<auto_compaction_context>')
                 for message in body['messages']
             )
             else 120
@@ -4061,8 +4041,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
         [
             message
             for message in body['messages']
-            if isinstance(message.get('content'), str)
-            and message['content'].startswith('<auto_compaction_context>')
+            if isinstance(message.get('content'), str) and message['content'].startswith('<auto_compaction_context>')
         ]
         for body in folded['sent']
     ]
@@ -4202,11 +4181,13 @@ def _payload_leg_patches(monkeypatch, middleware, *, request_filter=None, refs_r
     monkeypatch.setattr(middleware, 'get_system_oauth_token', noop)
     monkeypatch.setattr(middleware, 'get_task_model_id', lambda model_id, *args, **kwargs: model_id)
     if refs_runtime is not None:
+
         async def runtime():
             return refs_runtime
 
         monkeypatch.setattr(middleware, '_runtime_externalized_refs_config', runtime)
     if request_filter is not None:
+
         async def process(**kwargs):
             if kwargs.get('filter_type') == 'request' and kwargs.get('filter_functions'):
                 return await kwargs['filter_functions'][0](
@@ -4271,7 +4252,18 @@ def _seed_state_on_capture(monkeypatch, middleware, seed):
     monkeypatch.setattr(middleware, '_capture_pre_filter_tool_refs', wrapper)
 
 
-def _run_payload_leg(middleware, messages, *, params=None, seeded_metadata=None, message_id='message', assistant_message_id='assistant', form_tool_ids=None, file_context=False, files=None):
+def _run_payload_leg(
+    middleware,
+    messages,
+    *,
+    params=None,
+    seeded_metadata=None,
+    message_id='message',
+    assistant_message_id='assistant',
+    form_tool_ids=None,
+    file_context=False,
+    files=None,
+):
     request = SimpleNamespace(
         state=SimpleNamespace(direct=False),
         app=SimpleNamespace(state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)),
@@ -4316,7 +4308,7 @@ def _approved_stored():
                 'status': 'queued',
                 'approved': True,
             }
-        ]
+        ],
     }
 
 
@@ -4457,7 +4449,7 @@ def test_paused_rollback_restores_ref_apply_state(monkeypatch):
                 'arguments': '{}',
                 'status': 'queued',
             }
-        ]
+        ],
     }
 
     async def marker_filter(body, __metadata__=None):
@@ -4810,9 +4802,7 @@ def test_projected_view_prevents_false_context_limit(monkeypatch):
         {
             'role': 'assistant',
             'content': '',
-            'tool_calls': [
-                {'id': 't1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}
-            ],
+            'tool_calls': [{'id': 't1', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}],
         },
         {'role': 'tool', 'tool_call_id': 't1', 'content': big},
     ]
@@ -4901,9 +4891,7 @@ def test_round0_non_native_disables_continuation_capture():
     assert gated is None
     assert 'tool_ref_entries' not in state
 
-    unrestricted = asyncio.run(
-        middleware._capture_pre_filter_tool_refs(body, metadata, state, payload_tools=None)
-    )
+    unrestricted = asyncio.run(middleware._capture_pre_filter_tool_refs(body, metadata, state, payload_tools=None))
 
     assert unrestricted is not None and unrestricted is not body['messages']
 
@@ -5168,10 +5156,12 @@ def _stream_leg_patches(monkeypatch, middleware, *, replies, tools, request_filt
     monkeypatch.setattr(middleware, 'clear_response_stream', noop)
     monkeypatch.setattr(middleware, 'save_response_stream', noop)
     monkeypatch.setattr(middleware, 'publish_chat_finished_event', noop)
+
     async def upsert(*_args, **_kwargs):
         return {}
 
     monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', upsert)
+
     async def title(_chat_id):
         return ''
 
@@ -5182,6 +5172,7 @@ def _stream_leg_patches(monkeypatch, middleware, *, replies, tools, request_filt
     socket_main = importlib.import_module('open_webui.socket.main')
     monkeypatch.setattr(socket_main, 'get_event_emitter', noop)
     if request_filter is not None:
+
         async def process(**kwargs):
             if kwargs.get('filter_type') == 'request' and kwargs.get('filter_functions'):
                 current['filter_inputs'].append(copy.deepcopy(kwargs['form_data']['messages']))
@@ -5271,15 +5262,11 @@ def _plain_tools(view_result='result-a', fetch_result='result-b'):
         for name, callable_ in (
             (
                 'view_file',
-                asyncio.run(
-                    tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})
-                ),
+                asyncio.run(tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})),
             ),
             (
                 'fetch_url',
-                asyncio.run(
-                    tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})
-                ),
+                asyncio.run(tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})),
             ),
         )
     }
@@ -5287,9 +5274,7 @@ def _plain_tools(view_result='result-a', fetch_result='result-b'):
 
 def _marker_count(messages):
     return sum(
-        message.get('content', '').count('|MARK|')
-        for message in messages
-        if isinstance(message.get('content'), str)
+        message.get('content', '').count('|MARK|') for message in messages if isinstance(message.get('content'), str)
     )
 
 
@@ -5348,9 +5333,7 @@ def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch,
     seen = []
 
     async def deleting_filter(body):
-        contents = [
-            message.get('content') for message in body['messages'] if isinstance(message.get('content'), str)
-        ]
+        contents = [message.get('content') for message in body['messages'] if isinstance(message.get('content'), str)]
         seen.append(list(contents))
         kept = [message for message in body['messages'] if message.get('role') != 'tool']
         return {**body, 'messages': kept}
@@ -5369,8 +5352,7 @@ def test_filtered_tool_removal_controls_catalog_and_filter_sees_raw(monkeypatch,
         return (
             20
             if any(
-                isinstance(message.get('content'), str)
-                and message['content'].startswith('<auto_compaction_context>')
+                isinstance(message.get('content'), str) and message['content'].startswith('<auto_compaction_context>')
                 for message in body['messages']
             )
             else 120
@@ -5416,9 +5398,7 @@ def test_reader_is_offered_on_the_first_request(monkeypatch):
     _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
     _payload_leg_drain(monkeypatch, middleware, None)
 
-    send, metadata, _events, _state = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'hello'}])
-    )
+    send, metadata, _events, _state = asyncio.run(_run_payload_leg(middleware, [{'role': 'user', 'content': 'hello'}]))
 
     assert send['tools'] == [refs.REF_EXEC_TOOL_SPEC]
     assert refs.is_owned_ref_reader(metadata['tools'])
@@ -5551,15 +5531,11 @@ def test_tool_messages_param_sees_sent_view(monkeypatch):
     tools = {
         'view_file': {
             'spec': spec('view_file'),
-            'callable': asyncio.run(
-                tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})
-            ),
+            'callable': asyncio.run(tools_module.get_async_tool_function_and_apply_extra_params(view_file, {})),
         },
         'fetch_url': {
             'spec': spec('fetch_url'),
-            'callable': asyncio.run(
-                tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})
-            ),
+            'callable': asyncio.run(tools_module.get_async_tool_function_and_apply_extra_params(fetch_url, {})),
         },
     }
     current = _stream_leg_patches(
@@ -5825,8 +5801,7 @@ def test_stateful_two_round_continuation_keeps_reader(monkeypatch):
 
     assert round2.get('previous_response_id') == 'resp-2'
     assert any(
-        message.get('role') == 'tool' and message.get('content') == 'small result'
-        for message in round2['messages']
+        message.get('role') == 'tool' and message.get('content') == 'small result' for message in round2['messages']
     )
     assert (
         len(
@@ -5861,7 +5836,7 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
                 'status': 'queued',
                 'approved': True,
             }
-        ]
+        ],
     }
 
     async def process_result(_request, _name, result, *_args):
@@ -5878,9 +5853,7 @@ def test_payload_apply_before_drain_executes_reader(monkeypatch):
         {
             'role': 'assistant',
             'content': '',
-            'tool_calls': [
-                {'id': 'old-call', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}
-            ],
+            'tool_calls': [{'id': 'old-call', 'type': 'function', 'function': {'name': 'lookup', 'arguments': '{}'}}],
         },
         {'role': 'tool', 'tool_call_id': 'old-call', 'content': big},
     ]
@@ -5929,9 +5902,7 @@ def test_round0_non_native_continuation_sends_no_refs(monkeypatch):
     )
 
     sent = current['sent'][0]
-    assert any(
-        message.get('role') == 'tool' and message.get('content') is big for message in sent['messages']
-    )
+    assert any(message.get('role') == 'tool' and message.get('content') is big for message in sent['messages'])
     assert not any(
         isinstance(message.get('content'), str) and message.get('content').startswith('tool:')
         for message in sent['messages']
@@ -5954,8 +5925,7 @@ def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
 
     def content_chars(messages):
         return sum(
-            len(message.get('content')) if isinstance(message.get('content'), str) else 0
-            for message in messages
+            len(message.get('content')) if isinstance(message.get('content'), str) else 0 for message in messages
         )
 
     projected, _entries = asyncio.run(
@@ -6004,9 +5974,7 @@ def test_projected_snapshot_prevents_continuation_compaction(monkeypatch):
 
     sent = current['sent'][0]
     assert len(sent['messages']) == 3
-    assert not any(
-        '<auto_compaction_context>' in message.get('content', '') for message in sent['messages']
-    )
+    assert not any('<auto_compaction_context>' in message.get('content', '') for message in sent['messages'])
     tool_messages = [message for message in sent['messages'] if message.get('role') == 'tool']
     assert len(tool_messages) == 1
     assert tool_messages[0]['content'] == projected[0]['content']
@@ -6131,11 +6099,7 @@ def test_direct_summary_dispatch_to_server_model_stays_emitter_inert(monkeypatch
     )
 
     assert 'message_id' not in captured['metadata']
-    assert (
-        set(captured['metadata'])
-        - {'chat_id', 'session_id', 'user_id', 'tools', 'files'}
-        == {'task'}
-    )
+    assert set(captured['metadata']) - {'chat_id', 'session_id', 'user_id', 'tools', 'files'} == {'task'}
     assert captured['metadata']['task'] == 'context_compaction'
     assert 'tools' not in captured['metadata']
     assert 'files' not in captured['metadata']
@@ -6458,9 +6422,7 @@ def test_outlet_swapped_message_items_block_restore(monkeypatch):
                 {
                     'type': 'message',
                     'role': 'assistant',
-                    'content': [
-                        {'type': 'output_text', 'text': ' continued', 'annotations': [], 'logprobs': None}
-                    ],
+                    'content': [{'type': 'output_text', 'text': ' continued', 'annotations': [], 'logprobs': None}],
                 },
             ],
         },
@@ -7549,9 +7511,7 @@ def test_usage_receipt_is_saved_when_cancelled_before_stream_closes(monkeypatch)
             await release.wait()
 
         task = asyncio.create_task(
-            middleware.streaming_chat_response_handler(
-                StreamingResponse(chunks(), media_type='text/event-stream'), ctx
-            )
+            middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
         )
         try:
             await asyncio.wait_for(received.wait(), 2)
@@ -7703,9 +7663,7 @@ def test_initial_send_commit_adopts_pending_and_notifies(monkeypatch):
     monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 40)
 
-    send, _metadata, _events, state = asyncio.run(
-        _run_payload_leg(middleware, [{'role': 'user', 'content': 'start'}])
-    )
+    send, _metadata, _events, state = asyncio.run(_run_payload_leg(middleware, [{'role': 'user', 'content': 'start'}]))
 
     assert state['last_send_body'] is send
     assert 'pending_context_usage' not in state
@@ -8467,7 +8425,13 @@ def test_same_response_usage_stays_latest_single_response(monkeypatch):
         )
         await middleware.streaming_chat_response_handler(response, ctx)
         task = compaction.start_completed_turn_compaction_prefetch(
-            ctx['request'], ctx['user'], ctx['form_data']['messages'], metadata, 'model', {}, state,
+            ctx['request'],
+            ctx['user'],
+            ctx['form_data']['messages'],
+            metadata,
+            'model',
+            {},
+            state,
             ctx['completed_compaction']['usage'],
         )
         assert task is not None, 'the single-response usage must arm the prefetch'
@@ -8797,9 +8761,7 @@ def test_stream_start_persists_confirmed_snapshot(monkeypatch):
             yield b'data: [DONE]\n\n'
 
         running = asyncio.create_task(
-            middleware.streaming_chat_response_handler(
-                StreamingResponse(chunks(), media_type='text/event-stream'), ctx
-            )
+            middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
         )
         try:
             await asyncio.wait_for(started.wait(), 5)
@@ -8946,9 +8908,7 @@ def _observe_redis_stream(monkeypatch, specs, batch_size=1):
 
     async def run():
         response, parked, release = _parked_stream(middleware, specs)
-        running = asyncio.create_task(
-            middleware.streaming_chat_response_handler(response, harness['ctx'])
-        )
+        running = asyncio.create_task(middleware.streaming_chat_response_handler(response, harness['ctx']))
         try:
             await asyncio.wait_for(parked.wait(), 5)
             streams = copy.deepcopy(await harness['tasks'].get_response_streams_by_chat_id(redis, 'chat'))
@@ -9021,9 +8981,7 @@ def test_batched_body_usage_does_not_add_full_saves(monkeypatch):
     ],
 )
 def test_missing_token_counters_keep_latest(monkeypatch, invalid_usage):
-    result = _observe_redis_stream(
-        monkeypatch, [_usage_chunk(90), {'choices': [], 'usage': dict(invalid_usage)}]
-    )
+    result = _observe_redis_stream(monkeypatch, [_usage_chunk(90), {'choices': [], 'usage': dict(invalid_usage)}])
 
     assert result['state']['tokens'] == 90
     assert [item['tokens'] for item in _numeric_snapshots(result['events'])] == [90]
@@ -9136,9 +9094,7 @@ def test_non_stream_keeps_estimate_without_measurement(monkeypatch, raw):
 
 
 def test_non_stream_invalid_total_is_not_adopted(monkeypatch):
-    result = _non_stream_observe(
-        monkeypatch, {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': -1}
-    )
+    result = _non_stream_observe(monkeypatch, {'prompt_tokens': 80, 'completion_tokens': 10, 'total_tokens': -1})
 
     assert result['state'] == _stream_confirmed_snapshot()
     assert result['completed']['usage'] is None
@@ -9169,9 +9125,7 @@ def test_non_stream_cache_inclusive_usage_is_adopted(monkeypatch):
     assert completed is not None
     assert completed['cache_creation_input_tokens'] == 10
     assert completed['cache_read_input_tokens'] == 50
-    assert (
-        compaction._usage_total_tokens(completed) == 90
-    ), 'the prefetch gate must see the cache-inclusive total'
+    assert compaction._usage_total_tokens(completed) == 90, 'the prefetch gate must see the cache-inclusive total'
 
 
 async def _allow_chat_creation(*_args, **_kwargs):
@@ -9273,9 +9227,7 @@ def _entry_wait_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(
         importlib.import_module('open_webui.utils.subagents'), 'process_pending_internal_messages', noop
     )
-    monkeypatch.setattr(
-        importlib.import_module('open_webui.utils.timers'), 'cancel_timers_for_chat', noop
-    )
+    monkeypatch.setattr(importlib.import_module('open_webui.utils.timers'), 'cancel_timers_for_chat', noop)
 
     return {
         'routing': routing,
@@ -9303,7 +9255,7 @@ def test_initial_wait_and_cancel_keep_confirmed_snapshot(monkeypatch, tmp_path):
     async def run():
         from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-        engine = create_async_engine(f"sqlite+aiosqlite:///{harness['tmp_path'] / 'entry.db'}")
+        engine = create_async_engine(f'sqlite+aiosqlite:///{harness["tmp_path"] / "entry.db"}')
         harness['makers']['session'] = async_sessionmaker(engine, expire_on_commit=False)
         try:
             async with engine.begin() as connection:
@@ -9378,17 +9330,13 @@ def test_initial_wait_and_cancel_keep_confirmed_snapshot(monkeypatch, tmp_path):
 
                 before = {
                     'row': await read_row(),
-                    'streams': copy.deepcopy(
-                        await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')
-                    ),
+                    'streams': copy.deepcopy(await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')),
                 }
                 await tasks.stop_task(None, task_id)
                 await asyncio.sleep(0)
                 after = {
                     'row': await read_row(),
-                    'streams': copy.deepcopy(
-                        await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')
-                    ),
+                    'streams': copy.deepcopy(await tasks.get_response_streams_by_chat_id(None, 'entry-review-chat')),
                 }
                 return {'before': before, 'after': after}
             finally:
@@ -9411,12 +9359,12 @@ def test_initial_wait_and_cancel_keep_confirmed_snapshot(monkeypatch, tmp_path):
         'source': 'estimated',
     }
     assert notified and notified[-1] == snapshot
-    assert harness['snapshot_calls'] == [
-        {'message_id': 'assistant', 'snapshot': snapshot}
-    ], 'the send commit must persist through the dedicated snapshot update'
-    assert not any(
-        call['update'].keys() == {'context_usage'} for call in harness['upsert_calls']
-    ), 'the send commit must not reuse the dual-writing upsert'
+    assert harness['snapshot_calls'] == [{'message_id': 'assistant', 'snapshot': snapshot}], (
+        'the send commit must persist through the dedicated snapshot update'
+    )
+    assert not any(call['update'].keys() == {'context_usage'} for call in harness['upsert_calls']), (
+        'the send commit must not reuse the dual-writing upsert'
+    )
 
     for phase in ('before', 'after'):
         message = observed[phase]['row']
@@ -9444,15 +9392,11 @@ def test_continuation_commit_saves_snapshot_before_provider_wait(monkeypatch):
         harness['current']['replies'] = [harness['current']['text_response']('done')]
         db_saves_before = len(harness['current']['saved'])
         running = asyncio.create_task(
-            middleware.streaming_chat_response_handler(
-                harness['current']['tool_response']('call-a', 'view_file'), ctx
-            )
+            middleware.streaming_chat_response_handler(harness['current']['tool_response']('call-a', 'view_file'), ctx)
         )
         try:
             await asyncio.wait_for(entered.wait(), 5)
-            streams = copy.deepcopy(
-                await harness['tasks'].get_response_streams_by_chat_id(None, 'chat')
-            )
+            streams = copy.deepcopy(await harness['tasks'].get_response_streams_by_chat_id(None, 'chat'))
             restored = harness['chats_router'].overlay_response_streams(harness['blob'](), streams)
             return {
                 'streams': streams,
@@ -9500,16 +9444,10 @@ async def _run_dualwrite_send_commit_leg(monkeypatch, middleware, chats_model, r
 
     _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
     _payload_leg_drain(monkeypatch, middleware, {'output': []})
-    _seed_state_on_capture(
-        monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()}
-    )
-    monkeypatch.setattr(
-        middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', counting_upsert
-    )
+    _seed_state_on_capture(monkeypatch, middleware, {'summary_message_content': '', 'config': _compaction_config()})
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', counting_upsert)
     if real_snapshot_update is not None:
-        monkeypatch.setattr(
-            middleware.Chats, 'update_message_context_usage', counting_snapshot_update
-        )
+        monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', counting_snapshot_update)
     monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda *_args, **_kwargs: 60)
     monkeypatch.setattr(middleware, 'get_event_emitter', get_event_emitter)
 

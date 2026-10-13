@@ -687,8 +687,14 @@ async def test_giant_single_line_commands_never_copy_the_source():
     for source, templates in (
         (
             'a' * (size - 6) + 'NEEDLE',
-            ('head -n 1 {0}', 'tail -n 1 {0}', 'sed -n 1p {0}',
-             'grep NEEDLE {0}', 'grep -n NEEDLE {0}', 'grep -o NEEDLE {0}'),
+            (
+                'head -n 1 {0}',
+                'tail -n 1 {0}',
+                'sed -n 1p {0}',
+                'grep NEEDLE {0}',
+                'grep -n NEEDLE {0}',
+                'grep -o NEEDLE {0}',
+            ),
         ),
         (
             'a' * (size - 7) + 'NEEDLE\n',
@@ -727,9 +733,7 @@ async def test_giant_single_line_head_is_truncated_with_a_marker():
             # count_tokens=None makes any <=64 KiB response "fit", so a page that
             # skipped the budget check would come back without its marker.
             for count_tokens in (None, compaction.estimate_text_tokens):
-                result = refs._execute_reader(
-                    stages, catalog, TOKEN_THRESHOLD, count_tokens
-                )
+                result = refs._execute_reader(stages, catalog, TOKEN_THRESHOLD, count_tokens)
                 assert result.endswith('</auto_compact_ref_truncated>'), command
                 assert result == text[: len(result) - len(marker)] + marker
                 assert len(result.encode('utf-8')) <= refs.REF_EXEC_RESPONSE_MAX_BYTES
@@ -776,11 +780,7 @@ async def test_grep_only_matching_tracks_source_bytes_across_multibyte_gaps():
     source = head + gap.join(('', 'NEEDLE', 'NEEDLE', 'NEEDLE'))
     entry = refs.make_ref_entry(source, kind='tool')
     stages = refs._parse_command(f'grep -o NEEDLE {entry.ref}')
-    lines = list(
-        refs._apply_stage(
-            refs._iter_source_lines(entry), stages[0], refs.MatchBudget()
-        )
-    )
+    lines = list(refs._apply_stage(refs._iter_source_lines(entry), stages[0], refs.MatchBudget()))
 
     gap_bytes = len(gap.encode('utf-8'))
     head_bytes = len(head.encode('utf-8'))
@@ -832,7 +832,7 @@ async def test_history_ancestor_body_survives_being_listed_first():
         body,
         registry,
         native=True,
-        threshold_tokens=10 ** 9,
+        threshold_tokens=10**9,
         count_tokens=lambda _text: 0,
         history_loader=load_selected,
     )
@@ -912,16 +912,12 @@ def test_short_line_spans_never_reach_for_the_byte_index(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_parked_history_stubs_reload_through_the_loader_that_listed_them():
-    ancestors = tuple(
-        refs.make_ref_entry(f'ancestor {index} body', kind='history') for index in range(2)
-    )
+    ancestors = tuple(refs.make_ref_entry(f'ancestor {index} body', kind='history') for index in range(2))
 
     async def load_a(requested):
         if requested is None:
             # `ls` parks metadata-only stubs that carry their own loader back.
-            return tuple(
-                compaction.replace(item, text='', load_history=load_a) for item in ancestors
-            )
+            return tuple(compaction.replace(item, text='', load_history=load_a) for item in ancestors)
         return tuple(item for item in ancestors if item.ref == requested)
 
     async def load_b(_requested):
@@ -1028,9 +1024,7 @@ def test_tail_of_nothing_never_pulls_the_source(monkeypatch):
 
 def _rebuilt_preview(source: str, ref: str, prefix: str, suffix: str) -> str:
     prefix_bytes = len(prefix.encode('utf-8'))
-    omitted_bytes = (
-        len(source.encode('utf-8')) - prefix_bytes - len(suffix.encode('utf-8'))
-    )
+    omitted_bytes = len(source.encode('utf-8')) - prefix_bytes - len(suffix.encode('utf-8'))
     command = f'tail -c +{prefix_bytes + 1} {ref} | head -c {omitted_bytes}'
     return prefix + refs._truncated_marker(command) + '\n' + suffix
 
