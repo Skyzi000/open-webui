@@ -3013,9 +3013,13 @@ def test_request_start_summary_is_tracked_through_the_payload_path(monkeypatch, 
     assert summarized == [['old user', 'old answ']]
 
 
-@pytest.mark.parametrize('sent_with_summary', [False, True], ids=['measured-before-summary', 'measured-with-summary'])
+@pytest.mark.parametrize(
+    ('reply_output', 'measured_with_summary'),
+    [(['text'], False), (['summary', 'text'], True), (['text', 'summary', 'text'], False)],
+    ids=['measured-before-summary', 'measured-with-summary', 'summary-adopted-by-a-later-leg'],
+)
 def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_current_summary(
-    monkeypatch, sent_with_summary
+    monkeypatch, reply_output, measured_with_summary
 ):
     middleware = importlib.import_module('open_webui.utils.middleware')
     answer = {
@@ -3032,7 +3036,7 @@ def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_curre
             'id': 'a1',
             'role': 'assistant',
             'content': 'answer',
-            'output': [*([_adoption_item('summary')] if sent_with_summary else []), answer],
+            'output': [_adoption_item('summary') if item == 'summary' else answer for item in reply_output],
             'usage': {'prompt_tokens': 2_000, 'completion_tokens': 5},
         },
         {'id': 'u2', 'role': 'user', 'content': 'next question'},
@@ -3069,7 +3073,7 @@ def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_curre
 
     asyncio.run(run())
 
-    assert summarized == ([True] if sent_with_summary else [])
+    assert summarized == ([True] if measured_with_summary else [])
 
 
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):

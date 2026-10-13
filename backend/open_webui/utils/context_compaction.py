@@ -390,6 +390,17 @@ def _latest_adoption_summary(output: Any) -> str | None:
     return None
 
 
+def _adopts_summary_after_output(output: Any) -> bool:
+    """Whether a later leg of the reply ran under another summary than the one its first output was sent with."""
+    seen_output = False
+    for item in output if isinstance(output, list) else []:
+        if not (isinstance(item, dict) and item.get('type') == CONTEXT_COMPACTION_OUTPUT_TYPE):
+            seen_output = True
+        elif seen_output:
+            return True
+    return False
+
+
 def latest_branch_adoption_summary(messages: Any) -> str | None:
     if not isinstance(messages, list):
         return None
@@ -849,9 +860,13 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
             # merge_usage keeps one prompt size per reply, so a reply with tool rounds cannot say which call it measured.
             # A reply requested under another summary measured messages this request no longer sends as they were.
             recorded = latest_branch_adoption_summary(active_messages[: index + 1])
-            if (recorded.strip() if isinstance(recorded, str) else None) == previous_summary and not any(
-                isinstance(item, dict) and item.get('type') == 'function_call_output'
-                for item in message.get('output') or []
+            if (
+                (recorded.strip() if isinstance(recorded, str) else None) == previous_summary
+                and not _adopts_summary_after_output(message.get('output'))
+                and not any(
+                    isinstance(item, dict) and item.get('type') == 'function_call_output'
+                    for item in message.get('output') or []
+                )
             ):
                 message[CONTEXT_COMPACTION_USAGE_ANCHOR_KEY] = input_tokens
             break
