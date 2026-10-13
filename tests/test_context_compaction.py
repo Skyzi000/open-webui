@@ -2144,6 +2144,74 @@ def test_summary_saved_after_the_turn_survives_an_older_copy_that_keeps_what_it_
     assert [item.get('contextSummary') for item in asyncio.run(run())] == kept
 
 
+@pytest.mark.parametrize('stored_nulls', [{}, {'files': None, 'statusHistory': None}], ids=['clean', 'nulls-on-disk'])
+def test_reply_takes_an_image_and_a_status_after_its_summary_was_saved_in_the_background(
+    tmp_path, monkeypatch, stored_nulls
+):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+    builtin = importlib.import_module('open_webui.tools.builtin')
+    socket_main = importlib.import_module('open_webui.socket.main')
+    makers = {}
+    monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model, 'get_async_db', _sqlite_session_context(makers))
+    monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
+
+    async def image_generations(**_kwargs):
+        return [{'url': '/api/v1/files/image-1/content'}]
+
+    async def emit(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(builtin, 'image_generations', image_generations)
+    monkeypatch.setattr(socket_main.sio, 'emit', emit)
+    output = [{'type': 'function_call', 'id': 'fc_1'}]
+    reply = {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': '', 'done': False, 'output': output}
+    history = {
+        'currentId': 'a1',
+        'messages': {
+            'u1': {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'start'},
+            'a1': {**reply, **stored_nulls},
+        },
+    }
+
+    async def summary():
+        return 'summary'
+
+    async def run():
+        engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "chat.db"}')
+        makers['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
+                await connection.run_sync(chat_messages.ChatMessage.__table__.create)
+            await chats_model.Chats.insert_new_chat('chat', 'user-1', chats_model.ChatForm(chat={'history': history}))
+            await compaction._summarize_in_background(
+                None, summary(), {'chat_id': 'chat', 'message_id': 'a1'}, dict(output[0])
+            )
+            emitter = await socket_main.get_event_emitter(
+                {'user_id': 'user-1', 'chat_id': 'chat', 'message_id': 'a1'}
+            )
+            await emitter({'type': 'status', 'data': {'description': 'searching', 'done': True}})
+            result = await builtin.generate_image(
+                'a cat', __request__=object(), __chat_id__='chat', __message_id__='a1'
+            )
+            stored = (await chats_model.Chats.get_chat_by_id('chat')).chat['history']['messages']['a1']
+            return json.loads(result), stored
+        finally:
+            await engine.dispose()
+
+    result, stored = asyncio.run(run())
+
+    assert result == {'status': 'success', 'images': [{'url': '/api/v1/files/image-1/content'}]}
+    assert stored['files'] == [{'type': 'image', 'url': '/api/v1/files/image-1/content'}]
+    assert stored['statusHistory'] == [{'description': 'searching', 'done': True}]
+    assert [key for key, value in stored.items() if value is None] == []
+
+
 def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path, monkeypatch):
     from contextlib import asynccontextmanager
 

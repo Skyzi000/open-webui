@@ -420,7 +420,7 @@ class ChatTable:
                     {
                         ChatMessages.DB_TO_JSON_KEY_MAP.get(column.key, column.key): getattr(row, column.key)
                         for column in ChatMessage.__table__.columns
-                        if column.key not in ChatMessages.EXCLUDED_COLUMNS
+                        if column.key not in ChatMessages.EXCLUDED_COLUMNS and getattr(row, column.key) is not None
                     }
                 )
                 message['id'] = message_id
@@ -1431,7 +1431,7 @@ class ChatTable:
                 history = chat.get('history', {})
 
                 if message_id in history.get('messages', {}):
-                    status_history = history['messages'][message_id].get('statusHistory', [])
+                    status_history = history['messages'][message_id].get('statusHistory') or []
                     status_history.append(status)
                     history['messages'][message_id]['statusHistory'] = status_history
                     message = history['messages'][message_id]
@@ -1462,7 +1462,7 @@ class ChatTable:
             message_files = []
 
             if message_id in history.get('messages', {}):
-                message_files = history['messages'][message_id].get('files', [])
+                message_files = history['messages'][message_id].get('files') or []
                 message_files = message_files + files
                 history['messages'][message_id]['files'] = message_files
                 message = history['messages'][message_id]
