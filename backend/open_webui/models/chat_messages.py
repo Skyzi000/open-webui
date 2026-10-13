@@ -261,7 +261,7 @@ class ChatMessageTable:
             message.status_history = data.get('status_history') or data.get('statusHistory')
         if 'error' in data:
             message.error = data.get('error')
-        if 'context_summary' in data or 'contextSummary' in data:
+        if data.get('context_summary') or data.get('contextSummary'):
             message.context_summary = data.get('context_summary') or data.get('contextSummary')
 
         usage = get_usage(data)

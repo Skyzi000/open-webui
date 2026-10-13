@@ -2193,6 +2193,41 @@ def test_reply_takes_an_image_and_a_status_after_its_summary_was_saved_in_the_ba
     assert [key for key, value in stored.items() if value is None] == []
 
 
+def test_checkpoint_survives_a_later_save_of_a_reply_stored_with_a_null_marker(tmp_path, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+    makers = {}
+    monkeypatch.setattr(chats_model, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model, 'get_async_db', _sqlite_session_context(makers))
+    monkeypatch.setattr(chat_messages, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
+    history = {
+        'currentId': 'a1',
+        'messages': {
+            'u1': {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'start'},
+            'a1': {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'reply', 'contextSummary': None},
+        },
+    }
+
+    async def run():
+        engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "chat.db"}')
+        makers['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        try:
+            async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
+                await connection.run_sync(chat_messages.ChatMessage.__table__.create)
+            await chats_model.Chats.insert_new_chat('chat', 'user-1', chats_model.ChatForm(chat={'history': history}))
+            await chat_messages.ChatMessages.update_context_summary('chat', 'a1', 'checkpoint')
+            await chats_model.Chats.upsert_message_to_chat_by_id_and_message_id('chat', 'a1', {'content': 'more'})
+            return (await chats_model.Chats.get_messages_map_by_chat_id('chat'))['a1'].get('contextSummary')
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(run()) == 'checkpoint'
+
+
 def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path, monkeypatch):
     from contextlib import asynccontextmanager
 
