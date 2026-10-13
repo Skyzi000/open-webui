@@ -23,6 +23,7 @@ from sqlalchemy import (
     cast,
     delete,
     func,
+    or_,
     select,
     update,
 )
@@ -233,6 +234,33 @@ def _keep_output_checkpoints(stored, incoming):
     return kept
 
 
+def overlay_context_summaries(history_messages: dict, normalized_messages: dict) -> None:
+    """Put the checkpoint markers held by normalized rows onto the embedded history messages."""
+    for message_id, normalized in normalized_messages.items():
+        embedded = history_messages.get(message_id)
+        if not isinstance(normalized, dict) or not isinstance(embedded, dict):
+            continue
+        summary = normalized.get('contextSummary')
+        if isinstance(summary, str) and summary.strip():
+            history_messages[message_id] = {**embedded, 'contextSummary': summary}
+        normalized_output = normalized.get('output')
+        embedded_output = embedded.get('output')
+        if not (isinstance(normalized_output, list) and isinstance(embedded_output, list)):
+            continue
+        patched_output = None
+        for index, item in enumerate(embedded_output):
+            normalized_item = normalized_output[index] if index < len(normalized_output) else None
+            if not isinstance(item, dict) or not isinstance(normalized_item, dict):
+                continue
+            item_summary = normalized_item.get('contextSummary')
+            if isinstance(item_summary, str) and item_summary.strip():
+                patched_output = list(embedded_output) if patched_output is None else patched_output
+                patched_output[index] = {**item, 'contextSummary': item_summary}
+        if patched_output is not None:
+            current = history_messages[message_id]
+            history_messages[message_id] = {**current, 'output': patched_output}
+
+
 class ChatMessageTable:
     @staticmethod
     def _apply_message_data(message: ChatMessage, data: dict, now: int) -> None:
@@ -359,6 +387,36 @@ class ChatMessageTable:
             )
             await db.commit()
             return result.rowcount == 1
+
+    async def add_context_summaries(self, chat_id: str, chat: dict, db: Optional[AsyncSession] = None) -> dict:
+        """Copy of a chat blob that also carries the checkpoints only its rows hold."""
+        history = chat.get('history') if isinstance(chat, dict) else None
+        messages = history.get('messages') if isinstance(history, dict) else None
+        if not isinstance(messages, dict):
+            return chat
+        async with get_async_db_context(db) as db:
+            result = await db.execute(
+                select(ChatMessage.id, ChatMessage.context_summary, ChatMessage.output)
+                .where(ChatMessage.chat_id == chat_id)
+                .where(
+                    or_(
+                        ChatMessage.context_summary.is_not(None),
+                        cast(ChatMessage.output, Text).like('%contextSummary%'),
+                    )
+                )
+            )
+            rows = result.all()
+        if not rows:
+            return chat
+        messages = dict(messages)
+        overlay_context_summaries(
+            messages,
+            {
+                row.id.removeprefix(f'{chat_id}-'): {'contextSummary': row.context_summary, 'output': row.output}
+                for row in rows
+            },
+        )
+        return {**chat, 'history': {**history, 'messages': messages}}
 
     async def get_message_by_id(self, id: str, db: Optional[AsyncSession] = None) -> Optional[ChatMessageModel]:
         async with get_async_db_context(db) as db:

@@ -19,7 +19,7 @@ from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
 from open_webui.events import EVENTS, publish_event
 from open_webui.internal.db import get_async_session
 from open_webui.models.access_grants import AccessGrants
-from open_webui.models.chat_messages import ChatMessages
+from open_webui.models.chat_messages import ChatMessages, overlay_context_summaries
 from open_webui.models.chats import (
     AggregateChatStats,
     ChatBody,
@@ -1082,6 +1082,12 @@ async def get_user_pinned_chats(
 CHAT_EXPORT_BATCH_SIZE = 100
 
 
+async def _export_response(chat, db: AsyncSession | None = None) -> ChatResponse:
+    response = ChatResponse.model_validate(chat, from_attributes=True)
+    response.chat = await ChatMessages.add_context_summaries(chat.id, response.chat, db=db)
+    return response
+
+
 async def generate_chat_export_ndjson(user_id: str):
     """
     Async generator that streams all user chats as NDJSON (one JSON object per line).
@@ -1103,7 +1109,7 @@ async def generate_chat_export_ndjson(user_id: str):
 
         for chat in result.items:
             try:
-                yield ChatResponse.model_validate(chat, from_attributes=True).model_dump_json() + '\n'
+                yield (await _export_response(chat)).model_dump_json() + '\n'
             except Exception as e:
                 log.exception(f'Error serializing chat {chat.id}: {e}')
 
@@ -1128,10 +1134,7 @@ async def get_user_chats(user=Depends(get_verified_user)):
 
 @router.get('/all/archived', response_model=list[ChatResponse])
 async def get_user_archived_chats(user=Depends(get_verified_user), db: AsyncSession = Depends(get_async_session)):
-    return [
-        ChatResponse.model_validate(chat, from_attributes=True)
-        for chat in await Chats.get_archived_chats_by_user_id(user.id, db=db)
-    ]
+    return [await _export_response(chat, db=db) for chat in await Chats.get_archived_chats_by_user_id(user.id, db=db)]
 
 
 ############################
@@ -1158,7 +1161,7 @@ async def get_all_user_tags(user=Depends(get_verified_user), db: AsyncSession = 
 async def get_all_user_chats_in_db(user=Depends(get_admin_user), db: AsyncSession = Depends(get_async_session)):
     if not ENABLE_ADMIN_EXPORT:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
-    return [ChatResponse.model_validate(chat, from_attributes=True) for chat in await Chats.get_chats(db=db)]
+    return [await _export_response(chat, db=db) for chat in await Chats.get_chats(db=db)]
 
 
 ############################
@@ -1496,29 +1499,7 @@ def _overlay_context_summaries(data: dict, messages_map: dict | None) -> dict:
     if not isinstance(history_messages, dict):
         return data
 
-    for message_id, normalized in messages_map.items():
-        embedded = history_messages.get(message_id)
-        if not isinstance(normalized, dict) or not isinstance(embedded, dict):
-            continue
-        summary = normalized.get('contextSummary')
-        if isinstance(summary, str) and summary.strip():
-            history_messages[message_id] = {**embedded, 'contextSummary': summary}
-        normalized_output = normalized.get('output')
-        embedded_output = embedded.get('output')
-        if not (isinstance(normalized_output, list) and isinstance(embedded_output, list)):
-            continue
-        patched_output = None
-        for index, item in enumerate(embedded_output):
-            normalized_item = normalized_output[index] if index < len(normalized_output) else None
-            if not isinstance(item, dict) or not isinstance(normalized_item, dict):
-                continue
-            item_summary = normalized_item.get('contextSummary')
-            if isinstance(item_summary, str) and item_summary.strip():
-                patched_output = list(embedded_output) if patched_output is None else patched_output
-                patched_output[index] = {**item, 'contextSummary': item_summary}
-        if patched_output is not None:
-            current = history_messages[message_id]
-            history_messages[message_id] = {**current, 'output': patched_output}
+    overlay_context_summaries(history_messages, messages_map)
     return data
 
 
@@ -2006,7 +1987,7 @@ async def clone_chat_by_id(
     chat = await Chats.get_chat_by_id_and_user_id(id, user.id, db=db)
     if chat:
         updated_chat = {
-            **chat.chat,
+            **await ChatMessages.add_context_summaries(chat.id, chat.chat, db=db),
             'originalChatId': chat.id,
             'branchPointMessageId': chat.chat['history']['currentId'],
             'title': form_data.title if form_data.title else f'Clone of {chat.title}',
@@ -2092,7 +2073,9 @@ async def clone_shared_chat_by_id(
         )
 
     updated_chat = {
-        **(await shared_chat_response(chat, user, db=db))['chat'],
+        **await ChatMessages.add_context_summaries(
+            chat.id, (await shared_chat_response(chat, user, db=db))['chat'], db=db
+        ),
         'originalChatId': chat.id,
         'branchPointMessageId': chat.chat['history']['currentId'],
         'title': f'Clone of {chat.title}',

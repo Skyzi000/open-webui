@@ -8265,6 +8265,136 @@ def test_non_stream_response_prepends_adoption_record(monkeypatch):
     assert _adoption_shape(saved[-1]['output']) == [('message', None, None, None)]
 
 
+def test_copies_of_a_chat_keep_the_checkpoints_only_its_rows_hold(tmp_path, monkeypatch):
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    chats_model = importlib.import_module('open_webui.models.chats')
+    chat_messages = importlib.import_module('open_webui.models.chat_messages')
+    shared_chats = importlib.import_module('open_webui.models.shared_chats')
+    chats_router = importlib.import_module('open_webui.routers.chats')
+    socket_main = importlib.import_module('open_webui.socket.main')
+    makers = {}
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    async def no_grants(*_args, **_kwargs):
+        return []
+
+    for module in (chats_model, chat_messages, shared_chats):
+        monkeypatch.setattr(module, 'get_async_db_context', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model, 'get_async_db', _sqlite_session_context(makers))
+    monkeypatch.setattr(chats_model.Chats, 'require_chat_creation_permission', _allow_chat_creation)
+    for name in ('require_chat_import_permission', 'publish_event'):
+        monkeypatch.setattr(chats_router, name, _allow_chat_creation)
+    monkeypatch.setattr(chats_router, 'can_read_shared_chat', allowed)
+    monkeypatch.setattr(chats_router, 'filter_allowed_access_grants', no_grants)
+    monkeypatch.setattr(chats_router.AccessGrants, 'set_access_grants', no_grants)
+    monkeypatch.setattr(chats_router.Config, 'get', _allow_chat_creation)
+    monkeypatch.setattr(socket_main, 'refresh_chat_access', _allow_chat_creation)
+    user = SimpleNamespace(id='user-1', role='admin', name='User')
+    call = {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}'}
+    answer = {'type': 'message', 'id': 'msg_1', 'content': [{'type': 'output_text', 'text': 'answer'}]}
+    question = {'id': 'u1', 'parentId': None, 'role': 'user', 'content': 'question'}
+    history = {
+        'currentId': 'a1',
+        'messages': {
+            'u1': {**question, 'user': {'id': 'user-1', 'name': 'User'}},
+            'a1': {
+                'id': 'a1',
+                'parentId': 'u1',
+                'role': 'assistant',
+                'content': 'answer',
+                'done': True,
+                'output': [call, answer],
+            },
+        },
+    }
+    Chats, ChatMessages = chats_model.Chats, chat_messages.ChatMessages
+
+    def checkpoints(messages):
+        return messages['u1'].get('contextSummary'), messages['a1']['output'][0].get('contextSummary')
+
+    async def copied(chat):
+        return checkpoints(await Chats.get_messages_map_by_chat_id(chat.id))
+
+    async def run():
+        engine = create_async_engine(f'sqlite+aiosqlite:///{tmp_path / "copies.db"}')
+        makers['session'] = async_sessionmaker(engine, expire_on_commit=False)
+        seen = {}
+        try:
+            async with engine.begin() as connection:
+                for table in (chats_model.Chat, chat_messages.ChatMessage, shared_chats.SharedChat):
+                    await connection.run_sync(table.__table__.create)
+            for chat_id in ('fixed', 'live'):
+                await Chats.insert_new_chat(chat_id, 'user-1', chats_model.ChatForm(chat={'history': history}))
+                await ChatMessages.update_context_summary(chat_id, 'u1', 'FIRST')
+                await ChatMessages.upsert_message(
+                    'a1', chat_id, 'user-1', {'output': [{**call, 'contextSummary': 'NESTED'}, answer]}
+                )
+            assert checkpoints((await Chats.get_chat_by_id('fixed')).chat['history']['messages']) == (None, None)
+
+            async with makers['session']() as db:
+                seen['clone'] = await copied(
+                    await chats_router.clone_chat_by_id(None, chats_router.CloneForm(), 'fixed', user, db)
+                )
+                await chats_router.share_chat_by_id(None, 'fixed', None, user, db)
+                await chats_router.share_chat_by_id(
+                    None, 'live', shared_chats.ShareChatForm(share_mode='continue'), user, db
+                )
+                shares = {
+                    chat_id: (await Chats.get_chat_by_id(chat_id, db=db)).share_id for chat_id in ('fixed', 'live')
+                }
+            exported = [json.loads(line) async for line in chats_router.generate_chat_export_ndjson('user-1')]
+            seen['export'] = checkpoints(
+                next(chat for chat in exported if chat['id'] == 'fixed')['chat']['history']['messages']
+            )
+
+            for chat_id in ('fixed', 'live'):
+                await ChatMessages.update_context_summary(chat_id, 'u1', 'SECOND')
+            async with makers['session']() as db:
+                seen['fixed share'] = await copied(
+                    await chats_router.clone_shared_chat_by_id(None, shares['fixed'], user, db)
+                )
+                seen['live share'] = await copied(
+                    await chats_router.clone_shared_chat_by_id(None, shares['live'], user, db)
+                )
+                await chats_router.share_chat_by_id(None, 'fixed', None, user, db)
+                await chats_router.update_shared_chat_access_by_id(
+                    None, 'live', chats_router.ChatAccessGrantsForm(access_grants=[], share_mode=None), user, db
+                )
+            for chat_id in ('fixed', 'live'):
+                await ChatMessages.update_context_summary(chat_id, 'u1', 'THIRD')
+            async with makers['session']() as db:
+                seen['share taken again'] = await copied(
+                    await chats_router.clone_shared_chat_by_id(None, shares['fixed'], user, db)
+                )
+                seen['share fixed later'] = await copied(
+                    await chats_router.clone_shared_chat_by_id(None, shares['live'], user, db)
+                )
+                everything = await chats_router.get_all_user_chats_in_db(user, db)
+                seen['admin export'] = checkpoints(
+                    next(chat for chat in everything if chat.id == 'fixed').chat['history']['messages']
+                )
+                await Chats.toggle_chat_archive_by_id('fixed', db=db)
+                archived = await chats_router.get_user_archived_chats(user, db)
+                seen['archive export'] = checkpoints(archived[0].chat['history']['messages'])
+            return seen
+        finally:
+            await engine.dispose()
+
+    assert asyncio.run(run()) == {
+        'clone': ('FIRST', 'NESTED'),
+        'export': ('FIRST', 'NESTED'),
+        'fixed share': ('FIRST', 'NESTED'),
+        'live share': ('SECOND', 'NESTED'),
+        'share taken again': ('SECOND', 'NESTED'),
+        'share fixed later': ('SECOND', 'NESTED'),
+        'admin export': ('THIRD', 'NESTED'),
+        'archive export': ('THIRD', 'NESTED'),
+    }
+
+
 def test_fork_carries_embedded_context_usage_snapshots(tmp_path, monkeypatch):
     from contextlib import asynccontextmanager
 
