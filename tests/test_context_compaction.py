@@ -2996,6 +2996,65 @@ def test_request_start_summary_is_tracked_through_the_payload_path(monkeypatch, 
     assert summarized == [['old user', 'old answ']]
 
 
+@pytest.mark.parametrize('sent_with_summary', [False, True], ids=['measured-before-summary', 'measured-with-summary'])
+def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_current_summary(
+    monkeypatch, sent_with_summary
+):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    answer = {
+        'type': 'message',
+        'role': 'assistant',
+        'status': 'completed',
+        'content': [{'type': 'output_text', 'text': 'answer'}],
+    }
+    history = [
+        {'id': 'u0', 'role': 'user', 'content': 'old user details ' * 300},
+        {'id': 'a0', 'role': 'assistant', 'content': 'old answer details ' * 300},
+        {'id': 'u1', 'role': 'user', 'content': 'question', 'contextSummary': 'summary'},
+        {
+            'id': 'a1',
+            'role': 'assistant',
+            'content': 'answer',
+            'output': [*([_adoption_item('summary')] if sent_with_summary else []), answer],
+            'usage': {'prompt_tokens': 2_000, 'completion_tokens': 5},
+        },
+        {'id': 'u2', 'role': 'user', 'content': 'next question'},
+    ]
+    summarized = []
+
+    async def load_config():
+        return _compaction_config(token_threshold=3_000, token_cap=3_000, soft_trigger_ratio=0.5)
+
+    async def generate_summary(*_args, **_kwargs):
+        summarized.append(True)
+        return 'next summary'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history)
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+
+    async def run():
+        _send, _metadata, _events, state = await _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u2'},
+            assistant_message_id=None,
+        )
+        if state.get('prefetch_task') is not None:
+            await state['prefetch_task']
+
+    asyncio.run(run())
+
+    assert summarized == ([True] if sent_with_summary else [])
+
+
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     chat_module = importlib.import_module('open_webui.utils.chat')

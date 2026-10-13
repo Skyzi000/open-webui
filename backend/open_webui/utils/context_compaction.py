@@ -860,7 +860,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         input_tokens = _strict_usage_input_tokens(usage)
         if input_tokens is not None:
             # merge_usage keeps one prompt size per reply, so a reply with tool rounds cannot say which call it measured.
-            if not any(
+            # A reply requested under another summary measured messages this request no longer sends as they were.
+            recorded = latest_branch_adoption_summary(active_messages[: index + 1])
+            if (recorded.strip() if isinstance(recorded, str) else None) == previous_summary and not any(
                 isinstance(item, dict) and item.get('type') == 'function_call_output'
                 for item in message.get('output') or []
             ):
