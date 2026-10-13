@@ -7143,6 +7143,89 @@ def test_tool_loop_background_summary_starts_on_round_two_and_shows_once_adopted
     assert any(_adoption_shape(output) == applied for output in shown)
 
 
+@pytest.mark.parametrize('over_threshold', [False, True])
+def test_tool_loop_keeps_replying_when_a_prepared_summary_cannot_be_saved_below_the_threshold(
+    monkeypatch, over_threshold
+):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    summary = {'started': False, 'finished': False}
+    rounds = []
+    checkpoint_saves = []
+    gate = {}
+
+    async def generate_summary(*_args, **_kwargs):
+        summary['started'] = True
+        await gate['release'].wait()
+        summary['finished'] = True
+        return 'S1'
+
+    send_to_model = middleware.generate_chat_completion
+    save_reply = middleware.Chats.upsert_message_to_chat_by_id_and_message_id
+
+    async def generate(request, candidate, user, **kwargs):
+        await asyncio.sleep(0)
+        rounds.append(_contents(candidate['messages']))
+        if summary['started'] and not summary['finished']:
+            gate['release'].set()
+            await ctx['compaction_state']['background_summary']['task']
+        return await send_to_model(request, candidate, user, **kwargs)
+
+    async def save(chat_id, message_id, update, **kwargs):
+        if kwargs.get('touch') is False:
+            checkpoint_saves.append(True)
+            if len(checkpoint_saves) == 1:
+                return None
+        return await save_reply(chat_id, message_id, update, **kwargs)
+
+    def estimate(body, **_kwargs):
+        if 'SUMMARY' in _contents(body['messages']):
+            return 20
+        return 120 if over_threshold and summary['finished'] else 60
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(middleware, 'generate_chat_completion', generate)
+    monkeypatch.setattr(middleware.Chats, 'upsert_message_to_chat_by_id_and_message_id', save)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    monkeypatch.setattr(compaction.Chats, 'edit_message_output', _stored_reply({'output': []}))
+    current['replies'] = [
+        current['tool_response']('call-b', 'fetch_url'),
+        current['tool_response']('call-c', 'fetch_url'),
+        current['text_response']('done'),
+    ]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['compaction_state']['config']['soft_trigger_ratio'] = 0.5
+    ctx['event_emitter'] = current['emitter']
+
+    async def run():
+        gate['release'] = asyncio.Event()
+        await middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx)
+
+    asyncio.run(run())
+
+    errors = [
+        event['data']['error']['content'] for event in current['emitted'] if event['type'] == 'chat:message:error'
+    ]
+    if over_threshold:
+        assert rounds == [['start', '', 'result-a']]
+        assert len(errors) == 1 and 'could not be saved' in errors[0]
+        return
+    assert rounds == [
+        ['start', '', 'result-a'],
+        ['start', '', 'result-a', '', 'result-b'],
+        ['SUMMARY', '', 'result-a', '', 'result-b', '', 'result-b'],
+    ]
+    assert errors == []
+    assert current['saved'][-1]['output'][-1]['type'] == 'message'
+
+
 def test_completion_save_carries_snapshot_without_provider_leak(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])

@@ -1530,6 +1530,10 @@ async def compact_transient_provider_payload(
                 record, body, metadata, state, config, checkpoint_output, projected_body['messages']
             )
         except Exception:
+            if before <= threshold:
+                log.exception('Context compaction checkpoint prepared in the background could not be adopted')
+                state['background_summary'] = record
+                return body
             await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
             raise
         if adopted is not None:
