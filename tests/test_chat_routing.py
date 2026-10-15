@@ -404,6 +404,43 @@ def test_fallback_primary_uses_custom_capabilities_for_include_usage(monkeypatch
     assert primary['params']['compact_token_threshold'] == 12345
 
 
+@pytest.mark.parametrize(
+    'default_metadata, item_capabilities, expected',
+    [
+        ({}, {}, {'include_usage': True}),
+        ({'capabilities': {'usage': False}}, {}, None),
+        ({'capabilities': {'usage': False}}, {'usage': True}, {'include_usage': True}),
+    ],
+)
+def test_direct_connection_follows_the_global_usage_default(monkeypatch, default_metadata, item_capabilities, expected):
+    captured, request, user, _seen_keys = _install_provider_sink_harness(
+        monkeypatch, {}, config_values={'models.default_metadata': default_metadata}
+    )
+    sent = []
+
+    async def direct_sink(_request, form_data, user=None, models=None):
+        sent.append(form_data)
+        return {'status': True}
+
+    monkeypatch.setattr(chat, 'generate_direct_chat_completion', direct_sink)
+    request.app.state.MODELS = {'server-model': {'id': 'server-model', 'owned_by': 'openai', 'info': {}}}
+    model_item = {'id': 'direct-model', 'direct': True, 'owned_by': 'openai'}
+    if item_capabilities:
+        model_item['info'] = {'meta': {'capabilities': item_capabilities}}
+
+    _run_chat_completion(
+        request,
+        user,
+        _base_form_data(
+            'direct-model',
+            [{'model_id': 'direct-model', 'message_id': 'm1'}],
+            model_item=model_item,
+        ),
+    )
+
+    assert sent[0].get('stream_options') == expected
+
+
 def test_inlet_reroute_resolves_final_model_system(monkeypatch):
     models_map = {
         'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},

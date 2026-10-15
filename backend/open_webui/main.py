@@ -1137,6 +1137,14 @@ async def _set_direct_model(request: Request, model_item: dict, user) -> None:
         from open_webui.utils.access_control.files import get_accessible_folder_files
 
         model_meta['knowledge'] = await get_accessible_folder_files(knowledge_items, user)
+    # Direct connections bypass the server model list, where the global default capabilities are applied.
+    capabilities = model_meta.get('capabilities') or {}
+    default_capabilities = ((await Config.get('models.default_metadata')) or {}).get('capabilities') or {}
+    if 'usage' not in capabilities and 'usage' in default_capabilities:
+        model_item['info'] = {
+            **(model_item.get('info') or {}),
+            'meta': {**model_meta, 'capabilities': {**capabilities, 'usage': default_capabilities['usage']}},
+        }
     request.state.direct = True
     request.state.model = model_item
 
