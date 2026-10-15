@@ -306,7 +306,12 @@ def test_stream_options_rebuilt_per_column(monkeypatch):
             'owned_by': 'openai',
             'info': {'meta': {'capabilities': {'usage': True}}},
         },
-        'sibling-model': {'id': 'sibling-model', 'owned_by': 'openai', 'info': {}},
+        'sibling-model': {
+            'id': 'sibling-model',
+            'owned_by': 'openai',
+            'info': {'meta': {'capabilities': {'usage': False}}},
+        },
+        'unset-sibling': {'id': 'unset-sibling', 'owned_by': 'openai', 'info': {}},
         'capable-sibling': {
             'id': 'capable-sibling',
             'owned_by': 'openai',
@@ -316,6 +321,7 @@ def test_stream_options_rebuilt_per_column(monkeypatch):
     model_infos = {
         'primary-model': _EntryModelInfo({'stream_response': True}),
         'sibling-model': _EntryModelInfo({'stream_response': True}),
+        'unset-sibling': _EntryModelInfo({'stream_response': True}),
         'capable-sibling': _EntryModelInfo({'stream_response': True}),
     }
     captured, request, user, seen_keys = _install_provider_sink_harness(monkeypatch, model_infos)
@@ -331,12 +337,14 @@ def test_stream_options_rebuilt_per_column(monkeypatch):
                 {'model_id': 'primary-model', 'message_id': 'm1'},
                 {'model_id': 'sibling-model', 'message_id': 'm2'},
                 {'model_id': 'capable-sibling', 'message_id': 'm3'},
+                {'model_id': 'unset-sibling', 'message_id': 'm4'},
             ],
             stream_options=original_options,
         ),
     )
 
     assert captured['m2']['stream_options'] == {'custom': 1}
+    assert captured['m4']['stream_options'] == {'custom': 1, 'include_usage': True}
     assert captured['m3']['stream_options'] == {'custom': 1, 'include_usage': True}
     assert captured['m1']['stream_options'] == {'custom': 1, 'include_usage': True}
     # Every column gets its own copy — including one distinct from the

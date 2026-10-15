@@ -2913,7 +2913,7 @@ async def process_chat_payload(
             capability_usage = (((model.get('info') or {}).get('meta') or {}).get('capabilities') or {}).get('usage')
         if not form_data.get('stream'):
             form_data.pop('stream_options', None)
-        elif capability_usage:
+        elif capability_usage is not False:
             form_data['stream_options'] = {**(form_data.get('stream_options') or {}), 'include_usage': True}
 
     # Keep the template before apply_params_to_form_data consumes the model parameters.

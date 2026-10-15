@@ -1253,7 +1253,7 @@ async def chat_completion(
             form_data['stream'] = model_info_params.get('stream_response')
 
         # Providers only report token counts when asked, so ask on every caller's behalf.
-        if form_data.get('stream') and model_capabilities.get('usage'):
+        if form_data.get('stream') and model_capabilities.get('usage') is not False:
             form_data['stream_options'] = {**(form_data.get('stream_options') or {}), 'include_usage': True}
 
         if model_info_params.get('stream_delta_chunk_size'):

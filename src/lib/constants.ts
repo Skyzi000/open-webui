@@ -123,7 +123,7 @@ export const DEFAULT_CAPABILITIES = {
 	terminal: true,
 	citations: true,
 	status_updates: true,
-	usage: undefined,
+	usage: true,
 	memory: true,
 	builtin_tools: true
 };
