@@ -3187,8 +3187,11 @@ def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch
 
     assert len(summary_requests) == 1
     assert 'FILE BODY' not in summary_requests[0]
+    assert 'Do not discard earlier checkpoint information merely because it is summarized.' in summary_requests[0]
     assert retrieved == [[('f1', None)]]
     assert 'FILE BODY' in send['messages'][-1]['content']
+    assert '...[middle omitted]...' in send['messages'][0]['content']
+    assert 'max_bytes_per_message="512"' in send['messages'][0]['content']
 
 
 def _tool_loop_rounds(count):

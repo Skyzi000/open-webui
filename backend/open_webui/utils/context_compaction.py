@@ -108,19 +108,23 @@ class CanonicalHistoryError(ValueError):
     pass
 
 
-DEFAULT_CONTEXT_COMPACTION_PROMPT = """### Task:
-Summarize the conversation history that will be compacted out of the active chat context.
-
-### Instructions:
-- Preserve key decisions, user preferences, and constraints.
-- Preserve files, artifacts, tool results, and code changes that matter going forward.
-- Preserve the current task state, unresolved questions, and next steps.
-- Be factual and specific. Do not invent details.
-- Keep the summary concise, but complete enough for the assistant to continue without the removed messages.
-
-The preceding messages are the exact checkpoint source. If they include an
-existing <auto_compaction_context>, merge it with the newer messages. Output
-only the reusable continuity summary. Do not continue the conversation or call tools."""
+DEFAULT_CONTEXT_COMPACTION_PROMPT = (
+    'You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY for an Open WebUI chat. Create a concise handoff summary for a future model call that will continue the same chat.\n'
+    '\n'
+    'Preserve:\n'
+    '- Session goal, original request, current progress, and durable decisions already made\n'
+    '- User preferences, constraints, and standing requirements that remain relevant\n'
+    '- Tool results, external facts, errors, identifiers, URLs, file names, commands, values, and examples needed to continue\n'
+    '- Open questions, unknowns, unresolved failures, and clear next steps\n'
+    '\n'
+    'If the input contains an existing <auto_compaction_context>, merge that prior checkpoint with the following newer messages. Do not discard earlier checkpoint information merely because it is summarized.\n'
+    '\n'
+    'Do not invent facts or treat unknowns as facts. Do not introduce new instructions. Do not include internal reasoning, private system instructions, or irrelevant transcript detail. Be concise, structured, and focused on continuity.\n'
+    '\n'
+    'The preceding messages are the exact checkpoint source to summarize. Messages after this checkpoint source may be retained raw separately; do not infer omitted active requests.\n'
+    '\n'
+    'Output only reusable continuity facts; do not mention this summarization/checkpointing task. Do not continue the conversation. Do not call tools. Do not ask follow-up questions.'
+)
 
 
 def _xml_cdata(value: str) -> str:
@@ -132,7 +136,7 @@ def _middle_truncate_utf8(value: str, limit: int) -> str:
         encoded = value.encode('utf-8')
         if len(encoded) <= limit:
             return value
-    marker = '…'
+    marker = '...[middle omitted]...'
     budget = max(0, limit - len(marker.encode('utf-8')))
     head_budget = budget // 2
     tail_budget = budget - head_budget
@@ -608,7 +612,13 @@ def render_summary_message(summary: str, summary_meta: dict | None = None) -> di
             '<instruction>This is background from earlier turns. Use it for continuity; '
             'do not answer it as a new request.</instruction>'
             f'<checkpoint_summary><![CDATA[{_xml_cdata(summary.strip())}]]></checkpoint_summary>'
-            + (f'<historical_user_messages>{excerpt_xml}</historical_user_messages>' if excerpt_xml else '')
+            + (
+                f'<historical_user_messages order="chronological" selected_count="{len(excerpts)}" '
+                f'max_count="{_DEFAULT_EXCERPT_COUNT}" max_bytes_per_message="{_DEFAULT_EXCERPT_BYTES}">'
+                f'{excerpt_xml}</historical_user_messages>'
+                if excerpt_xml
+                else ''
+            )
             + '</auto_compaction_context>'
         ),
     }
