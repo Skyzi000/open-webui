@@ -2233,6 +2233,7 @@ def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path
 
     from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+    chats_model = importlib.import_module('open_webui.models.chats')
     chat_messages = importlib.import_module('open_webui.models.chat_messages')
 
     @asynccontextmanager
@@ -2257,9 +2258,11 @@ def test_normalized_checkpoint_survives_interleaved_chat_reconciliation(tmp_path
         pausing_session = async_sessionmaker(engine, class_=PausingSession, expire_on_commit=False)
         try:
             async with engine.begin() as connection:
+                await connection.run_sync(chats_model.Chat.__table__.create)
                 await connection.run_sync(chat_messages.ChatMessage.__table__.create)
 
             async with normal_session() as db:
+                db.add(chats_model.Chat(id='chat', user_id='user', title='chat', chat={}))
                 await chat_messages.ChatMessages.upsert_message(
                     'message',
                     'chat',
