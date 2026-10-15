@@ -5860,6 +5860,78 @@ def test_stateful_two_round_continuation_keeps_reader(monkeypatch):
     assert catalog == entries_after_round1
 
 
+def test_stateful_continuation_returns_the_error_of_a_rejected_call(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+
+    def responses_round(response_id, calls):
+        payload = {
+            'type': 'response.completed',
+            'response': {
+                'id': response_id,
+                'output': [
+                    {
+                        'type': 'function_call',
+                        'id': f'fc-{call_id}',
+                        'call_id': call_id,
+                        'name': name,
+                        'arguments': arguments,
+                        'status': 'completed',
+                    }
+                    for call_id, name, arguments in calls
+                ],
+            },
+        }
+
+        async def chunks():
+            yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+            yield b'data: [DONE]\n\n'
+
+        return StreamingResponse(chunks(), media_type='text/event-stream')
+
+    async def call_tool(**_kwargs):
+        raise AssertionError('a rejected call must not run')
+
+    tools = _plain_tools(fetch_result='fetched')
+    tools['call_tool'] = {
+        'tool_id': 'builtin:call_tool',
+        'spec': {'name': 'call_tool', 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': call_tool,
+    }
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    monkeypatch.setattr(middleware, 'ENABLE_RESPONSES_API_STATEFUL', True)
+    current['replies'] = [responses_round('resp-final', [])]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(
+            responses_round(
+                'resp-1',
+                [
+                    ('call-ok', 'fetch_url', '{}'),
+                    ('call-bad', 'call_tool', '{"tool_name": "missing", "params": "{}"}'),
+                ],
+            ),
+            _stream_leg_ctx(metadata, compaction_enabled=False),
+        )
+    )
+
+    continuation = current['sent'][0]
+    assert continuation['previous_response_id'] == 'resp-1'
+    results = {
+        message['tool_call_id']: message['content']
+        for message in continuation['messages']
+        if message.get('role') == 'tool'
+    }
+    assert results['call-ok'] == 'fetched'
+    assert 'missing' in results['call-bad']
+
+
 def test_payload_apply_before_drain_executes_reader(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     refs = importlib.import_module('open_webui.utils.externalized_refs')

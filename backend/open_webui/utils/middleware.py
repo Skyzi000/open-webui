@@ -7074,9 +7074,9 @@ async def streaming_chat_response_handler(response, ctx):
                         send_basis = standalone_body
                         if stateful and not checkpoint_advanced:
                             call_ids = {
-                                tool_call['id']
-                                for tool_call in response_tool_calls
-                                if isinstance(tool_call.get('id'), str)
+                                item['call_id']
+                                for item in output
+                                if item.get('type') == 'function_call_output' and isinstance(item.get('call_id'), str)
                             }
                             send_basis = _stateful_continuation_body(
                                 standalone_body,
