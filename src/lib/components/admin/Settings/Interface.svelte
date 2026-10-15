@@ -48,7 +48,6 @@
 		ENABLE_CONTEXT_COMPACTION: false,
 		CONTEXT_COMPACTION_TOKEN_THRESHOLD: 180000,
 		CONTEXT_COMPACTION_TOKEN_CAP: 180000,
-		CONTEXT_COMPACTION_RETENTION_PERCENTAGE: 40,
 		CONTEXT_COMPACTION_PROMPT_TEMPLATE: '',
 		ENABLE_TOOL_PERMISSIONS: false,
 		ENABLE_TOOL_SEARCH: false,
@@ -364,20 +363,6 @@
 							step="0.01"
 							class={inputClass}
 							bind:value={chatConfig.CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO}
-						/>
-					</AdminSettingField>
-
-					<AdminSettingField
-						label={$i18n.t('settings.admin.interface.retainedMessages.label')}
-						description={$i18n.t('settings.admin.interface.retainedMessages.description')}
-					>
-						<input
-							type="number"
-							min="10"
-							max="50"
-							step="1"
-							class={inputClass}
-							bind:value={chatConfig.CONTEXT_COMPACTION_RETENTION_PERCENTAGE}
 						/>
 					</AdminSettingField>
 

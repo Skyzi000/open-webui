@@ -873,7 +873,6 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
     boundary = await asyncio.to_thread(
         find_safe_compaction_boundary,
         active_messages,
-        config['retention_percentage'],
         config['transient_patterns'],
     )
 
@@ -1118,11 +1117,8 @@ async def compact_provider_payload(
             latest = await asyncio.to_thread(
                 find_safe_compaction_boundary,
                 projected_working,
-                config['retention_percentage'],
                 config['transient_patterns'],
-                maximize=True,
             )
-        # This summary is adopted a turn later, so it folds every completed turn instead of keeping the retention share.
         if (
             latest
             and (checkpoint := _checkpoint_for_boundary(state, working, latest)) is not None
@@ -1164,12 +1160,7 @@ async def compact_provider_payload(
             state['prefetch_cut_message'] = cleaned[cut]
         return {**body, 'messages': cleaned}
 
-    largest = find_safe_compaction_boundary(
-        projected_working,
-        config['retention_percentage'],
-        config['transient_patterns'],
-        maximize=True,
-    )
+    largest = find_safe_compaction_boundary(projected_working, config['transient_patterns'])
     if not boundary:
         if not largest or _checkpoint_for_boundary(state, working, largest) is None:
             return {**body, 'messages': _without_boundary_marker(messages)}
@@ -1696,21 +1687,7 @@ async def compact_transient_provider_payload(
         await _emit_compaction_status(event_emitter, 'Context compacted', True)
         return candidate
 
-    boundary = find_safe_compaction_boundary(
-        projected_working,
-        config['retention_percentage'],
-        config['transient_patterns'],
-        allow_tool_rounds=True,
-    )
-    largest = find_safe_compaction_boundary(
-        projected_working,
-        config['retention_percentage'],
-        config['transient_patterns'],
-        maximize=True,
-        allow_tool_rounds=True,
-    )
-    if not boundary:
-        boundary = largest
+    boundary = find_safe_compaction_boundary(projected_working, config['transient_patterns'], allow_tool_rounds=True)
     if not boundary:
         latest_user = next(
             (
@@ -1728,13 +1705,9 @@ async def compact_transient_provider_payload(
                 'provider request was not sent'
             )
         return body
-    boundaries = [
-        candidate
-        for candidate in (boundary, *([largest] if largest > boundary else []))
-        if _has_new_compaction_content(projected_working[:candidate], state)
-    ]
-    if not boundaries:
+    if not _has_new_compaction_content(projected_working[:boundary], state):
         return body
+    boundaries = [boundary]
 
     event_emitter = None
     if metadata.get('chat_id') and metadata.get('message_id'):
@@ -2049,7 +2022,6 @@ async def _load_config() -> dict:
         'chat.context_compaction.enable',
         'chat.context_compaction.token_threshold',
         'chat.context_compaction.token_cap',
-        'chat.context_compaction.retention_percentage',
         'chat.context_compaction.prompt_template',
         'chat.context_compaction.soft_trigger_ratio',
         'chat.context_compaction.transient_message_patterns',
@@ -2062,7 +2034,6 @@ async def _load_config() -> dict:
         'enable': enabled,
         'token_threshold': token_threshold,
         'token_cap': _parse_positive_int(values.get('chat.context_compaction.token_cap')) or token_threshold,
-        'retention_percentage': _clamp_retention_percentage(values.get('chat.context_compaction.retention_percentage')),
         'prompt_template': values.get('chat.context_compaction.prompt_template', '') or '',
         'soft_trigger_ratio': _soft_trigger_ratio(values.get('chat.context_compaction.soft_trigger_ratio')),
         'externalized_refs_enable': values.get('chat.externalized_refs.enable') is True,
@@ -2097,14 +2068,6 @@ def _soft_trigger_ratio(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.5
     return parsed if math.isfinite(parsed) and 0 <= parsed < 1 else 0.5
-
-
-def _clamp_retention_percentage(value: Any) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        parsed = 40
-    return min(50, max(10, parsed))
 
 
 def _resolve_token_threshold(global_threshold: int, global_cap: int, metadata: dict) -> int:
@@ -2360,16 +2323,12 @@ def estimate_provider_tokens(body: dict) -> int:
 
 def find_safe_compaction_boundary(
     messages: list[dict],
-    retention_percentage: int = 40,
     transient_patterns: tuple[re.Pattern[str], ...] = (),
     *,
-    maximize: bool = False,
     allow_tool_rounds: bool = False,
 ) -> int:
-    """Return a user-turn boundary that keeps tool pairs intact; system messages never block a cut."""
-    retention_percentage = _clamp_retention_percentage(retention_percentage)
-    keep_count = max(2, len(messages) * retention_percentage // 100)
-    target = len(messages) - 1 if maximize else max(1, len(messages) - keep_count)
+    """Return the latest user-turn boundary that keeps tool pairs intact; system messages never block a cut."""
+    target = len(messages) - 1
     events = []
     right_requested: Counter[str] = Counter()
     right_completed: Counter[str] = Counter()

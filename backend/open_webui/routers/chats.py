@@ -9,7 +9,6 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from open_webui.config import (
     BYPASS_ADMIN_ACCESS_CONTROL,
-    CONTEXT_COMPACTION_RETENTION_PERCENTAGE,
     CONTEXT_COMPACTION_TOKEN_THRESHOLD,
     ENABLE_ADMIN_CHAT_ACCESS,
     ENABLE_ADMIN_EXPORT,
@@ -62,7 +61,6 @@ CHAT_CONFIG_KEYS = {
     'ENABLE_CONTEXT_COMPACTION': 'chat.context_compaction.enable',
     'CONTEXT_COMPACTION_TOKEN_THRESHOLD': 'chat.context_compaction.token_threshold',
     'CONTEXT_COMPACTION_TOKEN_CAP': 'chat.context_compaction.token_cap',
-    'CONTEXT_COMPACTION_RETENTION_PERCENTAGE': 'chat.context_compaction.retention_percentage',
     'CONTEXT_COMPACTION_PROMPT_TEMPLATE': 'chat.context_compaction.prompt_template',
     'ENABLE_TOOL_PERMISSIONS': 'chat.tool_permissions.enable',
     'ENABLE_TOOL_SEARCH': 'chat.tool_search.enable',
@@ -214,7 +212,6 @@ class ChatConfigForm(BaseModel):
     ENABLE_CONTEXT_COMPACTION: bool
     CONTEXT_COMPACTION_TOKEN_THRESHOLD: int | None = None
     CONTEXT_COMPACTION_TOKEN_CAP: int | None = None
-    CONTEXT_COMPACTION_RETENTION_PERCENTAGE: int | None = None
     CONTEXT_COMPACTION_PROMPT_TEMPLATE: str
     ENABLE_TOOL_PERMISSIONS: bool = False
     ENABLE_TOOL_SEARCH: bool = False
@@ -296,8 +293,6 @@ async def get_chat_config_values() -> dict:
         config['CONTEXT_COMPACTION_MODEL'] = ''
     if config.get('CONTEXT_COMPACTION_TOKEN_CAP') is None:
         config['CONTEXT_COMPACTION_TOKEN_CAP'] = config.get('CONTEXT_COMPACTION_TOKEN_THRESHOLD', 180000)
-    if config.get('CONTEXT_COMPACTION_RETENTION_PERCENTAGE') is None:
-        config['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] = 40
     if config.get('CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO') is None:
         config['CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO'] = 0.5
     if config.get('CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS') is None:
@@ -943,10 +938,6 @@ async def set_chat_config(form_data: ChatConfigForm, user=Depends(get_admin_user
         threshold = CONTEXT_COMPACTION_TOKEN_THRESHOLD
     threshold = max(1, int(threshold))
     token_cap = max(1, int(form_data.CONTEXT_COMPACTION_TOKEN_CAP or threshold))
-    retention_percentage = form_data.CONTEXT_COMPACTION_RETENTION_PERCENTAGE
-    if retention_percentage is None:
-        retention_percentage = CONTEXT_COMPACTION_RETENTION_PERCENTAGE
-    retention_percentage = min(50, max(10, int(retention_percentage)))
     tool_search_defer_threshold = max(0, int(form_data.TOOL_SEARCH_DEFER_THRESHOLD))
     tool_search_always_loaded = [item.strip() for item in form_data.TOOL_SEARCH_ALWAYS_LOADED if item.strip()]
     await Config.upsert(
@@ -956,7 +947,6 @@ async def set_chat_config(form_data: ChatConfigForm, user=Depends(get_admin_user
                 'CONTEXT_COMPACTION_MODEL': form_data.CONTEXT_COMPACTION_MODEL or '',
                 'CONTEXT_COMPACTION_TOKEN_THRESHOLD': threshold,
                 'CONTEXT_COMPACTION_TOKEN_CAP': token_cap,
-                'CONTEXT_COMPACTION_RETENTION_PERCENTAGE': retention_percentage,
                 'TOOL_SEARCH_DEFER_THRESHOLD': tool_search_defer_threshold,
                 'TOOL_SEARCH_ALWAYS_LOADED': tool_search_always_loaded,
             }

@@ -572,8 +572,8 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
     preserved, without_system = compaction._split_leading_system_messages([*systems, *working])
     boundary = compaction.find_safe_compaction_boundary(without_system)
     assert preserved == systems
-    assert boundary == 4
-    assert without_system[boundary]['content'] == 'old two'
+    assert boundary == 8
+    assert without_system[boundary]['content'] == 'current'
 
     crossing_round = [
         {'role': 'user', 'content': 'first'},
@@ -584,8 +584,9 @@ def test_safe_boundary_preserves_system_messages_and_complete_tool_rounds():
         {'role': 'user', 'content': 'current'},
         {'role': 'assistant', 'content': 'current answer'},
     ]
-    assert compaction.find_safe_compaction_boundary(NoSlices(crossing_round), 50) == 0
-    assert compaction.find_safe_compaction_boundary(working[:2] + working[4:], 50) == 0
+    assert compaction.find_safe_compaction_boundary(NoSlices(crossing_round[:5])) == 0
+    assert compaction.find_safe_compaction_boundary(NoSlices(crossing_round)) == 5
+    assert compaction.find_safe_compaction_boundary(working[:2] + working[4:]) == 0
 
 
 def test_tool_round_boundary_skips_system_between_rounds():
@@ -600,7 +601,7 @@ def test_tool_round_boundary_skips_system_between_rounds():
         {'role': 'tool', 'tool_call_id': 'b', 'content': 'b result'},
     ]
 
-    assert compaction.find_safe_compaction_boundary(messages, maximize=True, allow_tool_rounds=True) == 6
+    assert compaction.find_safe_compaction_boundary(messages, allow_tool_rounds=True) == 6
 
 
 def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
@@ -639,7 +640,7 @@ def test_current_branch_uses_its_nearest_checkpoint(monkeypatch):
     fork = compaction.get_message_list(messages_map, 'b1')
 
     async def load_config():
-        return {'enable': True, 'retention_percentage': 40, 'transient_patterns': ()}
+        return {'enable': True, 'transient_patterns': ()}
 
     async def prepare(messages):
         prepared, state = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
@@ -697,7 +698,6 @@ def test_checkpoint_source_is_isolated_from_image_payload_mutation(monkeypatch):
     async def load_config():
         return {
             'enable': True,
-            'retention_percentage': 40,
             'transient_patterns': (),
         }
 
@@ -2337,7 +2337,6 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
     async def load_config():
         return {
             'enable': True,
-            'retention_percentage': 40,
             'transient_patterns': (),
         }
 
@@ -2383,7 +2382,7 @@ def test_checkpoint_preparation_copies_only_the_active_suffix(monkeypatch):
     real_deepcopy = copy.deepcopy
 
     async def load_config():
-        return {'enable': True, 'retention_percentage': 40, 'transient_patterns': ()}
+        return {'enable': True, 'transient_patterns': ()}
 
     def deepcopy(value, memo=None):
         copied.append(value)
@@ -2898,7 +2897,6 @@ def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0.5,
             'transient_patterns': (),
@@ -3077,6 +3075,50 @@ def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_curre
     asyncio.run(run())
 
     assert summarized == ([True] if measured_with_summary else [])
+
+
+def test_compaction_before_a_request_folds_every_completed_turn(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    history = [
+        {'id': 'u0', 'role': 'user', 'content': 'old user details ' * 300},
+        {'id': 'a0', 'role': 'assistant', 'content': 'old answer details ' * 300},
+        {'id': 'u1', 'role': 'user', 'content': 'q1'},
+        {'id': 'a1', 'role': 'assistant', 'content': 'a1'},
+        {'id': 'u2', 'role': 'user', 'content': 'q2'},
+        {'id': 'a2', 'role': 'assistant', 'content': 'a2'},
+        {'id': 'u3', 'role': 'user', 'content': 'q3'},
+    ]
+    summarized = []
+
+    async def load_config():
+        return _compaction_config(token_threshold=1_000, token_cap=1_000, soft_trigger_ratio=0)
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted_messages, *_args, **_kwargs):
+        summarized.append([message['content'][:8] for message in compacted_messages])
+        return 'summary'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history)
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3'},
+            assistant_message_id=None,
+        )
+    )
+
+    assert summarized == [['old user', 'old answ', 'q1', 'a1', 'q2', 'a2']]
+    assert [message['content'] for message in send['messages'][1:]] == ['q3']
 
 
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
@@ -3411,7 +3453,6 @@ def _compaction_config(**overrides):
         'enable': True,
         'token_threshold': 100,
         'token_cap': 100,
-        'retention_percentage': 40,
         'prompt_template': '',
         'soft_trigger_ratio': 0,
         'transient_patterns': (),
@@ -3535,9 +3576,9 @@ def test_transient_sends_largest_compaction_when_estimate_stays_over_threshold(m
         )
     )
 
-    assert compacted_ranges == [['q1', 'a1'], ['q1', 'a1', 'q2', 'a2']]
+    assert compacted_ranges == [['q1', 'a1', 'q2', 'a2']]
     assert _summary_content_of(compacted['messages']) is state['summary_message_content']
-    assert 'SUMMARY-2' in state['summary_message_content']
+    assert 'SUMMARY-1' in state['summary_message_content']
     assert compacted['messages'][1:] == [{'role': 'user', 'content': 'q3'}]
     assert state['pending_context_usage']['tokens'] == 120
 
@@ -3961,7 +4002,6 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
                     'enable': enabled,
                     'token_threshold': 100,
                     'token_cap': 100,
-                    'retention_percentage': 40,
                     'prompt_template': '',
                     'soft_trigger_ratio': 0,
                     'transient_patterns': (),
@@ -4865,7 +4905,6 @@ def test_projected_view_prevents_false_context_limit(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 10_000,
-            'retention_percentage': 40,
             'prompt_template': '',
             'transient_patterns': (),
             'soft_trigger_ratio': 0,
@@ -5241,7 +5280,6 @@ def _stream_leg_ctx(metadata, *, compaction_enabled, refs=None, estimate=None):
             'enable': compaction_enabled,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -7027,7 +7065,6 @@ def _adoption_stream_ctx(tools, metadata, state=None):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -7393,7 +7430,6 @@ def test_streamed_usage_replaces_snapshot_tokens_per_response(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0.5,
             'transient_patterns': (),
@@ -7888,7 +7924,6 @@ def test_first_send_dedupes_against_branch_and_continues_existing_output(monkeyp
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -7984,7 +8019,6 @@ def test_continuation_dedupes_against_branch_adoption_record(monkeypatch):
             'enable': True,
             'token_threshold': 1000,
             'token_cap': 1000,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8053,7 +8087,6 @@ def test_content_only_continuation_places_adoption_after_previous_text(monkeypat
             'enable': True,
             'token_threshold': 1000,
             'token_cap': 1000,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8181,7 +8214,6 @@ def test_approval_pause_records_no_continuation_adoption(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8235,7 +8267,6 @@ def test_cancelled_stream_keeps_adoption_record(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8642,7 +8673,6 @@ def test_same_response_usage_stays_latest_single_response(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0.5,
             'transient_patterns': (),
@@ -8722,7 +8752,6 @@ def test_responses_api_usage_stays_latest_single_response(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8766,7 +8795,6 @@ def test_next_round_usage_does_not_accumulate(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),
@@ -8837,7 +8865,6 @@ def _stream_store_harness(monkeypatch):
             'enable': True,
             'token_threshold': 100,
             'token_cap': 100,
-            'retention_percentage': 40,
             'prompt_template': '',
             'soft_trigger_ratio': 0,
             'transient_patterns': (),

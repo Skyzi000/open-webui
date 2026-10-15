@@ -43,7 +43,7 @@ def test_chat_config_additional_field_defaults():
     data = response.json()
     assert data['CONTEXT_COMPACTION_MODEL'] == ''
     assert data['CONTEXT_COMPACTION_TOKEN_CAP'] is None
-    assert data['CONTEXT_COMPACTION_RETENTION_PERCENTAGE'] is None
+    assert 'CONTEXT_COMPACTION_RETENTION_PERCENTAGE' not in data
     assert data['ENABLE_TOOL_PERMISSIONS'] is False
     assert data['CONTEXT_COMPACTION_SOFT_TRIGGER_RATIO'] == 0.5
     assert data['CONTEXT_COMPACTION_TRANSIENT_MESSAGE_PATTERNS'] == ''
