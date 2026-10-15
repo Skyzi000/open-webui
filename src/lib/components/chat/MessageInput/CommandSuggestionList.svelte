@@ -21,6 +21,7 @@
 	export let onStatus: () => void = () => {};
 	export let onFork: () => void = () => {};
 	export let onModel: () => void = () => {};
+	export let onCompare: (() => void) | null = null;
 	export let onSettings: () => void = () => {};
 	export let onTemporary: () => void = () => {};
 	export let onCreateSkill: () => void = () => {};
@@ -104,6 +105,7 @@
 				<SlashCommands
 					bind:this={suggestionElement}
 					{query}
+					canCompare={onCompare !== null}
 					bind:filteredItems
 					canCompact={compactAvailable}
 					compactDisabled={isCompactDisabled}
@@ -137,6 +139,9 @@
 						} else if (type === 'command' && data.id === 'model') {
 							command({ id: data.id, label: data.id });
 							onModel();
+						} else if (type === 'command' && data.id === 'compare') {
+							command({ id: data.id, label: data.id });
+							onCompare?.();
 						} else if (type === 'command' && data.id === 'settings') {
 							command({ id: data.id, label: data.id });
 							onSettings();
