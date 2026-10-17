@@ -3121,6 +3121,119 @@ def test_compaction_before_a_request_folds_every_completed_turn(monkeypatch):
     assert [message['content'] for message in send['messages'][1:]] == ['q3']
 
 
+def test_summary_excerpts_keep_every_text_part_and_mark_images(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    history = [
+        {
+            'id': 'u0',
+            'role': 'user',
+            'content': [{'type': 'text', 'text': 'build the report'}, {'type': 'text', 'text': 'MUST include a chart'}],
+            'files': [{'type': 'image', 'url': '/api/v1/files/picture/content'}],
+        },
+        {'id': 'a0', 'role': 'assistant', 'content': 'old answer details ' * 300},
+        {'id': 'u1', 'role': 'user', 'content': 'q1'},
+    ]
+
+    async def load_config():
+        return _compaction_config(token_threshold=100, token_cap=100, soft_trigger_ratio=0)
+
+    async def generate_summary(*_args, **_kwargs):
+        return 'summary'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history)
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+        )
+    )
+
+    summary_message = send['messages'][0]['content']
+    assert 'build the report\nMUST include a chart' in summary_message
+    assert '<has_multimodal>true</has_multimodal>' in summary_message
+
+
+def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    socket_main = importlib.import_module('open_webui.socket.main')
+
+    def message(message_id, parent_id, role, content, **extra):
+        return {'id': message_id, 'parentId': parent_id, 'role': role, 'content': content, **extra}
+
+    messages_map = {
+        'u0': message(
+            'u0',
+            None,
+            'user',
+            [{'type': 'text', 'text': 'start'}, {'type': 'text', 'text': 'MUST include a chart'}],
+            files=[{'type': 'image', 'url': '/api/v1/files/picture/content'}],
+        ),
+        'a0': message('a0', 'u0', 'assistant', 'a0'),
+        'u1': message('u1', 'a0', 'user', 'q1', contextSummary='OLD'),
+        'a1': message('a1', 'u1', 'assistant', 'a1'),
+        'u2': message('u2', 'a1', 'user', 'q2'),
+        'a2': message('a2', 'u2', 'assistant', 'a2'),
+    }
+    previous_metas = []
+
+    async def generate_summary(*_args, **kwargs):
+        previous_metas.append(kwargs.get('previous_summary_meta'))
+        return 'NEW'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def emitter(*_args, **_kwargs):
+        return noop
+
+    async def get_messages(_chat_id):
+        return messages_map
+
+    async def replay(messages, _state):
+        return messages
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', emitter)
+    monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
+    state = {'config': _compaction_config(token_threshold=1_000, token_cap=1_000, soft_trigger_ratio=0.5)}
+
+    async def run():
+        await middleware.background_tasks_handler(
+            {
+                'request': SimpleNamespace(),
+                'form_data': {'model': 'model'},
+                'user': SimpleNamespace(),
+                'metadata': {'chat_id': 'chat', 'message_id': 'a2'},
+                'tasks': {},
+                'event_emitter': noop,
+                'model': {'id': 'model'},
+                'compaction_state': state,
+                'completed_compaction': {'usage': {'prompt_tokens': 550, 'completion_tokens': 50, 'total_tokens': 600}},
+            }
+        )
+        await state['completed_prefetch_task']
+
+    asyncio.run(run())
+
+    assert previous_metas[0]['historical_user_messages'] == ['start\nMUST include a chart']
+    assert previous_metas[0]['has_multimodal'] is True
+
+
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     chat_module = importlib.import_module('open_webui.utils.chat')

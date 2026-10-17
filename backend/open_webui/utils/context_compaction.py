@@ -179,6 +179,48 @@ def get_last_persistent_user_message(
     return None
 
 
+def _message_text(message: dict) -> str:
+    content = message.get('content')
+    if isinstance(content, list):
+        return '\n'.join(
+            part['text']
+            for part in content
+            if isinstance(part, dict) and part.get('type') == 'text' and isinstance(part.get('text'), str)
+        )
+    return content if isinstance(content, str) else ''
+
+
+def _has_multimodal(messages: list[dict]) -> bool:
+    for message in messages:
+        if message.get('files'):
+            return True
+        content = message.get('content')
+        if isinstance(content, list) and any(
+            isinstance(part, dict) and part.get('type') not in (None, 'text') for part in content
+        ):
+            return True
+        for item in message.get('output') or []:
+            if isinstance(item, dict) and (
+                item.get('files')
+                or any(
+                    isinstance(part, dict) and part.get('type') == 'input_image' for part in item.get('output') or []
+                )
+            ):
+                return True
+    return False
+
+
+def _summary_meta(messages: list[dict], patterns: tuple[re.Pattern[str], ...] = ()) -> dict:
+    meta = {
+        'historical_user_messages': _historical_user_excerpts(
+            messages, _DEFAULT_EXCERPT_BYTES, _DEFAULT_EXCERPT_COUNT, patterns
+        )
+    }
+    if _has_multimodal(messages):
+        meta['has_multimodal'] = True
+    return meta
+
+
 def _historical_user_excerpts(
     messages: list[dict],
     byte_limit: int,
@@ -192,7 +234,7 @@ def _historical_user_excerpts(
         if (
             message.get('role') == 'user'
             and not _is_transient_message(message, patterns)
-            and (content := get_content_from_message(message))
+            and (content := _message_text(message))
         ):
             excerpts.append(_middle_truncate_utf8(content, byte_limit))
             if len(excerpts) == count:
@@ -613,6 +655,11 @@ def render_summary_message(summary: str, summary_meta: dict | None = None) -> di
             'do not answer it as a new request.</instruction>'
             f'<checkpoint_summary><![CDATA[{_xml_cdata(summary.strip())}]]></checkpoint_summary>'
             + (
+                '<metadata><has_multimodal>true</has_multimodal></metadata>'
+                if (summary_meta or {}).get('has_multimodal')
+                else ''
+            )
+            + (
                 f'<historical_user_messages order="chronological" selected_count="{len(excerpts)}" '
                 f'max_count="{_DEFAULT_EXCERPT_COUNT}" max_bytes_per_message="{_DEFAULT_EXCERPT_BYTES}">'
                 f'{excerpt_xml}</historical_user_messages>'
@@ -842,11 +889,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
             if summary_output_index is not None
             else (checkpoint_messages, summary_index)
         )
-        summary_meta['historical_user_messages'] = await asyncio.to_thread(
-            _historical_user_excerpts,
+        summary_meta = await asyncio.to_thread(
+            _summary_meta,
             _history_prefix_messages(checkpoint_messages, summary_index, summary_output_index),
-            _DEFAULT_EXCERPT_BYTES,
-            _DEFAULT_EXCERPT_COUNT,
             config['transient_patterns'],
         )
     if not config['enable'] or metadata.get('task') == 'context_compaction':
@@ -947,15 +992,7 @@ async def _generate_checkpoint(
     chat_id = metadata.get('chat_id')
     if not checkpoint_message_id or not is_saved_chat_id(chat_id):
         raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
-    summary_meta = {
-        'historical_user_messages': await asyncio.to_thread(
-            _historical_user_excerpts,
-            source_messages,
-            _DEFAULT_EXCERPT_BYTES,
-            _DEFAULT_EXCERPT_COUNT,
-            config['transient_patterns'],
-        )
-    }
+    summary_meta = await asyncio.to_thread(_summary_meta, source_messages, config['transient_patterns'])
     summary = await _generate_summary(
         request,
         user,
@@ -1341,15 +1378,9 @@ async def _nested_checkpoint_history(
     else:
         history[message_index] = {**history[message_index], 'output': output}
     position = (history, message_index, carrier_index)
-    summary_meta = {
-        'historical_user_messages': await asyncio.to_thread(
-            _historical_user_excerpts,
-            _history_prefix_messages(history, message_index, carrier_index),
-            _DEFAULT_EXCERPT_BYTES,
-            _DEFAULT_EXCERPT_COUNT,
-            transient_patterns,
-        )
-    }
+    summary_meta = await asyncio.to_thread(
+        _summary_meta, _history_prefix_messages(history, message_index, carrier_index), transient_patterns
+    )
     return history, position, summary_meta
 
 
@@ -1828,7 +1859,7 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         messages_map = history.get('messages') or {}
 
     branch_messages = get_message_list(messages_map, current_id)
-    _system, _checkpoint_messages, active_messages, _summary_index, _summary_output, previous_summary = (
+    _system, checkpoint_messages, active_messages, summary_index, summary_output, previous_summary = (
         _stored_checkpoint_view(branch_messages)
     )
     # Split the checkpoint-view active suffix in the saved-message space so the
@@ -1856,6 +1887,15 @@ async def compact_chat_branch(request, user, chat: Any, model_id: str, models: d
         previous_summary,
         config['prompt_template'],
         config['transient_patterns'],
+        previous_summary_meta=(
+            await asyncio.to_thread(
+                _summary_meta,
+                _history_prefix_messages(checkpoint_messages, summary_index, summary_output),
+                config['transient_patterns'],
+            )
+            if summary_index is not None
+            else {}
+        ),
         externalized_refs_enable=config.get('externalized_refs_enable', False),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
         message_id=current_id,
@@ -1909,7 +1949,7 @@ async def _completed_turn_checkpoint(
     models: dict,
     config: dict,
 ) -> str | None:
-    _, _, active, _, _, previous_summary = _stored_checkpoint_view(messages)
+    _, checkpoint_messages, active, summary_index, summary_output, previous_summary = _stored_checkpoint_view(messages)
     if not active or active[-1].get('id') != metadata['message_id']:
         return None
     compacted_source = active[:-1]
@@ -1945,7 +1985,15 @@ async def _completed_turn_checkpoint(
             previous_summary,
             config['prompt_template'],
             config['transient_patterns'],
-            previous_summary_meta={},
+            previous_summary_meta=(
+                await asyncio.to_thread(
+                    _summary_meta,
+                    _history_prefix_messages(checkpoint_messages, summary_index, summary_output),
+                    config['transient_patterns'],
+                )
+                if summary_index is not None
+                else {}
+            ),
             externalized_refs_enable=config.get('externalized_refs_enable', False),
             externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
             message_id=metadata['message_id'],
