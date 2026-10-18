@@ -95,6 +95,7 @@ from open_webui.utils.context_compaction import (
     _emit_context_usage,
     _messages_from_checkpoint,
     apply_response_usage_to_context_usage,
+    compact_planned_provider_payload,
     compact_provider_payload,
     compact_transient_provider_payload,
     context_compaction_adoption_record,
@@ -2273,6 +2274,19 @@ def _send_copy(body: dict) -> dict:
     }
 
 
+def _summary_prefix_shaper(request_filter):
+    async def shape(state: dict, body: dict) -> dict:
+        # A summary prefix is shaped like a send but never sent, so the reader and held summary it installs are undone.
+        snapshot = _snapshot_ref_apply_state(state)
+        try:
+            send = normalize_messages_for_model(await request_filter(await asyncio.to_thread(_send_copy, body)))
+            return await apply_externalized_refs(send, state)
+        finally:
+            _rollback_ref_apply_state(state, snapshot)
+
+    return shape
+
+
 def _commit_walk_held(canonical: dict, prev_held: str | None, state: dict) -> None:
     new_held = state.get('summary_message_content')
     if new_held is prev_held:
@@ -3444,10 +3458,14 @@ async def process_chat_payload(
     }
 
     cut_id = (compaction_state.get('prefetch_cut_message') or {}).get('id')
+    planned = compaction_state.get('planned_compaction') or []
+    planned_ids = {cut.get('id'): index for index, (cut, _) in enumerate(planned)}
     for message in form_data.get('messages', []):
-        # A pipeline filter returns rebuilt messages, so the background summary's cut is found again by id before ids go.
+        # A pipeline filter returns rebuilt messages, so the cuts chosen before assembly are found again by id before ids go.
         if cut_id is not None and message.get('id') == cut_id:
             compaction_state['prefetch_cut_message'] = message
+        if (index := planned_ids.get(message.get('id'))) is not None:
+            planned[index] = (message, planned[index][1])
         message.pop('id', None)
 
     # Check if file context extraction is enabled for this model (default True)
@@ -3542,6 +3560,22 @@ async def process_chat_payload(
         form_data['messages'].extend(pending_response_messages())
         await convert_url_images_to_base64(form_data, user=user)
 
+    async def request_filter(send: dict) -> dict:
+        if ENABLE_FUNCTIONS:
+            try:
+                send, _ = await process_filter_functions(
+                    request=request,
+                    filter_context=filter_context,
+                    filter_functions=filter_functions,
+                    filter_type='request',
+                    form_data=send,
+                    extra_params=extra_params,
+                )
+            except Exception as e:
+                raise Exception(f'{e}')
+        return send
+
+    compaction_state['summary_prefix'] = _summary_prefix_shaper(request_filter)
     canonical = normalize_messages_for_model(form_data)
     snapshot = await _capture_pre_filter_tool_refs(
         canonical,
@@ -3549,6 +3583,16 @@ async def process_chat_payload(
         compaction_state,
         payload_tools,
         native=(compaction_state.get('externalized_refs') or {}).get('native'),
+    )
+    canonical, snapshot = await compact_planned_provider_payload(
+        request,
+        user,
+        canonical,
+        metadata,
+        canonical.get('model'),
+        compaction_models,
+        compaction_state,
+        projected_messages=snapshot,
     )
     canonical = await _compact_final_provider_payload(
         request,
@@ -3560,21 +3604,7 @@ async def process_chat_payload(
         compaction_state,
         projected_messages=snapshot,
     )
-    send = _send_copy(canonical)
-    if ENABLE_FUNCTIONS:
-        try:
-            send, _ = await process_filter_functions(
-                request=request,
-                filter_context=filter_context,
-                filter_functions=filter_functions,
-                filter_type='request',
-                form_data=send,
-                extra_params=extra_params,
-            )
-        except Exception as e:
-            raise Exception(f'{e}')
-
-    send = normalize_messages_for_model(send)
+    send = normalize_messages_for_model(await request_filter(_send_copy(canonical)))
     prev_held = compaction_state.get('summary_message_content')
     send = await apply_externalized_refs(send, compaction_state)
     _commit_walk_held(canonical, prev_held, compaction_state)
@@ -4163,7 +4193,7 @@ async def background_tasks_handler(ctx):
         completed_models = (ctx.get('compaction_state') or {}).get('models') or {
             completed_model_id: ctx.get('model') or {}
         }
-        start_completed_turn_compaction_prefetch(
+        await start_completed_turn_compaction_prefetch(
             request,
             user,
             message_list,

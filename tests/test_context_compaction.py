@@ -94,7 +94,7 @@ def test_compact_functions_record_pending_candidate_only(monkeypatch):
     transient_state = {'config': _compaction_config(soft_trigger_ratio=0.5)}
 
     result = asyncio.run(
-        compaction.compact_provider_payload(
+        _compact_request_start(
             None,
             None,
             {'messages': [{'role': 'user', 'content': 'hello'}]},
@@ -161,7 +161,7 @@ def test_compact_provider_updates_pending_to_selected_candidate_after(monkeypatc
     }
 
     compacted = asyncio.run(
-        compaction.compact_provider_payload(
+        _compact_request_start(
             None,
             None,
             {'messages': history},
@@ -504,7 +504,7 @@ def test_tiktoken_failure_logs_once_and_uses_core_approximation(monkeypatch, cap
             assert compaction.estimate_text_tokens('hello') == compaction._estimate_tokens('hello')
 
             result = asyncio.run(
-                compaction.compact_provider_payload(
+                _compact_request_start(
                     None,
                     None,
                     body,
@@ -2343,7 +2343,7 @@ def test_compaction_cpu_work_is_dispatched_off_the_event_loop(monkeypatch):
     async def run():
         _, state = await compaction.prepare_compaction_messages(messages, {'chat_id': 'chat'})
         await compaction.resolve_request_history(state['selected_history'])
-        await compaction.compact_provider_payload(
+        await _compact_request_start(
             None,
             None,
             {'messages': [{'role': 'user', 'content': 'small'}]},
@@ -2906,7 +2906,7 @@ def test_soft_prefetch_is_reused_at_the_hard_threshold(monkeypatch):
     async def run():
         nonlocal before
         metadata = {'chat_id': 'chat'}
-        first = await compaction.compact_provider_payload(None, None, body, metadata, 'model', {}, state)
+        first = await _compact_request_start(None, None, body, metadata, 'model', {}, state)
         assert compaction._BOUNDARY_KEY not in first['messages'][2]
         await state['prefetch_task']
         before = 120
@@ -2953,7 +2953,7 @@ def test_background_summary_folds_every_completed_turn(monkeypatch):
     async def run():
         metadata = {'chat_id': 'chat'}
         prepared, state = await compaction.prepare_compaction_messages(history, metadata)
-        await compaction.compact_provider_payload(None, None, {'messages': prepared}, metadata, 'model', {}, state)
+        await _compact_request_start(None, None, {'messages': prepared}, metadata, 'model', {}, state)
         await state['prefetch_task']
 
     asyncio.run(run())
@@ -3426,6 +3426,613 @@ def test_a_chat_that_sent_refs_links_a_summary_made_without_the_reader(monkeypat
     assert refs.REF_EXEC_TOOL_NAME not in json.dumps(send['tools'])
 
 
+_PREFIX_HISTORY = [
+    {'id': 'u0', 'parentId': None, 'role': 'user', 'content': 'opening question'},
+    {'id': 'a0', 'parentId': 'u0', 'role': 'assistant', 'content': 'opening answer'},
+    {'id': 'u1', 'parentId': 'a0', 'role': 'user', 'content': 'first question ' * 150, 'contextSummary': 'OLD'},
+    {'id': 'a1', 'parentId': 'u1', 'role': 'assistant', 'content': 'first answer ' * 150},
+    {'id': 'u2', 'parentId': 'a1', 'role': 'user', 'content': 'second question ' * 150},
+    {'id': 'a2', 'parentId': 'u2', 'role': 'assistant', 'content': 'second answer ' * 150},
+    {'id': 'u3', 'parentId': 'a2', 'role': 'user', 'content': 'latest question'},
+]
+
+
+def _quiet_config(**overrides):
+    return _compaction_config(
+        **{
+            'token_threshold': 1_000_000,
+            'token_cap': 1_000_000,
+            'externalized_refs_enable': True,
+            'externalized_refs_token_threshold': 1000,
+            **overrides,
+        }
+    )
+
+
+def _shared_prefix_harness(monkeypatch, *, summary_replies=(), compaction_model=None, request_filter=None):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    socket_main = importlib.import_module('open_webui.socket.main')
+    current = {
+        'config': None,
+        'summaries': [],
+        'replies': list(summary_replies),
+        'hold': False,
+        'history': _PREFIX_HISTORY,
+    }
+    tool = {
+        'spec': {'name': 'lookup', 'description': 'find facts', 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': lambda: None,
+    }
+
+    async def load_config():
+        return current['config']
+
+    async def summarize(_request, form_data=None, user=None, **_kwargs):
+        current['summaries'].append(
+            copy.deepcopy({key: value for key, value in form_data.items() if key != 'metadata'})
+        )
+        if current['hold']:
+            await current['released'].wait()
+        if current['replies']:
+            return current['replies'].pop(0)
+        return {'choices': [{'message': {'content': 'summary'}, 'finish_reason': 'stop'}]}
+
+    async def get_many(*_keys):
+        return {'chat.context_compaction.model': compaction_model} if compaction_model else {}
+
+    async def passthrough(prompt, _user):
+        return prompt
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def emitter(*_args, **_kwargs):
+        return noop
+
+    async def get_tools(*_args, **_kwargs):
+        return {'lookup': tool}
+
+    async def load_history(_chat_id, _message_id):
+        return copy.deepcopy(current['history'])
+
+    async def mark_answers(body, __metadata__=None):
+        for message in body['messages']:
+            if message['role'] == 'assistant' and isinstance(message['content'], str):
+                message['content'] += '|F|'
+                message['cache_control'] = {'type': 'ephemeral'}
+        return body
+
+    async def system_prompt(*_args, **_kwargs):
+        return 'MODEL SYSTEM'
+
+    _payload_leg_patches(
+        monkeypatch, middleware, request_filter=request_filter or mark_answers, refs_runtime=(True, 1000)
+    )
+    _payload_leg_drain(monkeypatch, middleware, {'output': []})
+    monkeypatch.setattr(middleware, 'load_messages_from_db', load_history)
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+    monkeypatch.setattr(middleware, 'get_tools', get_tools)
+    monkeypatch.setattr(middleware, 'resolve_system_prompt', system_prompt)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(compaction, 'prompt_template', passthrough)
+    monkeypatch.setattr(chat_module, 'generate_chat_completion', summarize)
+    monkeypatch.setattr(socket_main, 'get_event_emitter', emitter)
+
+    async def send(config, **kwargs):
+        current['config'] = config
+        current['released'] = asyncio.Event()
+        sent, _metadata, _events, state = await _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            **kwargs,
+        )
+        current['released'].set()
+        if isinstance(state.get('prefetch_task'), asyncio.Task):
+            await state['prefetch_task']
+        return sent, state
+
+    current['send'] = send
+    return middleware, current
+
+
+def _provider_messages(messages):
+    return compaction.strip_compaction_marker_keys(messages)
+
+
+@pytest.mark.parametrize('background', [False, True])
+def test_summary_request_repeats_the_prefix_the_chat_sent(monkeypatch, background):
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    _middleware, current = _shared_prefix_harness(monkeypatch)
+    threshold = 100_000 if background else 600
+    compacting = _quiet_config(
+        soft_trigger_ratio=0.001 if background else 0, token_threshold=threshold, token_cap=threshold
+    )
+
+    async def run():
+        before, _state = await current['send'](_quiet_config())
+        current['hold'] = background
+        during, _state = await current['send'](compacting)
+        return before, during
+
+    before, during = asyncio.run(run())
+
+    assert len(current['summaries']) == 1
+    summary = current['summaries'][0]
+    sent = _provider_messages(before['messages'])
+    read = _provider_messages(summary['messages'])
+    assert summary['model'] == 'model'
+    assert summary['tools'] == before['tools']
+    assert [tool['function']['name'] for tool in summary['tools']] == ['lookup', refs.REF_EXEC_TOOL_NAME]
+    assert read[0] == {'role': 'system', 'content': 'MODEL SYSTEM'}
+    assert '<history_ref>history:' in read[1]['content']
+    assert read[3]['content'].endswith('|F|')
+    assert 3 < len(read) - 1 < len(sent)
+    assert read[:-1] == sent[: len(read) - 1]
+    assert read[-1]['content'].startswith('You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY')
+    if background:
+        # The summary is still running, and shaping its copy must leave the chat's own send as it was.
+        assert (during['messages'], during['tools']) == (before['messages'], before['tools'])
+
+
+@pytest.mark.parametrize('background', [False, True])
+def test_summary_repeats_the_previous_turn_when_the_filter_marks_the_last_question(monkeypatch, background):
+    async def mark_last_question(body, __metadata__=None):
+        last = max(index for index, message in enumerate(body['messages']) if message['role'] == 'user')
+        body['messages'][last]['content'] += ' [A]'
+        return body
+
+    _middleware, current = _shared_prefix_harness(monkeypatch, request_filter=mark_last_question)
+    threshold = 100_000 if background else 600
+    compacting = _quiet_config(
+        soft_trigger_ratio=0.001 if background else 0, token_threshold=threshold, token_cap=threshold
+    )
+
+    async def run():
+        current['history'] = _PREFIX_HISTORY[:5]
+        previous_turn, _state = await current['send'](_quiet_config())
+        current['history'] = _PREFIX_HISTORY
+        current['hold'] = background
+        await current['send'](compacting)
+        return previous_turn
+
+    previous_turn = asyncio.run(run())
+
+    assert len(current['summaries']) == 1
+    sent = _provider_messages(previous_turn['messages'])
+    read = _provider_messages(current['summaries'][0]['messages'])
+    assert sent[-1]['content'] == 'second question ' * 150 + ' [A]'
+    assert read[: len(sent)] == sent
+    assert read[len(sent)]['content'] == 'second answer ' * 150
+    assert read[len(sent) + 1 :] == [read[-1]]
+    assert read[-1]['content'].startswith('You are performing an AUTO-COMPACTION CHECKPOINT SUMMARY')
+
+
+def test_prefetch_is_skipped_when_a_pipeline_leaves_nothing_before_its_cut(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+
+    async def keep_latest_question(_request, form_data, _user, _models):
+        return {**form_data, 'messages': form_data['messages'][-1:]}
+
+    monkeypatch.setattr(middleware, 'process_pipeline_inlet_filter', keep_latest_question)
+    prefetching = _quiet_config(soft_trigger_ratio=0.001, token_threshold=100_000, token_cap=100_000)
+
+    sent, state = asyncio.run(current['send'](prefetching))
+
+    assert current['summaries'] == []
+    assert 'prefetch_task' not in state
+    assert _provider_messages(sent['messages']) == [
+        {'role': 'system', 'content': 'MODEL SYSTEM'},
+        {'role': 'user', 'content': 'latest question'},
+    ]
+
+
+def _turn_end_harness(monkeypatch, middleware, history=_PREFIX_HISTORY):
+    messages_map = {
+        **{message['id']: dict(message) for message in history},
+        'message': {
+            'id': 'message',
+            'parentId': history[-1]['id'],
+            'role': 'assistant',
+            'content': 'latest answer',
+            'model': 'model',
+        },
+    }
+
+    async def get_messages(_chat_id):
+        return copy.deepcopy(messages_map)
+
+    async def replay(messages, _state):
+        return messages
+
+    monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
+
+
+def _turn_end_ctx(state, emitter):
+    return {
+        'request': SimpleNamespace(state=SimpleNamespace(direct=False), scope={'type': 'http'}, receive=None),
+        'form_data': {'model': 'model'},
+        'user': SimpleNamespace(),
+        'metadata': {'chat_id': 'chat', 'message_id': 'message'},
+        'tasks': {},
+        'event_emitter': emitter,
+        'model': {'id': 'model'},
+        'compaction_state': state,
+        'completed_compaction': {'usage': {'prompt_tokens': 6000, 'completion_tokens': 50, 'total_tokens': 6050}},
+    }
+
+
+def test_turn_end_summary_repeats_the_first_send_of_the_turn(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    _turn_end_harness(monkeypatch, middleware)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
+
+    async def run():
+        sent, state = await current['send'](
+            _quiet_config(soft_trigger_ratio=0.5, token_threshold=10_000, token_cap=10_000)
+        )
+        assert current['summaries'] == []
+        await middleware.background_tasks_handler(_turn_end_ctx(state, noop))
+        await state['completed_prefetch_task']
+        return sent
+
+    sent = asyncio.run(run())
+
+    assert len(current['summaries']) == 1
+    summary = current['summaries'][0]
+    assert summary['tools'] == sent['tools']
+    assert _provider_messages(summary['messages'])[:-1] == _provider_messages(sent['messages'])
+
+
+def test_prefix_that_fails_to_shape_skips_the_request_start_prefetch(monkeypatch):
+    async def refuse_answered_tail(body, __metadata__=None):
+        if body['messages'][-1]['role'] == 'assistant':
+            raise RuntimeError('filter refused')
+        return body
+
+    _middleware, current = _shared_prefix_harness(monkeypatch, request_filter=refuse_answered_tail)
+    prefetching = _quiet_config(soft_trigger_ratio=0.001, token_threshold=100_000, token_cap=100_000)
+
+    sent, state = asyncio.run(current['send'](prefetching))
+
+    assert current['summaries'] == []
+    assert 'prefetch_task' not in state
+    assert _provider_messages(sent['messages'])[-1] == {'role': 'user', 'content': 'latest question'}
+
+
+def test_prefix_that_fails_to_shape_skips_the_turn_end_summary(monkeypatch):
+    refusing = {'on': False}
+
+    async def refuse_after_the_send(body, __metadata__=None):
+        if refusing['on']:
+            raise RuntimeError('filter refused')
+        return body
+
+    middleware, current = _shared_prefix_harness(monkeypatch, request_filter=refuse_after_the_send)
+    _turn_end_harness(monkeypatch, middleware)
+    reviewed = []
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def review(**kwargs):
+        reviewed.append(kwargs['metadata']['message_id'])
+
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', review)
+
+    async def run():
+        _sent, state = await current['send'](
+            _quiet_config(soft_trigger_ratio=0.5, token_threshold=10_000, token_cap=10_000)
+        )
+        refusing['on'] = True
+        await middleware.background_tasks_handler(_turn_end_ctx(state, noop))
+        return state
+
+    state = asyncio.run(run())
+
+    assert current['summaries'] == []
+    assert 'completed_prefetch_task' not in state
+    assert reviewed == ['message']
+
+
+def test_transcript_prompt_reads_tool_results_as_excerpts_at_turn_end(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    history = _history_with_a_large_tool_result()
+    history = [
+        {**message, 'parentId': history[index - 1]['id'] if index else None} for index, message in enumerate(history)
+    ]
+    current['history'] = history
+    _turn_end_harness(monkeypatch, middleware, history)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
+
+    async def run():
+        _sent, state = await current['send'](
+            _quiet_config(
+                soft_trigger_ratio=0.5,
+                token_threshold=10_000,
+                token_cap=10_000,
+                prompt_template='Summarize:\n{{MESSAGES}}',
+            )
+        )
+        await middleware.background_tasks_handler(_turn_end_ctx(state, noop))
+        await state['completed_prefetch_task']
+
+    asyncio.run(run())
+
+    assert len(current['summaries']) == 1
+    read = json.dumps(current['summaries'][0]['messages'])
+    assert 'alpha beta gamma' in read
+    assert 'MIDDLE-FACT-42' not in read
+
+
+def test_summary_made_at_send_time_repeats_the_prefix_too(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    rules = 'rule ' * 2000
+
+    async def system_prompt(*_args, **_kwargs):
+        return rules
+
+    monkeypatch.setattr(middleware, 'resolve_system_prompt', system_prompt)
+
+    async def run():
+        before, _state = await current['send'](_quiet_config())
+        # The model's system prompt only joins after assembly, so the request-start check stays under the threshold.
+        during, _state = await current['send'](_quiet_config(token_threshold=2500, token_cap=2500))
+        return before, during
+
+    before, during = asyncio.run(run())
+
+    read = _provider_messages(current['summaries'][0]['messages'])
+    assert current['summaries'][0]['tools'] == before['tools']
+    assert read[0] == {'role': 'system', 'content': rules}
+    assert read[:-1] == _provider_messages(before['messages'])[: len(read) - 1]
+    assert '<![CDATA[summary]]>' in during['messages'][1]['content']
+
+
+def test_summary_request_keeps_the_chat_parameters_but_not_its_output_limits(monkeypatch):
+    async def cache_key(body, __metadata__=None):
+        return {**body, 'prompt_cache_key': 'chat-1'}
+
+    _middleware, current = _shared_prefix_harness(monkeypatch, request_filter=cache_key)
+
+    async def get_many(*_keys):
+        return {'task.model.params': {'temperature': 0.1, 'max_tokens': 32}}
+
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    chat_parameters = {
+        'reasoning_effort': 'high',
+        'thinking': {'type': 'enabled', 'budget_tokens': 2048},
+        'max_tokens': 4096,
+        'stop': ['END'],
+        'response_format': {'type': 'json_object'},
+        'n': 2,
+        'text': {
+            'format': {'type': 'json_schema', 'name': 'verdict', 'schema': {'type': 'boolean'}},
+            'verbosity': 'low',
+        },
+        'stream_options': {'include_usage': True},
+        'options': {'temperature': 0.7, 'num_predict': 64, 'custom_params': {'format': 'json', 'top_k': 5}},
+    }
+    compacting = _quiet_config(soft_trigger_ratio=0, token_threshold=600, token_cap=600)
+
+    async def run():
+        before, _state = await current['send'](_quiet_config(), extra_form=chat_parameters)
+        await current['send'](compacting, extra_form=chat_parameters)
+        return before
+
+    before = asyncio.run(run())
+
+    summary = current['summaries'][0]
+    assert {key: before[key] for key in ('reasoning_effort', 'thinking', 'prompt_cache_key')} == {
+        'reasoning_effort': 'high',
+        'thinking': {'type': 'enabled', 'budget_tokens': 2048},
+        'prompt_cache_key': 'chat-1',
+    }
+    assert {key: summary.get(key) for key in ('reasoning_effort', 'thinking', 'prompt_cache_key')} == {
+        key: before[key] for key in ('reasoning_effort', 'thinking', 'prompt_cache_key')
+    }
+    assert summary['options'] == {'temperature': 0.7, 'custom_params': {'top_k': 5}}
+    assert summary['text'] == {'verbosity': 'low'}
+    assert summary['stream'] is False
+    for key in ('max_tokens', 'stop', 'response_format', 'n', 'stream_options', 'temperature'):
+        assert key not in summary
+
+
+def test_summary_that_calls_a_tool_is_asked_again_without_tools(monkeypatch):
+    tool_call = {
+        'choices': [
+            {
+                'message': {'tool_calls': [{'id': 'c', 'type': 'function', 'function': {'name': 'lookup'}}]},
+                'finish_reason': 'tool_calls',
+            }
+        ]
+    }
+    _middleware, current = _shared_prefix_harness(monkeypatch, summary_replies=[tool_call])
+    compacting = _quiet_config(token_threshold=600, token_cap=600)
+
+    sent, _state = asyncio.run(current['send'](compacting))
+
+    first, second = current['summaries']
+    assert 'tools' in first
+    assert not any(key in second for key in ('tools', 'tool_choice', 'functions', 'function_call'))
+    assert second['messages'] == first['messages']
+    assert '<![CDATA[summary]]>' in sent['messages'][1]['content']
+
+
+@pytest.mark.parametrize(
+    'chat, key, summarized',
+    [
+        ({'tool_choice': {'type': 'function', 'function': {'name': 'lookup'}}}, 'tool_choice', 'none'),
+        (
+            {'functions': [{'name': 'lookup', 'parameters': {}}], 'function_call': {'name': 'lookup'}},
+            'function_call',
+            'none',
+        ),
+        ({'function_call': {'name': 'lookup'}}, 'function_call', None),
+    ],
+)
+def test_forced_tool_choice_is_lifted_only_for_the_summary(monkeypatch, chat, key, summarized):
+    _middleware, current = _shared_prefix_harness(monkeypatch)
+    compacting = _quiet_config(token_threshold=600, token_cap=600)
+
+    sent, _state = asyncio.run(current['send'](compacting, extra_form=chat))
+
+    assert sent[key] == chat[key]
+    assert current['summaries'][0].get(key) == summarized
+    assert current['summaries'][0]['tools'] == sent['tools']
+    assert current['summaries'][0].get('functions') == sent.get('functions')
+
+
+def test_a_separate_summary_model_reads_the_messages_without_tools_or_system(monkeypatch):
+    _middleware, current = _shared_prefix_harness(monkeypatch, compaction_model='small')
+    compacting = _quiet_config(token_threshold=600, token_cap=600)
+    models = {'model': {'id': 'model'}, 'small': {'id': 'small'}}
+
+    async def run():
+        before, _state = await current['send'](_quiet_config(), models=models)
+        await current['send'](compacting, models=models)
+        return before
+
+    before = asyncio.run(run())
+
+    summary = current['summaries'][0]
+    read = summary['messages']
+    assert summary['model'] == 'small'
+    assert 'tools' not in summary
+    assert read[0]['role'] == 'user'
+    assert read[:-1] == compaction._summary_provider_messages(_provider_messages(before['messages'])[1 : len(read)])
+
+
+@pytest.mark.parametrize('background', [False, True])
+def test_tool_round_summary_reads_the_round_it_folds_as_sent(monkeypatch, background):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    prefixes = []
+
+    async def generate_summary(*_args, **kwargs):
+        prefixes.append(kwargs['prefix_body'])
+        return 'S1'
+
+    async def mark_last(body):
+        body['messages'][-1]['content'] += '|F|'
+        return body
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    spec = [{'type': 'function', 'function': tools['view_file']['spec']}]
+    ctx['form_data']['tools'] = spec
+    state = ctx['compaction_state']
+    state['summary_prefix'] = middleware._summary_prefix_shaper(mark_last)
+    ctx['event_emitter'] = current['emitter']
+    if background:
+        state['config']['soft_trigger_ratio'] = 0.5
+        monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body, **_kwargs: 60)
+        monkeypatch.setattr(compaction.Chats, 'edit_message_output', _stored_reply({'output': []}))
+
+    async def run():
+        await middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx)
+        for task in list(compaction._BACKGROUND_SUMMARIES):
+            await task
+
+    asyncio.run(run())
+
+    assert len(prefixes) == 1
+    assert prefixes[0]['messages'] == [{'role': 'user', 'content': 'start|F|'}]
+    assert prefixes[0]['tools'] == spec
+    assert ctx['form_data']['messages'] == [{'role': 'user', 'content': 'start'}]
+
+
+def test_prefix_that_fails_to_shape_skips_the_tool_round_prefetch(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    started = []
+
+    async def generate_summary(*_args, **kwargs):
+        started.append(kwargs['prefix_body'])
+        return 'S1'
+
+    async def refuse(_body):
+        raise RuntimeError('filter refused')
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', lambda _body, **_kwargs: 60)
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    state = ctx['compaction_state']
+    state['summary_prefix'] = middleware._summary_prefix_shaper(refuse)
+    state['config']['soft_trigger_ratio'] = 0.5
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    assert started == []
+    assert 'background_summary' not in state
+    assert len(current['sent']) == 1
+
+
+def test_tool_round_compaction_reports_a_prefix_that_fails_to_shape(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    socket_main = importlib.import_module('open_webui.socket.main')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+
+    async def refuse(_body):
+        raise RuntimeError('filter refused')
+
+    async def status_emitter(_metadata):
+        return current['emitter']
+
+    monkeypatch.setattr(socket_main, 'get_event_emitter', status_emitter)
+    current['replies'] = [current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['compaction_state']['summary_prefix'] = middleware._summary_prefix_shaper(refuse)
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    statuses = [
+        event['data']['description'] for event in current['emitted'] if event.get('type') == 'context_compaction'
+    ]
+    assert statuses == ['Compacting context', 'Context compaction failed']
+    assert current['sent'] == []
+
+
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     chat_module = importlib.import_module('open_webui.utils.chat')
@@ -3652,7 +4259,7 @@ def test_tool_loop_adopts_the_request_start_summary_once_it_is_ready(monkeypatch
         metadata = {'chat_id': 'chat', 'message_id': 'a2'}
         prepared, state = await compaction.prepare_compaction_messages(history, metadata)
         body = {'messages': prepared}
-        body = await compaction.compact_provider_payload(None, None, body, metadata, 'model', {}, state)
+        body = await _compact_request_start(None, None, body, metadata, 'model', {}, state)
         body = await compaction.compact_transient_provider_payload(None, None, body, metadata, 'model', {}, state)
         assert _contents(body['messages']) == ['user 1', 'assistant 1', 'user 2', *continued]
         gate['release'].set()
@@ -3715,7 +4322,7 @@ def test_tool_round_summary_finishing_after_the_turn_is_saved_for_the_next_reque
             checkpoint_message_start=3,
         )
         task = state['background_summary']['task']
-        repeated = compaction.start_completed_turn_compaction_prefetch(
+        repeated = await compaction.start_completed_turn_compaction_prefetch(
             None, None, [], metadata, 'model', {}, state, {'total_tokens': 60}
         )
         gate['release'].set()
@@ -3745,7 +4352,7 @@ def test_turn_end_does_not_repeat_a_summary_started_with_the_request(monkeypatch
         }
         if round_pending:
             state['background_summary'] = {'task': started, 'cut': 3, 'carrier': {}}
-        task = compaction.start_completed_turn_compaction_prefetch(
+        task = await compaction.start_completed_turn_compaction_prefetch(
             None, None, [], {'chat_id': 'chat', 'message_id': 'a1'}, 'model', {}, state, {'total_tokens': 60}
         )
         await started
@@ -3754,6 +4361,12 @@ def test_turn_end_does_not_repeat_a_summary_started_with_the_request(monkeypatch
         return task
 
     assert (asyncio.run(run()) is not None) == repeats
+
+
+async def _compact_request_start(request, user, body, metadata, model_id, models, state, **kwargs):
+    body = await compaction.compact_provider_payload(request, user, body, metadata, model_id, models, state, **kwargs)
+    body, _ = await compaction.compact_planned_provider_payload(request, user, body, metadata, model_id, models, state)
+    return body
 
 
 def _compaction_config(**overrides):
@@ -4104,7 +4717,7 @@ def test_compact_provider_saves_largest_checkpoint_when_estimate_stays_over_thre
     }
 
     compacted = asyncio.run(
-        compaction.compact_provider_payload(
+        _compact_request_start(
             None, None, {'messages': copy.deepcopy(history)}, {'chat_id': 'chat'}, 'model', {}, state
         )
     )
@@ -4138,7 +4751,7 @@ def test_compact_provider_keeps_existing_summary_when_nothing_new_to_compact(mon
         'config': _compaction_config(),
     }
 
-    result = asyncio.run(compaction.compact_provider_payload(None, None, body, {'chat_id': 'chat'}, 'model', {}, state))
+    result = asyncio.run(_compact_request_start(None, None, body, {'chat_id': 'chat'}, 'model', {}, state))
 
     assert result['messages'] == body['messages']
 
@@ -4654,10 +5267,12 @@ def _run_payload_leg(
     file_context=False,
     files=None,
     stream=True,
+    models=None,
+    extra_form=None,
 ):
     request = SimpleNamespace(
         state=SimpleNamespace(direct=False),
-        app=SimpleNamespace(state=SimpleNamespace(MODELS={'model': {'id': 'model'}}, redis=None)),
+        app=SimpleNamespace(state=SimpleNamespace(MODELS=models or {'model': {'id': 'model'}}, redis=None)),
         scope={'type': 'http', 'state': {}},
         receive=None,
     )
@@ -4682,6 +5297,7 @@ def _run_payload_leg(
         form_data['tool_ids'] = form_tool_ids
     if files is not None:
         form_data['files'] = files
+    form_data.update(extra_form or {})
     model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': file_context}}}}
     return middleware.process_chat_payload(request, form_data, None, metadata, model)
 
@@ -7237,9 +7853,7 @@ def test_blocking_compaction_success_carries_boundary(monkeypatch):
     metadata = {'chat_id': 'chat', 'message_id': 'assistant'}
 
     compacted = asyncio.run(
-        compaction.compact_provider_payload(
-            None, None, {'messages': copy.deepcopy(history)}, metadata, 'model', {}, state
-        )
+        _compact_request_start(None, None, {'messages': copy.deepcopy(history)}, metadata, 'model', {}, state)
     )
     assert compacted['messages'][0]['content'].startswith('<auto_compaction_context>')
     assert events == [
@@ -9007,7 +9621,7 @@ def test_same_response_usage_stays_latest_single_response(monkeypatch):
             _chunk_iter(middleware, [_usage_chunk(85), _usage_chunk(90)]), media_type='text/event-stream'
         )
         await middleware.streaming_chat_response_handler(response, ctx)
-        task = compaction.start_completed_turn_compaction_prefetch(
+        task = await compaction.start_completed_turn_compaction_prefetch(
             ctx['request'],
             ctx['user'],
             ctx['form_data']['messages'],
@@ -10293,7 +10907,7 @@ def test_terminal_instructions_survive_compaction_and_count_towards_budget(monke
     assert all(any(m.get('content') == instructions for m in candidate) for candidate in measured)
     assert all(m.get('content') != instructions for prefix in summarized for m in prefix)
     # Early no-compaction passes must not discard the marker needed by later passes.
-    body = asyncio.run(compaction.compact_provider_payload(None, None, body, {}, 'model', {}, state))
+    body = asyncio.run(_compact_request_start(None, None, body, {}, 'model', {}, state))
     assert body['messages'][1][compaction.CONTEXT_COMPACTION_PREFIX_MARKER_KEY] is True
     stripped = compaction.strip_compaction_marker_keys(body['messages'])
     assert stripped[1] == {'role': 'user', 'content': instructions}

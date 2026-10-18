@@ -91,6 +91,7 @@ _SUMMARY_MESSAGE_KEYS = (
     'thinking',
     'refusal',
 )
+_SUMMARY_TOOL_KEYS = ('tools', 'tool_choice', 'functions', 'function_call', 'parallel_tool_calls')
 _HISTORY_DB_KEYS = {
     'id',
     'parentId',
@@ -105,6 +106,10 @@ _HISTORY_DB_KEYS = {
 
 
 class CanonicalHistoryError(ValueError):
+    pass
+
+
+class _SummaryToolCallError(RuntimeError):
     pass
 
 
@@ -987,6 +992,7 @@ async def _generate_checkpoint(
     recent_messages: list[dict],
     *,
     checkpoint_history: tuple[list[dict[str, Any]], int] | None = None,
+    prefix_body: dict | None = None,
 ) -> tuple[str, dict[str, Any], tuple[list[dict[str, Any]], int], str]:
     checkpoint_history = _history_source(checkpoint_history or state.get('checkpoint_history'))
     if checkpoint_history and checkpoint_history[1] > 0:
@@ -1013,6 +1019,7 @@ async def _generate_checkpoint(
         externalized_refs_enable=_tool_refs_active(state, config),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
         message_id=metadata.get('message_id'),
+        prefix_body=prefix_body,
     )
     return summary, summary_meta, checkpoint_history, checkpoint_message_id
 
@@ -1131,7 +1138,7 @@ async def compact_provider_payload(
     *,
     projected_messages: list[dict] | None = None,
 ) -> dict:
-    """Create a durable checkpoint before request filters can alter the DB branch."""
+    """Choose the cut and its durable carrier before request filters can alter the DB branch."""
     messages = body.get('messages')
     if not isinstance(messages, list):
         return body
@@ -1177,36 +1184,7 @@ async def compact_provider_payload(
             and (checkpoint := _checkpoint_for_boundary(state, working, latest)) is not None
             and _has_new_compaction_content(projected_working[:latest], state)
         ):
-            # ponytail: duplicate cross-worker prefetches are harmless; add Redis
-            # dedup only if measured summary cost warrants the coordination.
-            event_emitter = None
-            if metadata.get('chat_id') and metadata.get('message_id'):
-                from open_webui.socket.main import get_event_emitter
-
-                event_emitter = await get_event_emitter(metadata)
-            await _emit_compaction_status(
-                event_emitter,
-                'Generating summary in advance',
-                False,
-                phase='prefetch',
-            )
-            generation = asyncio.create_task(
-                _generate_checkpoint(
-                    request,
-                    user,
-                    model_id,
-                    models,
-                    metadata,
-                    state,
-                    config,
-                    _without_boundary_marker(projected_working[:latest], keep_transient=True),
-                    _without_boundary_marker(projected_working[latest:], keep_transient=True),
-                    checkpoint_history=checkpoint,
-                )
-            )
-            task = asyncio.create_task(_finalize_prefetch_checkpoint(generation, metadata['chat_id'], event_emitter))
-            task.add_done_callback(_prefetch_done)
-            state['prefetch_task'] = task
+            state['prefetch_checkpoint'] = checkpoint
             cut = len(messages) - len(working) + latest
         cleaned = _without_boundary_marker(messages)
         if cut is not None:
@@ -1226,30 +1204,90 @@ async def compact_provider_payload(
     ]
     if not boundaries:
         return {**body, 'messages': _without_boundary_marker(messages)}
-    event_emitter = None
-    if metadata.get('chat_id') and metadata.get('message_id'):
-        from open_webui.socket.main import get_event_emitter
+    cleaned = _without_boundary_marker(messages, keep_transient=True)
+    offset = len(messages) - len(working)
+    planned = [
+        (cleaned[offset + candidate], checkpoint)
+        for candidate in boundaries
+        if (checkpoint := _checkpoint_for_boundary(state, working, candidate)) is not None
+    ]
+    if not planned:
+        event_emitter = await _status_emitter(metadata)
+        await _emit_compaction_status(event_emitter, 'Compacting context', False)
+        await _emit_compaction_status(event_emitter, 'Context compaction failed', True, error=True)
+        raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
+    state['planned_compaction'] = planned
+    return {**body, 'messages': cleaned}
 
-        event_emitter = await get_event_emitter(metadata)
+
+async def compact_planned_provider_payload(
+    request,
+    user,
+    body: dict,
+    metadata: dict,
+    model_id: str,
+    models: dict,
+    state: dict,
+    *,
+    projected_messages: list[dict] | None = None,
+) -> tuple[dict, list[dict] | None]:
+    """Summarize the cut chosen before assembly against the body as it is sent."""
+    prefetch_checkpoint = state.pop('prefetch_checkpoint', None)
+    planned = state.pop('planned_compaction', None) or []
+    messages = body.get('messages')
+    config = state.get('config') or {}
+    if not isinstance(messages, list) or not config.get('enable'):
+        return body, projected_messages
+    system_messages, working = _split_leading_system_messages(messages)
+    projected_system, projected_working = _split_leading_system_messages(
+        projected_messages if isinstance(projected_messages, list) else messages
+    )
+    if len(projected_working) != len(working):
+        projected_system, projected_working = system_messages, working
+
+    def located(message: Any) -> int:
+        return next((index for index, item in enumerate(working) if item is message), 0)
+
+    cut_message = state.pop('prefetch_cut_message', None)
+    cut = located(cut_message)
+    if prefetch_checkpoint is not None and cut:
+        # ponytail: duplicate cross-worker prefetches are harmless; add Redis
+        # dedup only if measured summary cost warrants the coordination.
+        try:
+            prefix_body = await _summary_prefix(state, body, messages[: len(system_messages) + cut])
+        except Exception:
+            log.exception('Context compaction prefetch could not shape its prefix')
+        else:
+            event_emitter = await _status_emitter(metadata)
+            await _emit_compaction_status(event_emitter, 'Generating summary in advance', False, phase='prefetch')
+            generation = asyncio.create_task(
+                _generate_checkpoint(
+                    request,
+                    user,
+                    model_id,
+                    models,
+                    metadata,
+                    state,
+                    config,
+                    _without_boundary_marker(projected_working[:cut], keep_transient=True),
+                    _without_boundary_marker(projected_working[cut:], keep_transient=True),
+                    checkpoint_history=prefetch_checkpoint,
+                    prefix_body=prefix_body,
+                )
+            )
+            task = asyncio.create_task(_finalize_prefetch_checkpoint(generation, metadata['chat_id'], event_emitter))
+            task.add_done_callback(_prefetch_done)
+            state['prefetch_task'] = task
+            state['prefetch_cut_message'] = cut_message
+
+    planned = [(cut, checkpoint) for message, checkpoint in planned if (cut := located(message))]
+    if not planned:
+        return body, projected_messages
+    threshold = _resolve_token_threshold(config['token_threshold'], config['token_cap'], metadata)
+    event_emitter = await _status_emitter(metadata)
     await _emit_compaction_status(event_emitter, 'Compacting context', False)
     try:
-        compacted_body = None
-        summary = None
-        summary_meta = None
-        history_entry = None
-        for candidate_boundary in boundaries:
-            compacted_messages = _without_boundary_marker(
-                projected_working[:candidate_boundary],
-                keep_transient=True,
-            )
-            projected_recent = _without_boundary_marker(
-                projected_working[candidate_boundary:],
-                keep_transient=True,
-            )
-            recent_messages = _without_boundary_marker(working[candidate_boundary:], keep_transient=True)
-            checkpoint = _checkpoint_for_boundary(state, working, candidate_boundary)
-            if checkpoint is None:
-                continue
+        for cut, checkpoint in planned:
             summary, summary_meta, history_entry, checkpoint_message_id = await _generate_checkpoint(
                 request,
                 user,
@@ -1258,38 +1296,29 @@ async def compact_provider_payload(
                 metadata,
                 state,
                 config,
-                compacted_messages,
-                projected_recent,
+                _without_boundary_marker(projected_working[:cut], keep_transient=True),
+                _without_boundary_marker(projected_working[cut:], keep_transient=True),
                 checkpoint_history=checkpoint,
+                prefix_body=await _summary_prefix(state, body, messages[: len(system_messages) + cut]),
             )
             # The held identity must track the candidate actually returned to
             # the provider; the projected copy below is estimation-only and its
             # separate render must never become the held reference.
             summary_message = render_summary_message(summary, summary_meta)
-            compacted_body = {
-                **body,
-                'messages': [
-                    *system_messages,
-                    summary_message,
-                    *recent_messages,
-                ],
-            }
-            projected_candidate = {
-                **compacted_body,
-                'messages': [
-                    *projected_system,
-                    render_summary_message(summary, summary_meta),
-                    *projected_recent,
-                ],
-            }
-            after = await asyncio.to_thread(estimate_provider_tokens, projected_candidate)
+            compacted_body = {**body, 'messages': [*system_messages, summary_message, *working[cut:]]}
+            projected_candidate = [
+                *projected_system,
+                render_summary_message(summary, summary_meta),
+                *projected_working[cut:],
+            ]
+            after = await asyncio.to_thread(
+                estimate_provider_tokens, {**compacted_body, 'messages': projected_candidate}
+            )
             # The threshold only triggers compaction; when no candidate fits,
             # the largest one is still sent rather than refusing the request.
             if after <= threshold:
                 break
 
-        if compacted_body is None:
-            raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
         await _save_checkpoint(metadata['chat_id'], checkpoint_message_id, summary)
         state.update(
             {
@@ -1314,7 +1343,7 @@ async def compact_provider_payload(
         message_id=checkpoint_message_id,
         summary=summary,
     )
-    return compacted_body
+    return compacted_body, projected_candidate
 
 
 def _nested_checkpoint(
@@ -1388,6 +1417,11 @@ async def _nested_checkpoint_history(
         _summary_meta, _history_prefix_messages(history, message_index, carrier_index), transient_patterns
     )
     return history, position, summary_meta
+
+
+async def _summary_prefix(state: dict, body: dict, messages: list[dict]) -> dict | None:
+    shape = state.get('summary_prefix')
+    return await shape(state, {**body, 'messages': messages}) if shape is not None else None
 
 
 async def _status_emitter(metadata: dict):
@@ -1611,38 +1645,48 @@ async def compact_transient_provider_payload(
             working_start = len(nested_checkpoint[1])
             projected_compacted = _without_boundary_marker(projected_working[:working_start], keep_transient=True)
             if _has_new_compaction_content(projected_compacted, state):
-                event_emitter = await _status_emitter(metadata)
-                await _emit_compaction_status(event_emitter, 'Generating summary in advance', False, phase='prefetch')
-                task = asyncio.create_task(
-                    _summarize_in_background(
-                        event_emitter,
-                        _generate_summary(
-                            request,
-                            user,
-                            model_id,
-                            models,
-                            projected_compacted,
-                            _without_boundary_marker(projected_working[working_start:], keep_transient=True),
-                            state.get('previous_summary'),
-                            config['prompt_template'],
-                            config['transient_patterns'],
-                            previous_summary_meta=state.get('previous_summary_meta'),
-                            externalized_refs_enable=_tool_refs_active(state, config),
-                            externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
-                            message_id=metadata.get('message_id'),
-                        ),
-                        metadata,
-                        checkpoint_carrier,
+                try:
+                    prefix_body = await _summary_prefix(state, body, [*system_messages, *working[:working_start]])
+                except Exception:
+                    log.exception('Context compaction prefetch could not shape its prefix')
+                else:
+                    event_emitter = await _status_emitter(metadata)
+                    await _emit_compaction_status(
+                        event_emitter, 'Generating summary in advance', False, phase='prefetch'
                     )
-                )
-                _BACKGROUND_SUMMARIES.add(task)
-                task.add_done_callback(_BACKGROUND_SUMMARIES.discard)
-                task.add_done_callback(_prefetch_done)
-                state['background_summary'] = {
-                    'task': task,
-                    'cut': checkpoint_message_start,
-                    'carrier': checkpoint_carrier,
-                }
+                    task = asyncio.create_task(
+                        _summarize_in_background(
+                            event_emitter,
+                            _generate_summary(
+                                request,
+                                user,
+                                model_id,
+                                models,
+                                projected_compacted,
+                                _without_boundary_marker(projected_working[working_start:], keep_transient=True),
+                                state.get('previous_summary'),
+                                config['prompt_template'],
+                                config['transient_patterns'],
+                                previous_summary_meta=state.get('previous_summary_meta'),
+                                externalized_refs_enable=_tool_refs_active(state, config),
+                                externalized_refs_token_threshold=config.get(
+                                    'externalized_refs_token_threshold', 10000
+                                ),
+                                message_id=metadata.get('message_id'),
+                                prefix_body=prefix_body,
+                            ),
+                            metadata,
+                            checkpoint_carrier,
+                        )
+                    )
+                    _BACKGROUND_SUMMARIES.add(task)
+                    task.add_done_callback(_BACKGROUND_SUMMARIES.discard)
+                    task.add_done_callback(_prefetch_done)
+                    state['background_summary'] = {
+                        'task': task,
+                        'cut': checkpoint_message_start,
+                        'carrier': checkpoint_carrier,
+                    }
         return body
 
     if nested_checkpoint is not None:
@@ -1659,6 +1703,7 @@ async def compact_transient_provider_payload(
             event_emitter = await get_event_emitter(metadata)
         await _emit_compaction_status(event_emitter, 'Compacting context', False)
         try:
+            prefix_body = await _summary_prefix(state, body, [*system_messages, *compacted_messages])
             summary = await _generate_summary(
                 request,
                 user,
@@ -1673,6 +1718,7 @@ async def compact_transient_provider_payload(
                 externalized_refs_enable=_tool_refs_active(state, config),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
                 message_id=metadata.get('message_id'),
+                prefix_body=prefix_body,
             )
             history, position, summary_meta = await _nested_checkpoint_history(
                 state,
@@ -1788,6 +1834,7 @@ async def compact_transient_provider_payload(
                 externalized_refs_enable=_tool_refs_active(state, config),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
                 message_id=metadata.get('message_id'),
+                prefix_body=await _summary_prefix(state, body, [*system_messages, *working[:candidate_boundary]]),
             )
             # The held identity must track the candidate actually returned to
             # the provider; the projected copy below is estimation-only and its
@@ -1960,6 +2007,7 @@ async def _completed_turn_checkpoint(
     models: dict,
     config: dict,
     tool_refs_active: bool | None = None,
+    prefix_body: dict | None = None,
 ) -> str | None:
     _, checkpoint_messages, active, summary_index, summary_output, previous_summary = _stored_checkpoint_view(messages)
     if not active or active[-1].get('id') != metadata['message_id']:
@@ -2011,6 +2059,7 @@ async def _completed_turn_checkpoint(
             else tool_refs_active,
             externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
             message_id=metadata['message_id'],
+            prefix_body=prefix_body,
         )
         await _save_checkpoint(metadata['chat_id'], metadata['message_id'], summary)
     except BaseException:
@@ -2033,7 +2082,7 @@ async def _completed_turn_checkpoint(
     return summary
 
 
-def start_completed_turn_compaction_prefetch(
+async def start_completed_turn_compaction_prefetch(
     request: Request,
     user: Any,
     messages: list[dict],
@@ -2073,6 +2122,17 @@ def start_completed_turn_compaction_prefetch(
         if total < int(threshold * ratio) or total >= threshold:
             return None
 
+    # The summary reads the turn as its first send carried it, which is the prefix the provider cached.
+    canonical = state.get('canonical_body')
+    try:
+        prefix_body = (
+            await _summary_prefix(state, canonical, canonical['messages'])
+            if isinstance(canonical, dict) and isinstance(canonical.get('messages'), list)
+            else None
+        )
+    except Exception:
+        log.exception('Context compaction prefetch could not shape its prefix')
+        return None
     task = asyncio.create_task(
         _completed_turn_checkpoint(
             request,
@@ -2083,6 +2143,7 @@ def start_completed_turn_compaction_prefetch(
             models,
             config,
             _tool_refs_active(state, config),
+            prefix_body,
         )
     )
     task.add_done_callback(_prefetch_done)
@@ -2490,6 +2551,54 @@ def find_safe_compaction_boundary(
     return max(selected, completed_round)
 
 
+def _is_forced_tool_choice(value: Any) -> bool:
+    if isinstance(value, dict):
+        return value.get('type') not in {'auto', 'none'}
+    return isinstance(value, str) and value not in {'auto', 'none'}
+
+
+def _is_forced_function_call(value: Any) -> bool:
+    if isinstance(value, dict):
+        return bool(value.get('name'))
+    return isinstance(value, str) and value not in {'auto', 'none'}
+
+
+_SUMMARY_RESPONSE_CONTROL_KEYS = (
+    'max_tokens',
+    'max_completion_tokens',
+    'max_output_tokens',
+    'num_predict',
+    'stop',
+    'response_format',
+    'format',
+    'n',
+)
+
+
+def _shared_prefix_payload(prefix_body: dict) -> dict:
+    """The chat's send as a summary request, without the controls that would cut or shape the summary."""
+    payload = {key: value for key, value in prefix_body.items() if key not in {'messages', 'metadata'}}
+    payload.pop('previous_response_id', None)
+    payload.pop('stream_options', None)
+    for values in (payload, payload.get('params'), payload.get('options')):
+        if isinstance(values, dict):
+            for scope in (values, values.get('custom_params')):
+                if isinstance(scope, dict):
+                    for key in _SUMMARY_RESPONSE_CONTROL_KEYS:
+                        scope.pop(key, None)
+                    if isinstance(scope.get('text'), dict):
+                        scope['text'] = {key: value for key, value in scope['text'].items() if key != 'format'}
+    if payload.get('tools') and _is_forced_tool_choice(payload.get('tool_choice')):
+        payload['tool_choice'] = 'none'
+    elif not payload.get('tools'):
+        payload.pop('tool_choice', None)
+    if payload.get('functions') and _is_forced_function_call(payload.get('function_call')):
+        payload['function_call'] = 'none'
+    elif not payload.get('functions'):
+        payload.pop('function_call', None)
+    return payload
+
+
 def _inherit_model_max_tokens(task_model_params: dict, model: dict) -> dict:
     if task_model_params:
         return task_model_params
@@ -2514,6 +2623,7 @@ async def _generate_summary(
     externalized_refs_enable: bool = False,
     externalized_refs_token_threshold: int = 10000,
     message_id: str | None = None,
+    prefix_body: dict | None = None,
 ) -> str:
     from open_webui.utils.chat import generate_chat_completion
 
@@ -2529,6 +2639,15 @@ async def _generate_summary(
     if task_model_id not in models:
         raise ValueError('No available model for context compaction')
 
+    custom_prompt = summary_prompt_template.strip()
+    legacy_transcript_prompt = bool(
+        custom_prompt
+        and (
+            _SUMMARY_TRANSCRIPT_VARIABLE_RE.search(custom_prompt)
+            or '{{PREVIOUS_SUMMARY}}' in custom_prompt
+            or _SUMMARY_PROMPT_VARIABLE_RE.search(custom_prompt)
+        )
+    )
     compacted_messages = _drop_rendered_summary_once(
         compacted_messages,
         previous_summary,
@@ -2540,7 +2659,7 @@ async def _generate_summary(
         previous_summary_meta,
     )
     all_messages = [*compacted_messages, *recent_messages]
-    if externalized_refs_enable:
+    if externalized_refs_enable and (prefix_body is None or legacy_transcript_prompt):
         all_messages = await project_tool_refs(
             all_messages,
             threshold_tokens=externalized_refs_token_threshold,
@@ -2549,15 +2668,6 @@ async def _generate_summary(
         compacted_messages = all_messages[: len(compacted_messages)]
         recent_messages = all_messages[len(compacted_messages) :]
 
-    custom_prompt = summary_prompt_template.strip()
-    legacy_transcript_prompt = bool(
-        custom_prompt
-        and (
-            _SUMMARY_TRANSCRIPT_VARIABLE_RE.search(custom_prompt)
-            or '{{PREVIOUS_SUMMARY}}' in custom_prompt
-            or _SUMMARY_PROMPT_VARIABLE_RE.search(custom_prompt)
-        )
-    )
     summary_prompt_template = custom_prompt or DEFAULT_CONTEXT_COMPACTION_PROMPT
     prompt_compacted_messages = compacted_messages
     prompt_all_messages = [*prompt_compacted_messages, *recent_messages]
@@ -2587,8 +2697,15 @@ async def _generate_summary(
         prompt = f'{render_summary_message(previous_summary, previous_summary_meta)["content"]}\n\n{prompt}'
     prompt = await prompt_template(prompt, user)
 
+    shared_prefix = (
+        prefix_body is not None and not legacy_transcript_prompt and task_model_id == prefix_body.get('model')
+    )
     if legacy_transcript_prompt:
         summary_messages = [{'role': 'user', 'content': prompt}]
+    elif prefix_body is not None:
+        summary_messages = [*prefix_body['messages'], {'role': 'user', 'content': prompt}]
+        if not shared_prefix:
+            summary_messages = _split_leading_system_messages(summary_messages)[1]
     else:
         summary_messages = _without_boundary_marker(
             await asyncio.to_thread(copy.deepcopy, compacted_messages),
@@ -2596,12 +2713,6 @@ async def _generate_summary(
         if previous_summary:
             summary_messages.insert(0, render_summary_message(previous_summary, previous_summary_meta))
         summary_messages.append({'role': 'user', 'content': prompt})
-    task_model_params = task_config.get('task.model.params') or {}
-    if not isinstance(task_model_params, dict):
-        task_model_params = {}
-    task_model_params = {key: value for key, value in task_model_params.items() if value is not None and value != ''}
-    task_model_params = _inherit_model_max_tokens(task_model_params, models[task_model_id])
-
     summary_metadata = dict(request.state.metadata) if hasattr(request.state, 'metadata') else {}
     summary_metadata.pop('tools', None)
     summary_metadata.pop('files', None)
@@ -2623,21 +2734,43 @@ async def _generate_summary(
         'state': {**(request.scope.get('state') or {}), 'metadata': summary_metadata},
     }
     summary_request = Request(summary_scope, receive=request.receive)
-    payload = {
-        'model': task_model_id,
-        'messages': _summary_provider_messages(summary_messages),
-        'stream': False,
-        'metadata': summary_metadata,
-    }
-
-    payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
-    for key in ('tools', 'tool_choice', 'functions', 'function_call', 'parallel_tool_calls'):
-        payload.pop(key, None)
+    if shared_prefix:
+        # Tools, system prompt and request parameters such as thinking all lead the provider's cached prefix.
+        payload = {
+            **_shared_prefix_payload(prefix_body),
+            'model': task_model_id,
+            'messages': summary_messages,
+            'stream': False,
+            'metadata': summary_metadata,
+        }
+    else:
+        task_model_params = task_config.get('task.model.params') or {}
+        if not isinstance(task_model_params, dict):
+            task_model_params = {}
+        task_model_params = {
+            key: value for key, value in task_model_params.items() if value is not None and value != ''
+        }
+        task_model_params = _inherit_model_max_tokens(task_model_params, models[task_model_id])
+        payload = {
+            'model': task_model_id,
+            'messages': _summary_provider_messages(summary_messages),
+            'stream': False,
+            'metadata': summary_metadata,
+        }
+        payload = apply_params_to_form_data(payload, models[task_model_id], task_model_params)
+        for key in _SUMMARY_TOOL_KEYS:
+            payload.pop(key, None)
+    # Keep bypass_system_prompt: the router must not add the model's system prompt; a shared prefix already carries the chat's.
+    response = await generate_chat_completion(summary_request, form_data=payload, user=user, bypass_system_prompt=True)
+    try:
+        return await _response_text(response)
+    except _SummaryToolCallError:
+        if not any(key in payload for key in _SUMMARY_TOOL_KEYS):
+            raise
     response = await generate_chat_completion(
         summary_request,
-        form_data=payload,
+        form_data={key: value for key, value in payload.items() if key not in _SUMMARY_TOOL_KEYS},
         user=user,
-        # Keep bypass_system_prompt: the summary request must not inherit the chat model's system prompt.
         bypass_system_prompt=True,
     )
     return await _response_text(response)
@@ -2708,7 +2841,7 @@ async def _stream_summary_payload(response: StreamingResponse) -> dict:
             if not isinstance(delta, dict):
                 raise RuntimeError('Context compaction model returned an invalid event stream')
             if delta.get('tool_calls') or delta.get('function_call'):
-                raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+                raise _SummaryToolCallError('Context compaction model requested a tool instead of returning a summary')
             content = delta.get('content')
             if isinstance(content, str):
                 chat_parts.append(content)
@@ -2716,7 +2849,7 @@ async def _stream_summary_payload(response: StreamingResponse) -> dict:
             if finish_reason in (None, ''):
                 continue
             if finish_reason in {'tool_calls', 'function_call'}:
-                raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+                raise _SummaryToolCallError('Context compaction model requested a tool instead of returning a summary')
             if finish_reason != 'stop':
                 raise RuntimeError('Context compaction model stopped before completing the summary')
             completed = True
@@ -2774,7 +2907,7 @@ async def _response_text(response: Any) -> str:
         choice = choices[0]
         message = choice.get('message') or {}
         if message.get('tool_calls') or message.get('function_call'):
-            raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+            raise _SummaryToolCallError('Context compaction model requested a tool instead of returning a summary')
         if choice.get('finish_reason') not in (None, 'stop'):
             raise RuntimeError('Context compaction model stopped before completing the summary')
         content = message.get('content')
@@ -2789,7 +2922,7 @@ async def _response_text(response: Any) -> str:
         if not isinstance(item, dict):
             continue
         if item.get('type') in {'function_call', 'tool_call'}:
-            raise RuntimeError('Context compaction model requested a tool instead of returning a summary')
+            raise _SummaryToolCallError('Context compaction model requested a tool instead of returning a summary')
         if item.get('status') not in (None, 'completed'):
             raise RuntimeError('Context compaction model stopped before completing the summary')
         for content in item.get('content') or []:
