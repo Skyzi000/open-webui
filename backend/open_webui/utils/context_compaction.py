@@ -210,6 +210,12 @@ def _has_multimodal(messages: list[dict]) -> bool:
     return False
 
 
+def _tool_refs_active(state: dict, config: dict) -> bool:
+    """Whether this request's sends replace large tool results with refs, so its summaries see the same view."""
+    active = state.get('tool_refs_active')
+    return config.get('externalized_refs_enable', False) if active is None else active
+
+
 def _summary_meta(messages: list[dict], patterns: tuple[re.Pattern[str], ...] = ()) -> dict:
     meta = {
         'historical_user_messages': _historical_user_excerpts(
@@ -1004,7 +1010,7 @@ async def _generate_checkpoint(
         config['prompt_template'],
         config['transient_patterns'],
         previous_summary_meta=state.get('previous_summary_meta'),
-        externalized_refs_enable=config.get('externalized_refs_enable', False),
+        externalized_refs_enable=_tool_refs_active(state, config),
         externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
         message_id=metadata.get('message_id'),
     )
@@ -1621,7 +1627,7 @@ async def compact_transient_provider_payload(
                             config['prompt_template'],
                             config['transient_patterns'],
                             previous_summary_meta=state.get('previous_summary_meta'),
-                            externalized_refs_enable=config.get('externalized_refs_enable', False),
+                            externalized_refs_enable=_tool_refs_active(state, config),
                             externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
                             message_id=metadata.get('message_id'),
                         ),
@@ -1664,7 +1670,7 @@ async def compact_transient_provider_payload(
                 config['prompt_template'],
                 config['transient_patterns'],
                 previous_summary_meta=state.get('previous_summary_meta'),
-                externalized_refs_enable=config.get('externalized_refs_enable', False),
+                externalized_refs_enable=_tool_refs_active(state, config),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
                 message_id=metadata.get('message_id'),
             )
@@ -1779,7 +1785,7 @@ async def compact_transient_provider_payload(
                 config['prompt_template'],
                 config['transient_patterns'],
                 previous_summary_meta=state.get('previous_summary_meta'),
-                externalized_refs_enable=config.get('externalized_refs_enable', False),
+                externalized_refs_enable=_tool_refs_active(state, config),
                 externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
                 message_id=metadata.get('message_id'),
             )
@@ -1813,9 +1819,14 @@ async def compact_transient_provider_payload(
         history_entry = (
             await asyncio.to_thread(_history_entry_at, working, candidate_boundary)
             if ref_config.get('enable') is True
-            and ref_config.get('native') is True
-            and isinstance(registry, dict)
-            and can_externalize_refs(body, native=True, registry=registry)
+            and (
+                state.get('keep_tool_refs') is True
+                or (
+                    ref_config.get('native') is True
+                    and isinstance(registry, dict)
+                    and can_externalize_refs(body, native=True, registry=registry)
+                )
+            )
             else None
         )
         summary_meta: dict[str, Any] = {}
@@ -1948,6 +1959,7 @@ async def _completed_turn_checkpoint(
     model_id: str,
     models: dict,
     config: dict,
+    tool_refs_active: bool | None = None,
 ) -> str | None:
     _, checkpoint_messages, active, summary_index, summary_output, previous_summary = _stored_checkpoint_view(messages)
     if not active or active[-1].get('id') != metadata['message_id']:
@@ -1994,7 +2006,9 @@ async def _completed_turn_checkpoint(
                 if summary_index is not None
                 else {}
             ),
-            externalized_refs_enable=config.get('externalized_refs_enable', False),
+            externalized_refs_enable=config.get('externalized_refs_enable', False)
+            if tool_refs_active is None
+            else tool_refs_active,
             externalized_refs_token_threshold=config.get('externalized_refs_token_threshold', 10000),
             message_id=metadata['message_id'],
         )
@@ -2068,6 +2082,7 @@ def start_completed_turn_compaction_prefetch(
             model_id,
             models,
             config,
+            _tool_refs_active(state, config),
         )
     )
     task.add_done_callback(_prefetch_done)

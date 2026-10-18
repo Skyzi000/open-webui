@@ -455,6 +455,7 @@ async def externalize_refs(
     history_loader: Callable[[], Awaitable[RefEntry | None]] | None = None,
     seed_entries: Iterable[RefEntry] = (),
     render_cache: dict[tuple[str, int, Any], str] | None = None,
+    install_reader: bool = True,
 ) -> bool:
     """Install or extend one Core-owned reader and project eligible tool messages.
 
@@ -462,7 +463,7 @@ async def externalize_refs(
     The original messages list and message dictionaries remain unchanged.
     """
 
-    if not can_externalize_refs(body, native=native, registry=registry):
+    if install_reader and not can_externalize_refs(body, native=native, registry=registry):
         return False
     messages = body.get('messages')
     if not isinstance(messages, list):
@@ -473,7 +474,7 @@ async def externalize_refs(
         for entry in seed_entries
         if isinstance(entry, RefEntry) and entry.ref.startswith('tool:') and _valid_ref(entry.ref)
     )
-    reader = _owned_reader(registry)
+    reader = _owned_reader(registry) if install_reader else None
     projections = await _capture_projections(
         messages,
         threshold_tokens=threshold_tokens,
@@ -503,34 +504,35 @@ async def externalize_refs(
     if not _projections_are_current(messages, projections):
         return False
 
-    if reader is None:
-        catalog: dict[str, RefEntry] = {}
-        reader = _new_reader(
-            catalog,
-            threshold_tokens=threshold_tokens,
-            count_tokens=count_tokens,
-        )
-    else:
-        catalog = reader.__externalized_ref_catalog__
+    if install_reader:
+        if reader is None:
+            catalog: dict[str, RefEntry] = {}
+            reader = _new_reader(
+                catalog,
+                threshold_tokens=threshold_tokens,
+                count_tokens=count_tokens,
+            )
+        else:
+            catalog = reader.__externalized_ref_catalog__
 
-    for entry in seeds:
-        catalog.setdefault(entry.ref, entry)
-    for _, _, entry, _preview in projections:
-        catalog.setdefault(entry.ref, entry)
-    if history_entry is not None:
-        catalog.setdefault(history_entry.ref, history_entry)
+        for entry in seeds:
+            catalog.setdefault(entry.ref, entry)
+        for _, _, entry, _preview in projections:
+            catalog.setdefault(entry.ref, entry)
+        if history_entry is not None:
+            catalog.setdefault(history_entry.ref, history_entry)
 
-    if REF_EXEC_TOOL_NAME not in registry:
-        registry[REF_EXEC_TOOL_NAME] = {
-            'spec': copy.deepcopy(REF_EXEC_FUNCTION_SPEC),
-            'callable': reader,
-        }
+        if REF_EXEC_TOOL_NAME not in registry:
+            registry[REF_EXEC_TOOL_NAME] = {
+                'spec': copy.deepcopy(REF_EXEC_FUNCTION_SPEC),
+                'callable': reader,
+            }
 
-    tools = body.get('tools')
-    if tools is None:
-        body['tools'] = [copy.deepcopy(REF_EXEC_TOOL_SPEC)]
-    elif not any(isinstance(tool, dict) and _tool_schema_name(tool) == REF_EXEC_TOOL_NAME for tool in tools):
-        body['tools'] = [*tools, copy.deepcopy(REF_EXEC_TOOL_SPEC)]
+        tools = body.get('tools')
+        if tools is None:
+            body['tools'] = [copy.deepcopy(REF_EXEC_TOOL_SPEC)]
+        elif not any(isinstance(tool, dict) and _tool_schema_name(tool) == REF_EXEC_TOOL_NAME for tool in tools):
+            body['tools'] = [*tools, copy.deepcopy(REF_EXEC_TOOL_SPEC)]
 
     # Copy only the list and dictionaries whose content changes. Strings remain shared.
     body['messages'] = _apply_projections(messages, projections)

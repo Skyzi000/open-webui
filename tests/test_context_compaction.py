@@ -3187,9 +3187,11 @@ def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatc
         'a2': message('a2', 'u2', 'assistant', 'a2'),
     }
     previous_metas = []
+    refs_flags = []
 
     async def generate_summary(*_args, **kwargs):
         previous_metas.append(kwargs.get('previous_summary_meta'))
+        refs_flags.append(kwargs.get('externalized_refs_enable'))
         return 'NEW'
 
     async def noop(*_args, **_kwargs):
@@ -3210,7 +3212,12 @@ def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatc
     monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
     monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
     monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
-    state = {'config': _compaction_config(token_threshold=1_000, token_cap=1_000, soft_trigger_ratio=0.5)}
+    state = {
+        'config': _compaction_config(
+            token_threshold=1_000, token_cap=1_000, soft_trigger_ratio=0.5, externalized_refs_enable=True
+        ),
+        'tool_refs_active': False,
+    }
 
     async def run():
         await middleware.background_tasks_handler(
@@ -3232,6 +3239,191 @@ def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatc
 
     assert previous_metas[0]['historical_user_messages'] == ['start\nMUST include a chart']
     assert previous_metas[0]['has_multimodal'] is True
+    assert refs_flags == [False]
+
+
+def _history_with_a_large_tool_result():
+    big = 'alpha beta gamma ' * 2000 + 'MIDDLE-FACT-42' + ' delta epsilon' * 2000
+    return [
+        {'id': 'u0', 'role': 'user', 'content': 'look it up'},
+        {
+            'id': 'a0',
+            'role': 'assistant',
+            'content': 'answer',
+            'output': [
+                {
+                    'type': 'function_call',
+                    'id': 'fc-1',
+                    'call_id': 'call-1',
+                    'name': 'lookup',
+                    'arguments': '{}',
+                    'status': 'completed',
+                },
+                {
+                    'type': 'function_call_output',
+                    'id': 'fco-1',
+                    'call_id': 'call-1',
+                    'output': [{'type': 'input_text', 'text': big}],
+                    'status': 'completed',
+                },
+                {
+                    'type': 'message',
+                    'role': 'assistant',
+                    'status': 'completed',
+                    'content': [{'type': 'output_text', 'text': 'answer'}],
+                },
+            ],
+        },
+        {'id': 'u1', 'role': 'user', 'content': 'question'},
+    ]
+
+
+@pytest.mark.parametrize(
+    'stored, stream, summary_sees_middle',
+    [(True, True, False), (True, False, False), (False, True, False), (False, False, True)],
+)
+def test_summary_sees_tool_results_as_the_request_sends_them(monkeypatch, stored, stream, summary_sees_middle):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    summary_requests = []
+
+    async def load_config():
+        return _compaction_config(
+            token_threshold=100,
+            token_cap=100,
+            soft_trigger_ratio=0,
+            externalized_refs_enable=True,
+            externalized_refs_token_threshold=1000,
+        )
+
+    async def summarize(_request, form_data=None, user=None, **_kwargs):
+        summary_requests.append(json.dumps(form_data['messages']))
+        return {'choices': [{'message': {'content': 'summary'}, 'finish_reason': 'stop'}]}
+
+    async def get_many(*_keys):
+        return {}
+
+    async def passthrough(prompt, _user):
+        return prompt
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    history = _history_with_a_large_tool_result()
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(compaction, 'prompt_template', passthrough)
+    monkeypatch.setattr(chat_module, 'generate_chat_completion', summarize)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history if stored else [])
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+
+    asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}] if stored else history,
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+            stream=stream,
+        )
+    )
+
+    assert len(summary_requests) == 1
+    assert ('MIDDLE-FACT-42' in summary_requests[0]) is summary_sees_middle
+
+
+@pytest.mark.parametrize(
+    'stored, stream, params, middle_sent, reader_offered',
+    [
+        (True, True, None, False, True),
+        (True, False, None, False, False),
+        (True, True, {'function_calling': 'legacy'}, False, False),
+        (False, False, None, True, False),
+    ],
+)
+def test_stored_tool_results_stay_previews_whatever_the_request_can_offer(
+    monkeypatch, stored, stream, params, middle_sent, reader_offered
+):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    reader_name = importlib.import_module('open_webui.utils.externalized_refs').REF_EXEC_TOOL_NAME
+    history = _history_with_a_large_tool_result()
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=history if stored else [])
+
+    body, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}] if stored else history,
+            params=params,
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+            stream=stream,
+        )
+    )
+
+    assert ('MIDDLE-FACT-42' in json.dumps(body['messages'])) is middle_sent
+    assert (reader_name in [tool['function']['name'] for tool in body.get('tools') or []]) is reader_offered
+
+
+def test_a_chat_that_sent_refs_links_a_summary_made_without_the_reader(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    tool = {
+        'spec': {'name': 'lookup', 'description': 'word ' * 3000, 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': lambda: None,
+    }
+    summaries_saw_previews = []
+
+    async def get_tools(*_args, **_kwargs):
+        return {'lookup': tool}
+
+    async def get_filters(*_args, **_kwargs):
+        return []
+
+    async def load_config():
+        return _compaction_config(
+            token_threshold=2500,
+            token_cap=2500,
+            soft_trigger_ratio=0,
+            externalized_refs_enable=True,
+            externalized_refs_token_threshold=1000,
+        )
+
+    async def generate_summary(*_args, **kwargs):
+        summaries_saw_previews.append(kwargs['externalized_refs_enable'])
+        return 'summary'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(middleware, 'get_tools', get_tools)
+    monkeypatch.setattr(middleware, 'ENABLE_FUNCTIONS', True)
+    monkeypatch.setattr(middleware, 'get_filter_functions', get_filters)
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(True, 1000))
+    _payload_leg_drain(monkeypatch, middleware, {'output': []}, history=_history_with_a_large_tool_result())
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+
+    send, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u1'},
+            assistant_message_id=None,
+            stream=False,
+            form_tool_ids=['lookup'],
+        )
+    )
+
+    assert summaries_saw_previews == [True]
+    assert '<history_ref>history:' in send['messages'][0]['content']
+    assert [tool['function']['name'] for tool in send['tools']] == ['lookup']
+    assert refs.REF_EXEC_TOOL_NAME not in json.dumps(send['tools'])
 
 
 def test_compaction_reads_no_attachment_and_leaves_it_on_the_request(monkeypatch):
@@ -4461,6 +4653,7 @@ def _run_payload_leg(
     form_tool_ids=None,
     file_context=False,
     files=None,
+    stream=True,
 ):
     request = SimpleNamespace(
         state=SimpleNamespace(direct=False),
@@ -4481,7 +4674,7 @@ def _run_payload_leg(
         metadata.update(seeded_metadata)
     form_data = {
         'model': 'model',
-        'stream': True,
+        'stream': stream,
         'messages': messages,
         'metadata': metadata,
     }

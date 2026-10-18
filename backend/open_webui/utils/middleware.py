@@ -2561,15 +2561,16 @@ async def apply_externalized_refs(
     state: dict,
 ) -> dict:
     config = state.get('externalized_refs') or {}
-    installed = False
+    projected = False
     has_summary = False
     seed_entries = tuple(state.get('tool_ref_entries') or ())
     admitted_seed_entries: tuple[RefEntry, ...] = ()
-    if config.get('enable') and can_externalize_refs(
+    reader_usable = bool(config.get('enable')) and can_externalize_refs(
         body,
         native=config.get('native') is True,
         registry=config['registry'],
-    ):
+    )
+    if reader_usable or (config.get('enable') and state.get('keep_tool_refs') is True):
         messages = body.get('messages')
         if isinstance(messages, list):
             admitted_seed_entries, has_summary = _post_filter_ref_state(
@@ -2584,7 +2585,7 @@ async def apply_externalized_refs(
                 state['selected_history'] = entry
             return entry
 
-        installed = await externalize_refs(
+        projected = await externalize_refs(
             body,
             config['registry'],
             native=True,
@@ -2593,8 +2594,9 @@ async def apply_externalized_refs(
             history_loader=load_history if has_summary else None,
             seed_entries=admitted_seed_entries,
             render_cache=state.setdefault('ref_preview_cache', {}),
+            install_reader=reader_usable,
         )
-        if installed:
+        if projected and reader_usable:
             config['metadata']['tools'] = config['registry']
 
     history_entry = state.get('selected_history')
@@ -2602,7 +2604,7 @@ async def apply_externalized_refs(
         return body
     return set_summary_history_ref(
         body,
-        history_entry.ref if has_summary and installed and isinstance(history_entry, RefEntry) else None,
+        history_entry.ref if has_summary and projected and isinstance(history_entry, RefEntry) else None,
         state=state,
     )
 
@@ -2616,12 +2618,18 @@ async def _capture_pre_filter_tool_refs(
 ) -> list[dict] | None:
     messages = body.get('messages')
     config = state.get('config') or {}
-    if (
-        not isinstance(messages, list)
-        or config.get('externalized_refs_enable') is not True
-        or not (native if native is not None else _can_install_externalized_ref_reader(metadata, payload_tools))
-        or not can_externalize_refs(body, native=True, registry={})
-    ):
+    state['tool_refs_active'] = (
+        isinstance(messages, list)
+        and config.get('externalized_refs_enable') is True
+        and (
+            state.get('keep_tool_refs') is True
+            or (
+                bool(native if native is not None else _can_install_externalized_ref_reader(metadata, payload_tools))
+                and can_externalize_refs(body, native=True, registry={})
+            )
+        )
+    )
+    if not state['tool_refs_active']:
         return None
     projected, entries = await capture_tool_ref_projections(
         messages,
@@ -2945,6 +2953,7 @@ async def process_chat_payload(
         chat and chat.user_id == user.id and payload_tools is None and use_builtin_tools
     )
 
+    keep_tool_refs = False
     if is_saved_chat_id(chat_id) and user_message_id:
         db_messages = await load_messages_from_db(chat_id, user_message_id)
         if db_messages:
@@ -2977,11 +2986,14 @@ async def process_chat_payload(
             # DB history replaces the request's messages, so carry its first system message wherever it sits.
             system_message = next((m for m in form_data.get('messages', []) if m.get('role') == 'system'), None)
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
+            keep_tool_refs = True
 
     if is_saved_chat_id(chat_id) and user_message_id:
         form_data['messages'], compaction_state = await _prepare_compaction_or_default(
             form_data.get('messages', []), metadata
         )
+    # Stored tool results stay previews even when this request cannot offer the reader, so a chat never switches.
+    compaction_state['keep_tool_refs'] = keep_tool_refs
     if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
         models = {
             request.state.model['id']: request.state.model,
