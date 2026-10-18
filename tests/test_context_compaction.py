@@ -9141,14 +9141,9 @@ def _stream_store_harness(monkeypatch):
     save_calls = []
     real_save = tasks.save_response_stream
 
-    async def counting_save(redis, task_id, chat_id, message_id, content, output, **kwargs):
-        save_calls.append(
-            {
-                'content': content,
-                'context_usage': copy.deepcopy(kwargs.get('context_usage')),
-            }
-        )
-        await real_save(redis, task_id, chat_id, message_id, content, output, **kwargs)
+    async def counting_save(redis, task_id, chat_id, message_id, output, **kwargs):
+        save_calls.append({'context_usage': copy.deepcopy(kwargs.get('context_usage'))})
+        return await real_save(redis, task_id, chat_id, message_id, output, **kwargs)
 
     monkeypatch.setattr(middleware, 'save_response_stream', counting_save)
     monkeypatch.setattr(middleware, 'clear_response_stream', tasks.clear_response_stream)
@@ -9448,34 +9443,46 @@ class _RecordingRedis:
     def __init__(self):
         self.entries = {}
         self.writes = []
-        self.exists_count = 0
+        self.results = []
 
     def pipeline(self, transaction=False):
-        self.exists_count = 0
+        self.results = []
         return self
 
     def exists(self, key):
-        self.exists_count += 1
+        self.results.append(True)
+        return self
+
+    def get(self, key):
+        self.results.append(self.entries.get(key))
+        return self
+
+    def delete(self, key):
+        self.results.append(int(self.entries.pop(key, None) is not None))
+        return self
+
+    def hdel(self, key, field):
+        self.results.append(0)
         return self
 
     async def execute(self):
-        return [True] * self.exists_count
+        return self.results
 
-    async def hset(self, key, field, value):
-        self.entries[(key, field)] = value
+    async def set(self, key, value, ex=None):
+        self.entries[key] = value
         self.writes.append(value)
 
+    async def eval(self, _script, _keys, key, size, line, _ttl):
+        if len(self.entries.get(key, b'')) != size:
+            return 0
+        self.entries[key] += line
+        return 1
+
     async def hmget(self, key, fields):
-        return [self.entries.get((key, field)) for field in fields]
+        return [None] * len(fields)
 
     async def smembers(self, key):
         return {'stream-task'}
-
-    async def hexpire(self, *args):
-        return None
-
-    async def hdel(self, key, field):
-        self.entries.pop((key, field), None)
 
 
 def _observe_redis_stream(monkeypatch, specs, batch_size=1):
@@ -9543,6 +9550,7 @@ def test_structured_updates_reach_stream_store_serialized(monkeypatch):
 
 def test_batched_body_usage_does_not_add_full_saves(monkeypatch):
     specs = [_usage_chunk(total) for total in range(81, 85)]
+    specs[0]['choices'][0]['delta']['content'] = 'PART' * 500
     no_usage_specs = [{k: v for k, v in spec.items() if k != 'usage'} for spec in specs]
 
     with pytest.MonkeyPatch.context() as inner:
@@ -9551,6 +9559,16 @@ def test_batched_body_usage_does_not_add_full_saves(monkeypatch):
         measured = _observe_redis_stream(inner, specs, batch_size=20)
 
     assert len(measured['writes']) == len(control['writes'])
+
+
+def test_usage_between_snapshots_reaches_the_redis_stream_store(monkeypatch):
+    first = {'choices': [{'delta': {'content': 'PART' * 500}, 'finish_reason': None}]}
+
+    result = _observe_redis_stream(monkeypatch, [first, _usage_only_chunk(90)])
+
+    assert len(result['writes']) == 2
+    assert result['streams'][0]['content'] == 'PART' * 500
+    assert result['streams'][0]['context_usage']['tokens'] == 90
 
 
 @pytest.mark.parametrize(

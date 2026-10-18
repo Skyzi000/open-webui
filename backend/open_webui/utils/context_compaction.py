@@ -2644,7 +2644,7 @@ async def _generate_summary(
 
 
 async def _stream_summary_payload(response: StreamingResponse) -> dict:
-    from open_webui.utils.middleware import handle_responses_streaming_event
+    from open_webui.utils.response import handle_responses_streaming_event
 
     iterator = response.body_iterator.__aiter__()
     parser = _SSEParser()
