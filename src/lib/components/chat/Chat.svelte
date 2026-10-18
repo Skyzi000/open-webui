@@ -1250,9 +1250,9 @@
 		contextReadySummaries = contextReadySummaries;
 
 		if (isContextUsageSnapshot(status?.context_usage)) {
-			const target = (
-				history.messages as Record<string, { context_usage?: ContextUsageSnapshot }>
-			)[messageId];
+			const target = (history.messages as Record<string, { context_usage?: ContextUsageSnapshot }>)[
+				messageId
+			];
 			if (target) {
 				target.context_usage = status.context_usage;
 				history = history;
@@ -1263,9 +1263,9 @@
 		}
 
 		if (status?.done) {
-			const summaryTarget = (
-				history.messages as Record<string, { contextSummary?: string }>
-			)[status?.message_id];
+			const summaryTarget = (history.messages as Record<string, { contextSummary?: string }>)[
+				status?.message_id
+			];
 			if (typeof status?.summary === 'string' && summaryTarget) {
 				summaryTarget.contextSummary = status.summary;
 				history = history;
@@ -3435,7 +3435,8 @@
 			Array.isArray(output) &&
 			output.some(
 				(item) =>
-					item?.type === 'open_webui:context_compaction' && item?.compaction_summary === readySummary
+					item?.type === 'open_webui:context_compaction' &&
+					item?.compaction_summary === readySummary
 			)
 		) {
 			delete contextReadySummaries[message.id];
@@ -5386,14 +5387,14 @@
 										bind:showCommands
 										bind:dragged
 										dropzoneId={messageInputDropzoneId}
-									chatId={$chatId}
-									{contextUsage}
-									{contextLiveState}
-									{contextCompactionEnabled}
-									{embedded}
-									compactHandler={handleManualCompact}
-									statusHandler={handleStatusCommand}
-									forkHandler={handleForkChat}
+										chatId={$chatId}
+										{contextUsage}
+										{contextLiveState}
+										{contextCompactionEnabled}
+										{embedded}
+										compactHandler={handleManualCompact}
+										statusHandler={handleStatusCommand}
+										forkHandler={handleForkChat}
 										{toolApprovalMode}
 										onToolApprovalModeChange={handleToolApprovalModeChange}
 										{generating}

@@ -853,15 +853,15 @@
 							</div>
 						{/if}
 
-					<div
-						bind:this={contentContainerElement}
-						class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
-						id="response-content-container"
-					>
-						{#if messageContextSummary}
-							<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
-						{/if}
-						{#if hasResponseContent && message.error !== true}
+						<div
+							bind:this={contentContainerElement}
+							class="w-full flex flex-col relative {edit ? 'hidden' : ''}"
+							id="response-content-container"
+						>
+							{#if messageContextSummary}
+								<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
+							{/if}
+							{#if hasResponseContent && message.error !== true}
 								<!-- always show message contents even if there's an error -->
 								<!-- unless message.error === true which is legacy error handling, where the error message is stored in message.content -->
 								<ContentRenderer

@@ -200,13 +200,13 @@
 			</div>
 		{/if}
 
-	<div class="chat-{message.role} w-full min-w-full">
-		{#if messageContextSummary}
-			<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
-		{/if}
+		<div class="chat-{message.role} w-full min-w-full">
+			{#if messageContextSummary}
+				<ContextCompactionDivider variant="checkpoint" summary={messageContextSummary} />
+			{/if}
 
-		{#if edit !== true}
-			{#if message.files}
+			{#if edit !== true}
+				{#if message.files}
 					<div
 						class="mb-1 w-full flex flex-col justify-end overflow-x-auto gap-1 flex-wrap"
 						dir={$settings?.chatDirection ?? 'auto'}
