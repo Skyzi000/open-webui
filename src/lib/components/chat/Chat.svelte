@@ -1558,6 +1558,7 @@
 					}
 				} else if (type === 'context_compaction') {
 					handleContextCompactionStatus(data, event.message_id);
+					return; // Patches history.messages directly; skip the trailing write-back.
 				} else if (type === 'chat:active') {
 					if (!data?.active) {
 						taskIds = null;
