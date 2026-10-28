@@ -159,4 +159,14 @@ describe('buildOutputDisplayItems compaction boundaries', () => {
 
 		expect(shapes(items)).toEqual(['detail_single', 'message']);
 	});
+
+	it('shows records written in the upstream shape as compaction points', () => {
+		const items = buildOutputDisplayItems([
+			functionCallItem('call-a', 'lookup'),
+			{ type: 'open_webui:context_compaction', id: 'cc_1', summary: 'UPSTREAM' },
+			messageItem('m1', 'answer')
+		]);
+
+		expect(shapes(items)).toEqual(['detail_single', 'checkpoint:UPSTREAM', 'message']);
+	});
 });

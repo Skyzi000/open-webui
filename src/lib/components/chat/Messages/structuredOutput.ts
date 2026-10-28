@@ -14,7 +14,7 @@ export type OutputItem = {
 	status?: string;
 	arguments?: unknown;
 	content?: OutputContentPart[];
-	summary?: OutputContentPart[];
+	summary?: OutputContentPart[] | string;
 	output?: OutputContentPart[];
 	files?: unknown;
 	embeds?: unknown;
@@ -397,7 +397,7 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 			});
 		}
 
-		if (item.type === 'open_webui:context_compaction') {
+		if (item.type === 'open_webui:context_compaction' && 'compaction_summary' in item) {
 			const adoptionSummary = item.compaction_summary;
 			if (typeof adoptionSummary === 'string' && adoptionSummary.trim()) {
 				flushDetails();
@@ -437,6 +437,17 @@ export function buildOutputDisplayItems(output: OutputItem[] = []): OutputDispla
 			if (token) {
 				currentDetailTokens.push(token);
 			}
+			return;
+		}
+
+		if (item.type === 'open_webui:context_compaction') {
+			flushDetails();
+			displayItems.push({
+				type: 'context_compaction',
+				id: item.id ?? `context-compaction-${index}`,
+				summary: typeof item.summary === 'string' ? item.summary : '',
+				variant: 'checkpoint'
+			});
 			return;
 		}
 
@@ -649,7 +660,7 @@ export function applyResponseStreamEvent(
 		if (!event.part) {
 			return nextOutput;
 		}
-		item.summary = [...(item.summary ?? [])];
+		item.summary = Array.isArray(item.summary) ? [...item.summary] : [];
 		const summaryIndex = event.summary_index ?? item.summary.length;
 		setPart(item.summary, summaryIndex, { ...event.part }, { type: 'summary_text', text: '' });
 		return nextOutput;
@@ -664,7 +675,7 @@ export function applyResponseStreamEvent(
 
 		if (deltaType === 'reasoning_summary_text') {
 			const summaryIndex = event.summary_index ?? 0;
-			item.summary = [...(item.summary ?? [])];
+			item.summary = Array.isArray(item.summary) ? [...item.summary] : [];
 			const part = ensurePart(item.summary, summaryIndex, { type: 'summary_text', text: '' });
 			part.text = appendDelta(part.text ?? '', event.delta);
 			return nextOutput;

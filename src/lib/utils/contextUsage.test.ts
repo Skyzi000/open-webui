@@ -170,6 +170,36 @@ describe('contextRingState', () => {
 });
 
 describe('applyContextCompactionEvent', () => {
+	it('drops a prepared summary that a newer one on the same branch replaced', () => {
+		const liveStates: Record<string, any> = { m0: 'compacting' };
+		const readySummaries: Record<string, string> = {};
+		const messages = {
+			m1: { parentId: null },
+			u2: { parentId: 'm1' },
+			m2: { parentId: 'u2' },
+			m3: { parentId: 'u2' }
+		};
+		const ready = (summary: string, messageId: string) =>
+			applyContextCompactionEvent(
+				liveStates,
+				readySummaries,
+				{
+					action: 'context_compaction',
+					description: 'Summary ready',
+					done: true,
+					phase: 'prefetch',
+					summary
+				},
+				messageId,
+				messages
+			);
+		ready('S1', 'm1');
+		ready('S2', 'm2');
+		ready('S3', 'm3');
+		expect(liveStates).toEqual({ m0: 'compacting', m2: 'ready', m3: 'ready' });
+		expect(readySummaries).toEqual({ m2: 'S2', m3: 'S3' });
+	});
+
 	it('clears the generating state after a failed prefetch without touching others', () => {
 		const liveStates: Record<string, any> = {};
 		const readySummaries: Record<string, string> = {};

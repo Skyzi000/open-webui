@@ -20,7 +20,7 @@ from open_webui.config import TIKTOKEN_ENCODING_NAME
 from open_webui.models.chat_messages import ChatMessages
 from open_webui.models.chats import Chats
 from open_webui.models.config import Config
-from open_webui.utils.chat_id import is_saved_chat_id
+from open_webui.utils.chat_id import is_saved_chat_id, is_temporary_chat_id
 from open_webui.utils.externalized_refs import RefEntry, can_externalize_refs, make_ref_entry, project_tool_refs
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import (
@@ -392,6 +392,18 @@ def _checkpoint_positions(
             if isinstance(summary, str) and summary.strip():
                 positions.append((message_index, output_index, summary.strip()))
     return positions
+
+
+def without_compaction_records(message: dict[str, Any]) -> dict[str, Any]:
+    marker_keys = {'contextSummary', 'context_summary'}
+    message = {key: value for key, value in message.items() if key not in marker_keys}
+    if isinstance(message.get('output'), list):
+        message['output'] = [
+            {key: value for key, value in item.items() if key not in marker_keys} if isinstance(item, dict) else item
+            for item in message['output']
+            if not (isinstance(item, dict) and item.get('type') == CONTEXT_COMPACTION_OUTPUT_TYPE)
+        ]
+    return message
 
 
 def restore_nested_checkpoint_markers(
@@ -1002,7 +1014,7 @@ async def _generate_checkpoint(
         source_messages = []
         checkpoint_message_id = None
     chat_id = metadata.get('chat_id')
-    if not checkpoint_message_id or not is_saved_chat_id(chat_id):
+    if not checkpoint_message_id or not (is_saved_chat_id(chat_id) or is_temporary_chat_id(chat_id)):
         raise RuntimeError('Context compaction checkpoint is not durable; provider request was not sent')
     summary_meta = await asyncio.to_thread(_summary_meta, source_messages, config['transient_patterns'])
     summary = await _generate_summary(
@@ -1025,6 +1037,9 @@ async def _generate_checkpoint(
 
 
 async def _save_checkpoint(chat_id: str, checkpoint_message_id: str, summary: str) -> None:
+    # A temporary chat has no rows; its client keeps the summary from the completion event.
+    if is_temporary_chat_id(chat_id):
+        return
     if not await ChatMessages.update_context_summary(chat_id, checkpoint_message_id, summary):
         raise RuntimeError('Context compaction checkpoint could not be saved; provider request was not sent')
 
@@ -1075,6 +1090,7 @@ async def _emit_compaction_status(
     phase: str | None = None,
     message_id: str | None = None,
     summary: str | None = None,
+    output_item_id: str | None = None,
 ) -> None:
     if not event_emitter:
         return
@@ -1091,6 +1107,8 @@ async def _emit_compaction_status(
         data['message_id'] = message_id
     if summary is not None:
         data['summary'] = summary
+    if output_item_id is not None:
+        data['output_item_id'] = output_item_id
     await event_emitter({'type': 'context_compaction', 'data': data})
 
 
@@ -1461,7 +1479,9 @@ async def _summarize_in_background(event_emitter, generation, metadata: dict, ca
                     item['contextSummary'] = summary
     except Exception:
         log.exception('Context compaction checkpoint prepared in the background could not be saved')
-    await _emit_compaction_status(event_emitter, 'Summary ready', True, phase='prefetch')
+    await _emit_compaction_status(
+        event_emitter, 'Summary ready', True, phase='prefetch', summary=summary, output_item_id=carrier.get('id')
+    )
     return summary
 
 
@@ -1780,16 +1800,28 @@ async def compact_transient_provider_payload(
         await _emit_compaction_status(event_emitter, 'Context compacted', True)
         return candidate
 
-    boundary = find_safe_compaction_boundary(projected_working, config['transient_patterns'], allow_tool_rounds=True)
+    # A guided regeneration's first send carries the revised reply and its instruction after the question, which stays the latest turn.
+    question = state.get('regeneration_question') if checkpoint_output is None else None
+    limit = next((index for index, message in enumerate(working) if message is question), None)
+    boundary = find_safe_compaction_boundary(
+        projected_working,
+        config['transient_patterns'],
+        allow_tool_rounds=True,
+        limit=limit,
+    )
     if not boundary:
-        latest_user = next(
-            (
-                index
-                for index in range(len(projected_working) - 1, -1, -1)
-                if projected_working[index].get('role') == 'user'
-                and not _is_transient_message(projected_working[index], config['transient_patterns'])
-            ),
-            0,
+        latest_user = (
+            limit
+            if limit is not None
+            else next(
+                (
+                    index
+                    for index in range(len(projected_working) - 1, -1, -1)
+                    if projected_working[index].get('role') == 'user'
+                    and not _is_transient_message(projected_working[index], config['transient_patterns'])
+                ),
+                0,
+            )
         )
         # The latest turn is the active input; only earlier history that cannot be cut blocks the send.
         if _has_new_compaction_content(projected_working[:latest_user], state):
@@ -2124,11 +2156,17 @@ async def start_completed_turn_compaction_prefetch(
 
     # The summary reads the turn as its first send carried it, which is the prefix the provider cached.
     canonical = state.get('canonical_body')
+    prefix_messages = canonical.get('messages') if isinstance(canonical, dict) else None
+    if isinstance(prefix_messages, list) and metadata.get('regeneration_message_id'):
+        # A guided regeneration's send carried the revised reply and its instruction after the question; they are off the branch.
+        question = state.get('regeneration_question')
+        end = next((index for index, message in enumerate(prefix_messages) if message is question), None)
+        if end is None:
+            return None
+        prefix_messages = prefix_messages[: end + 1]
     try:
         prefix_body = (
-            await _summary_prefix(state, canonical, canonical['messages'])
-            if isinstance(canonical, dict) and isinstance(canonical.get('messages'), list)
-            else None
+            await _summary_prefix(state, canonical, prefix_messages) if isinstance(prefix_messages, list) else None
         )
     except Exception:
         log.exception('Context compaction prefetch could not shape its prefix')
@@ -2460,9 +2498,10 @@ def find_safe_compaction_boundary(
     transient_patterns: tuple[re.Pattern[str], ...] = (),
     *,
     allow_tool_rounds: bool = False,
+    limit: int | None = None,
 ) -> int:
     """Return the latest user-turn boundary that keeps tool pairs intact; system messages never block a cut."""
-    target = len(messages) - 1
+    target = len(messages) - 1 if limit is None else limit
     events = []
     right_requested: Counter[str] = Counter()
     right_completed: Counter[str] = Counter()

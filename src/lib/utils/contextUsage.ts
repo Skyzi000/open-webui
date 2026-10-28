@@ -125,11 +125,32 @@ const isCompactionStatus = (value: unknown): value is CompactionStatus =>
 	value !== null &&
 	(value as CompactionStatus).action === 'context_compaction';
 
+export const markContextSummaryReady = (
+	liveStates: Record<string, ContextUsageLiveState>,
+	readySummaries: Record<string, string>,
+	messageId: string,
+	summary: unknown,
+	messages: Record<string, { parentId?: string | null }>
+): void => {
+	// A new summary becomes its branch's latest checkpoint, so one prepared earlier on that branch is never used.
+	for (let id = messages[messageId]?.parentId; id; id = messages[id]?.parentId) {
+		if (liveStates[id] === 'ready') {
+			delete liveStates[id];
+			delete readySummaries[id];
+		}
+	}
+	liveStates[messageId] = 'ready';
+	if (typeof summary === 'string') {
+		readySummaries[messageId] = summary;
+	}
+};
+
 export const applyContextCompactionEvent = (
 	liveStates: Record<string, ContextUsageLiveState>,
 	readySummaries: Record<string, string>,
 	status: unknown,
-	messageId: string
+	messageId: string,
+	messages: Record<string, { parentId?: string | null }> = {}
 ): void => {
 	if (!isCompactionStatus(status)) {
 		return;
@@ -159,10 +180,7 @@ export const applyContextCompactionEvent = (
 				// A failed prefetch stops generation without failing the chat.
 				delete liveStates[messageId];
 			} else {
-				liveStates[messageId] = 'ready';
-				if (typeof status.summary === 'string') {
-					readySummaries[messageId] = status.summary;
-				}
+				markContextSummaryReady(liveStates, readySummaries, messageId, status.summary, messages);
 			}
 		} else {
 			liveStates[messageId] = 'prefetching';

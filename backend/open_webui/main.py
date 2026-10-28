@@ -1225,12 +1225,6 @@ async def chat_completion(
         if not isinstance(model_controls, dict):
             raise HTTPException(400, 'Model control options must be keyed by model.')
         model_controls = {} if form_data.get('automation_id') else model_controls
-        if any(model_controls.values()) and user.role != 'admin':
-            permissions = await Config.get('user.permissions')
-            for permission in ('chat.controls', 'chat.params'):
-                if not await has_permission(user.id, permission, permissions):
-                    model_controls = {}
-                    break
         if missing_base_model and model_controls.get(model_id):
             raise HTTPException(400, 'Model control options cannot be applied to the fallback model.')
         if model_info_params or request_params:
@@ -1321,6 +1315,8 @@ async def chat_completion(
             )
         ):
             tool_servers = None
+        if tool_servers and not await Config.get('direct.integrations.enable', False):
+            tool_servers = None
 
         automation_id = form_data.pop('automation_id', None)
         forced_by_context = bool(automation_id or chat_id.startswith('channel:'))
@@ -1349,6 +1345,7 @@ async def chat_completion(
             'user_message': user_message,
             'user_message_id': user_message.get('id') if user_message else None,
             'assistant_message_id': form_data.pop('assistant_message_id', None),
+            'regeneration_message_id': form_data.pop('regeneration_message_id', None),
             'session_id': form_data.pop('session_id', None),
             'automation_id': automation_id,
             'folder_id': form_data.pop('folder_id', None),
@@ -2423,6 +2420,7 @@ async def get_app_config(request: Request):
         'ui.enable_password_change_form',
         'direct.enable',
         'direct.integrations.enable',
+        'terminal_server.connections',
         'folders.enable',
         'folders.max_file_count',
         'channels.enable',
@@ -2440,6 +2438,9 @@ async def get_app_config(request: Request):
         'code_interpreter.enable',
         'image_generation.enable',
         'task.autocomplete.enable',
+        'task.title.enable',
+        'task.follow_up.enable',
+        'task.tags.enable',
         'ui.enable_community_sharing',
         'ui.enable_message_rating',
         'ui.enable_user_webhooks',
@@ -2447,9 +2448,11 @@ async def get_app_config(request: Request):
         'google_drive.enable',
         'onedrive.enable',
         'memories.enable',
+        'subagents.enable',
         'ui.default_models',
         'ui.default_pinned_models',
         'ui.default_interface_settings',
+        'ui.visibility',
         'ui.i18n',
         'ui.prompt_suggestions',
         'ui.prompt_suggestions_i18n',
@@ -2520,6 +2523,11 @@ async def get_app_config(request: Request):
                     'enable_tools': ENABLE_TOOLS,
                     'enable_functions': ENABLE_FUNCTIONS,
                     'enable_tool_servers': ENABLE_TOOL_SERVERS,
+                    'enable_terminal_servers': ENABLE_TOOL_SERVERS
+                    and any(
+                        connection.get('enabled', True)
+                        for connection in config.get('terminal_server.connections') or []
+                    ),
                     'enable_folders': config.get('folders.enable'),
                     'folder_max_file_count': config.get('folders.max_file_count'),
                     'enable_channels': config.get('channels.enable'),
@@ -2537,6 +2545,9 @@ async def get_app_config(request: Request):
                     'enable_code_interpreter': config.get('code_interpreter.enable'),
                     'enable_image_generation': config.get('image_generation.enable'),
                     'enable_autocomplete_generation': config.get('task.autocomplete.enable'),
+                    'enable_title_generation': config.get('task.title.enable'),
+                    'enable_follow_up_generation': config.get('task.follow_up.enable'),
+                    'enable_tags_generation': config.get('task.tags.enable'),
                     'enable_community_sharing': config.get('ui.enable_community_sharing'),
                     'enable_message_rating': config.get('ui.enable_message_rating'),
                     'enable_user_webhooks': config.get('ui.enable_user_webhooks'),
@@ -2547,6 +2558,7 @@ async def get_app_config(request: Request):
                     'enable_google_drive_integration': config.get('google_drive.enable'),
                     'enable_onedrive_integration': config.get('onedrive.enable'),
                     'enable_memories': config.get('memories.enable'),
+                    'enable_subagents': config.get('subagents.enable'),
                     **(
                         {
                             'enable_onedrive_personal': ENABLE_ONEDRIVE_PERSONAL,
@@ -2607,6 +2619,7 @@ async def get_app_config(request: Request):
                 },
                 'ui': {
                     'default_interface_settings': config.get('ui.default_interface_settings'),
+                    'visibility': config.get('ui.visibility'),
                     'pending_user_overlay_title': config.get('ui.pending_user_overlay_title'),
                     'pending_user_overlay_content': config.get('ui.pending_user_overlay_content'),
                     'response_watermark': config.get('ui.watermark'),
@@ -3203,6 +3216,8 @@ async def check_db_health():
 mimetypes.add_type('text/javascript', '.js')
 mimetypes.add_type('text/javascript', '.mjs')
 mimetypes.add_type('application/wasm', '.wasm')
+# Python before 3.13 only knows .webp from /etc/mime.types, which the Docker image does not ship
+mimetypes.add_type('image/webp', '.webp')
 
 # Serve build-time static assets (CSS, JS, images, favicon, etc.)
 app.mount('/static', StaticFiles(directory=STATIC_DIR), name='static')

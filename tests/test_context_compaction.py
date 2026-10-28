@@ -3581,6 +3581,279 @@ def test_summary_request_repeats_the_prefix_the_chat_sent(monkeypatch, backgroun
         assert (during['messages'], during['tools']) == (before['messages'], before['tools'])
 
 
+def test_temporary_chat_hands_its_summary_to_the_client_and_reuses_it(monkeypatch):
+    save_checkpoint = compaction._save_checkpoint
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    socket_main = importlib.import_module('open_webui.socket.main')
+    events = []
+
+    async def record(event):
+        events.append(event)
+
+    async def emitter(*_args, **_kwargs):
+        return record
+
+    async def no_rows(*_args, **_kwargs):
+        raise AssertionError('a temporary chat has no stored rows')
+
+    monkeypatch.setattr(socket_main, 'get_event_emitter', emitter)
+    monkeypatch.setattr(compaction, '_save_checkpoint', save_checkpoint)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', no_rows)
+    current['config'] = _quiet_config(token_threshold=600, token_cap=600)
+    client_history = [
+        {key: value for key, value in message.items() if key not in {'parentId', 'contextSummary'}}
+        for message in _PREFIX_HISTORY
+    ]
+
+    def send(messages):
+        sent, _metadata, _events, _state = asyncio.run(
+            _run_payload_leg(
+                middleware,
+                copy.deepcopy(messages),
+                seeded_metadata={'chat_id': 'temporary:t1', 'user_message_id': 'u3'},
+                assistant_message_id=None,
+                form_tool_ids=['lookup'],
+            )
+        )
+        return [message['content'] for message in _provider_messages(sent['messages'])]
+
+    first = send(client_history)
+    handed = [event['data'] for event in events if 'summary' in event.get('data', {})]
+
+    assert len(current['summaries']) == 1
+    assert [(data['message_id'], data['summary']) for data in handed] == [('u3', 'summary')]
+    assert '<![CDATA[summary]]>' in first[1]
+    assert first[2:] == ['latest question']
+
+    for message in client_history:
+        if message['id'] == handed[0]['message_id']:
+            message['contextSummary'] = handed[0]['summary']
+    assert send(client_history) == first
+    assert len(current['summaries']) == 1
+
+
+@pytest.mark.parametrize('chat_id', ['chat', 'temporary:t1'])
+def test_guided_regeneration_keeps_the_question_its_reply_answered(monkeypatch, chat_id):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    revised = {
+        'id': 'a3',
+        'parentId': 'u3',
+        'role': 'assistant',
+        'content': 'answer to revise',
+        'output': [
+            {'type': compaction.CONTEXT_COMPACTION_OUTPUT_TYPE, 'id': 'cc_1', 'compaction_summary': 'OLD'},
+            {
+                'type': 'message',
+                'id': 'msg_1',
+                'contextSummary': 'LOOP',
+                'content': [{'type': 'output_text', 'text': 'answer to revise'}],
+            },
+        ],
+        'contextSummary': 'TURN',
+    }
+
+    async def stored_message(_chat_id, message_id):
+        return copy.deepcopy(revised) if message_id == 'a3' else None
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', stored_message)
+    current['config'] = _quiet_config()
+    client_history = [
+        *[{key: value for key, value in message.items() if key != 'parentId'} for message in _PREFIX_HISTORY],
+        {'role': 'assistant', 'model': 'model', 'output': copy.deepcopy(revised['output'])},
+    ]
+    sent, metadata, _events, state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            client_history if chat_id.startswith('temporary:') else [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'chat_id': chat_id, 'user_message_id': 'u3', 'regeneration_message_id': 'a3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            extra_form={'regeneration_prompt': 'make it shorter'},
+        )
+    )
+    contents = [message['content'] for message in _provider_messages(sent['messages'])]
+
+    assert contents[-3:] == ['latest question', 'answer to revise|F|', 'make it shorter']
+    assert not any('TURN' in content or 'LOOP' in content for content in contents if isinstance(content, str))
+    # Below the threshold the request reads its latest user message as Core does, instruction included.
+    assert metadata['base_user_prompt'] == 'make it shorter'
+    record = compaction.context_compaction_adoption_record(state, [], state['checkpoint_messages'])
+    assert record is not None and record['compaction_summary'] == 'OLD'
+
+
+@pytest.mark.parametrize(('crossed_by', 'revised', 'threshold'), [('messages', 200, 900), ('tools', 100, 1200)])
+def test_compacting_a_guided_regeneration_keeps_the_question_and_the_revised_reply(
+    monkeypatch, crossed_by, revised, threshold
+):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+
+    async def stored_message(_chat_id, message_id):
+        return (
+            {'id': 'a3', 'role': 'assistant', 'content': 'answer to revise ' * revised} if message_id == 'a3' else None
+        )
+
+    async def get_tools(*_args, **_kwargs):
+        spec = {'name': 'lookup', 'description': 'tool specification ' * 1000, 'parameters': {'type': 'object'}}
+        return {'lookup': {'spec': spec, 'callable': lambda: None}}
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', stored_message)
+    if crossed_by == 'tools':
+        monkeypatch.setattr(middleware, 'get_tools', get_tools)
+        current['history'] = [
+            {'id': 'u0', 'parentId': None, 'role': 'user', 'content': 'previous question'},
+            {'id': 'a0', 'parentId': 'u0', 'role': 'assistant', 'content': 'previous answer'},
+            {'id': 'u3', 'parentId': 'a0', 'role': 'user', 'content': 'latest question'},
+        ]
+    current['config'] = _quiet_config(token_threshold=threshold, token_cap=threshold)
+    sent, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3', 'regeneration_message_id': 'a3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            extra_form={'regeneration_prompt': 'make it shorter'},
+        )
+    )
+    contents = [message['content'] for message in _provider_messages(sent['messages'])]
+
+    assert len(current['summaries']) == 1
+    assert contents[-3:] == ['latest question', 'answer to revise ' * revised + '|F|', 'make it shorter']
+
+
+def test_compacting_a_guided_regeneration_keeps_the_tool_round_of_the_revised_reply(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    revised_output = [
+        {'type': 'function_call', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}', 'status': 'completed'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'call-1',
+            'output': [{'type': 'input_text', 'text': 'tool output ' * 50}],
+            'status': 'completed',
+        },
+        {'type': 'message', 'id': 'msg_1', 'content': [{'type': 'output_text', 'text': 'answer to revise'}]},
+    ]
+
+    async def stored_message(_chat_id, message_id):
+        if message_id == 'a3':
+            return {'id': 'a3', 'role': 'assistant', 'content': 'answer to revise', 'output': revised_output}
+        return None
+
+    async def get_tools(*_args, **_kwargs):
+        spec = {'name': 'lookup', 'description': 'tool specification ' * 1000, 'parameters': {'type': 'object'}}
+        return {'lookup': {'spec': spec, 'callable': lambda: None}}
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', stored_message)
+    monkeypatch.setattr(middleware, 'get_tools', get_tools)
+    current['history'] = [
+        {'id': 'u0', 'parentId': None, 'role': 'user', 'content': 'previous question'},
+        {'id': 'a0', 'parentId': 'u0', 'role': 'assistant', 'content': 'previous answer'},
+        {'id': 'u3', 'parentId': 'a0', 'role': 'user', 'content': 'latest question'},
+    ]
+    current['config'] = _quiet_config(token_threshold=1200, token_cap=1200)
+    sent, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3', 'regeneration_message_id': 'a3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            extra_form={'regeneration_prompt': 'make it shorter'},
+        )
+    )
+    tail = [(message['role'], message.get('content')) for message in _provider_messages(sent['messages'])[2:]]
+
+    assert len(current['summaries']) == 1
+    assert tail[0] == ('user', 'latest question')
+    assert [role for role, _content in tail[1:]] == ['assistant', 'tool', 'assistant', 'user']
+    assert tail[-2:] == [('assistant', 'answer to revise|F|'), ('user', 'make it shorter')]
+
+
+@pytest.mark.parametrize('with_tool_round', [False, True])
+def test_guided_regeneration_of_the_first_answer_is_sent_over_the_threshold(monkeypatch, with_tool_round):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    revised = {'id': 'a3', 'role': 'assistant', 'content': 'answer to revise'}
+    if with_tool_round:
+        revised['output'] = [
+            {'type': 'function_call', 'call_id': 'call-1', 'name': 'lookup', 'arguments': '{}', 'status': 'completed'},
+            {
+                'type': 'function_call_output',
+                'call_id': 'call-1',
+                'output': [{'type': 'input_text', 'text': 'tool output ' * 50}],
+                'status': 'completed',
+            },
+            {'type': 'message', 'id': 'msg_1', 'content': [{'type': 'output_text', 'text': 'answer to revise'}]},
+        ]
+
+    async def stored_message(_chat_id, message_id):
+        return revised if message_id == 'a3' else None
+
+    async def get_tools(*_args, **_kwargs):
+        spec = {'name': 'lookup', 'description': 'tool specification ' * 1000, 'parameters': {'type': 'object'}}
+        return {'lookup': {'spec': spec, 'callable': lambda: None}}
+
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', stored_message)
+    monkeypatch.setattr(middleware, 'get_tools', get_tools)
+    current['history'] = [{'id': 'u3', 'parentId': None, 'role': 'user', 'content': 'latest question'}]
+    current['config'] = _quiet_config(token_threshold=1200, token_cap=1200)
+    sent, _metadata, _events, _state = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3', 'regeneration_message_id': 'a3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            extra_form={'regeneration_prompt': 'make it shorter'},
+        )
+    )
+    tail = [(message['role'], message.get('content')) for message in _provider_messages(sent['messages'])[1:]]
+
+    assert current['summaries'] == []
+    assert tail[0] == ('user', 'latest question')
+    assert [role for role, _content in tail[1:]] == [
+        *(['assistant', 'tool'] if with_tool_round else []),
+        'assistant',
+        'user',
+    ]
+    assert tail[-2:] == [('assistant', 'answer to revise|F|'), ('user', 'make it shorter')]
+
+
+def test_summary_after_a_guided_regeneration_reads_only_the_branch(monkeypatch):
+    middleware, current = _shared_prefix_harness(monkeypatch)
+    _turn_end_harness(monkeypatch, middleware)
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def stored_message(_chat_id, message_id):
+        return {'id': 'a3', 'role': 'assistant', 'content': 'answer to revise'} if message_id == 'a3' else None
+
+    monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
+    monkeypatch.setattr(middleware.Chats, 'get_message_by_id_and_message_id', stored_message)
+    current['config'] = _quiet_config(soft_trigger_ratio=0.5, token_threshold=10_000, token_cap=10_000)
+
+    async def run():
+        _sent, _metadata, _events, state = await _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u3', 'regeneration_message_id': 'a3'},
+            assistant_message_id=None,
+            form_tool_ids=['lookup'],
+            extra_form={'regeneration_prompt': 'make it shorter'},
+        )
+        ctx = _turn_end_ctx(state, noop)
+        ctx['metadata'].update({'user_message_id': 'u3', 'regeneration_message_id': 'a3'})
+        await middleware.background_tasks_handler(ctx)
+        await state['completed_prefetch_task']
+
+    asyncio.run(run())
+
+    assert len(current['summaries']) == 1
+    read = [message.get('content') for message in current['summaries'][0]['messages']]
+    assert read[-2] == 'latest question' and 'second answer ' * 150 + '|F|' in read
+    assert not any('answer to revise' in content or 'make it shorter' in content for content in read[:-1])
+
+
 @pytest.mark.parametrize('background', [False, True])
 def test_summary_repeats_the_previous_turn_when_the_filter_marks_the_last_question(monkeypatch, background):
     async def mark_last_question(body, __metadata__=None):
@@ -8147,6 +8420,11 @@ def test_tool_loop_background_summary_starts_on_round_two_and_shows_once_adopted
     ctx['compaction_state']['config']['soft_trigger_ratio'] = 0.5
     ctx['event_emitter'] = current['emitter']
 
+    async def same_channel(_metadata):
+        return current['emitter']
+
+    monkeypatch.setattr(importlib.import_module('open_webui.socket.main'), 'get_event_emitter', same_channel)
+
     async def run():
         gate['release'] = asyncio.Event()
         await middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx)
@@ -8177,6 +8455,13 @@ def test_tool_loop_background_summary_starts_on_round_two_and_shows_once_adopted
         if event.get('type') == 'chat:completion' and isinstance(event.get('data', {}).get('output'), list)
     ]
     assert any(_adoption_shape(output) == applied for output in shown)
+    ready = [
+        event['data']
+        for event in current['emitted']
+        if event.get('type') == 'context_compaction' and event['data'].get('description') == 'Summary ready'
+    ]
+    carrier_id = current['saved'][-1]['output'][0]['id']
+    assert [(data['summary'], data['output_item_id']) for data in ready] == [('S1', carrier_id)]
 
 
 @pytest.mark.parametrize('over_threshold', [False, True])
@@ -9229,6 +9514,37 @@ def test_cancelled_stream_keeps_adoption_record(monkeypatch):
         )
 
 
+def test_stop_while_the_adoption_record_is_shown_still_cancels(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {'enable': True, 'token_threshold': 100, 'token_cap': 100, 'soft_trigger_ratio': 0},
+        'checkpoint_messages': [{'id': 'u1', 'role': 'user', 'content': 'start'}],
+        'summary': 'S1',
+        'summary_message_content': '<auto_compaction_context>S1</auto_compaction_context>',
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+
+    async def stop_on_adoption(event):
+        if any(
+            item.get('type') == compaction.CONTEXT_COMPACTION_OUTPUT_TYPE for item in event['data'].get('output', [])
+        ):
+            raise asyncio.CancelledError()
+
+    ctx['event_emitter'] = stop_on_adoption
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(middleware.streaming_chat_response_handler(current['text_response']('done'), ctx))
+
+
 def test_non_stream_response_prepends_adoption_record(monkeypatch):
     middleware = importlib.import_module('open_webui.utils.middleware')
     emitted = []
@@ -9261,8 +9577,8 @@ def test_non_stream_response_prepends_adoption_record(monkeypatch):
         ],
     }
     ctx = {
-        'request': SimpleNamespace(),
-        'form_data': {},
+        'request': SimpleNamespace(state=SimpleNamespace()),
+        'form_data': {'model': 'model'},
         'user': SimpleNamespace(role='admin'),
         'metadata': metadata,
         'events': [],
@@ -9321,7 +9637,7 @@ def test_copies_of_a_chat_keep_the_checkpoints_only_its_rows_hold(tmp_path, monk
     for name in ('require_chat_import_permission', 'publish_event'):
         monkeypatch.setattr(chats_router, name, _allow_chat_creation)
     monkeypatch.setattr(chats_router, 'can_read_shared_chat', allowed)
-    monkeypatch.setattr(chats_router, 'filter_allowed_access_grants', no_grants)
+    monkeypatch.setattr(chats_router, 'validate_access_grants', no_grants)
     monkeypatch.setattr(chats_router.AccessGrants, 'set_access_grants', no_grants)
     monkeypatch.setattr(chats_router.Config, 'get', _allow_chat_creation)
     monkeypatch.setattr(socket_main, 'refresh_chat_access', _allow_chat_creation)

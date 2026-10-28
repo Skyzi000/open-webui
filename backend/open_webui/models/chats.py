@@ -851,6 +851,18 @@ class ChatTable:
         except Exception:
             return
 
+    async def update_chat_params_by_id(self, id: str, params: dict) -> ChatModel | None:
+        async with self._chat_transaction(id) as (_, chat):
+            if chat is None:
+                return None
+
+            stored = chat.chat or {}
+            chat.chat = {
+                **stored,
+                'params': self._clean_null_bytes({**(stored.get('params') or {}), **params}),
+            }
+            return ChatModel.model_validate(chat)
+
     async def update_chat_variables_by_id(
         self,
         id: str,
@@ -1587,7 +1599,7 @@ class ChatTable:
     async def archive_all_chats_by_user_id(self, user_id: str, db: AsyncSession | None = None) -> bool:
         try:
             async with get_async_db_context(db) as session:
-                await session.execute(update(Chat).filter_by(user_id=user_id).values(archived=True))
+                await session.execute(update(Chat).filter_by(user_id=user_id).values(archived=True, folder_id=None))
                 await session.commit()
                 return True
         except Exception:
@@ -1802,6 +1814,13 @@ class ChatTable:
 
             result = await session.execute(stmt)
             return [meta for meta in result.scalars().all() if isinstance(meta, dict)]
+
+    async def get_owner_ids_by_chat_ids(self, chat_ids: list[str], db: AsyncSession | None = None) -> dict[str, str]:
+        if not chat_ids:
+            return {}
+        async with get_async_db_context(db) as session:
+            result = await session.execute(select(Chat.id, Chat.user_id).filter(Chat.id.in_(chat_ids)))
+            return dict(result.all())
 
     async def get_chats_by_model_id(
         self,
@@ -2541,7 +2560,8 @@ class ChatTable:
                 chat = await session.get(Chat, id)
                 chat.folder_id = folder_id
                 chat.updated_at = int(time.time())
-                chat.last_read_at = int(time.time())
+                if chat.user_id == user_id:
+                    chat.last_read_at = int(time.time())
                 chat.pinned = False
                 if folder_id is not None:
                     # Folder listings only show unarchived chats, so moving an archived

@@ -34,7 +34,9 @@
 	export let canTemporary: boolean | (() => boolean) = false;
 	export let temporaryEnabled: boolean | (() => boolean) = false;
 	export let hasChatContent = false;
+	export let canCreateSkill: boolean | (() => boolean) = false;
 	export let contextUsage = null;
+	export let fileUploadEnabled: boolean | (() => boolean) = true;
 
 	$: compactAvailable = typeof canCompact === 'function' ? canCompact() : canCompact;
 	$: isCompactDisabled =
@@ -45,6 +47,8 @@
 	$: temporaryAvailable = typeof canTemporary === 'function' ? canTemporary() : canTemporary;
 	$: isTemporaryEnabled =
 		typeof temporaryEnabled === 'function' ? temporaryEnabled() : temporaryEnabled;
+	$: createSkillAvailable =
+		typeof canCreateSkill === 'function' ? canCreateSkill() : canCreateSkill;
 	$: resolvedContextUsage = typeof contextUsage === 'function' ? contextUsage() : contextUsage;
 	$: contextHasThreshold = Number(resolvedContextUsage?.threshold) > 0;
 	$: contextPercent =
@@ -54,6 +58,8 @@
 					Math.round((resolvedContextUsage.tokens / resolvedContextUsage.threshold) * 100)
 				)
 			: null;
+	$: isFileUploadEnabled =
+		typeof fileUploadEnabled === 'function' ? fileUploadEnabled() : fileUploadEnabled;
 
 	let suggestionElement: any = null;
 	let filteredItems: any[] = [];
@@ -117,6 +123,7 @@
 					{contextPercent}
 					{contextHasThreshold}
 					{hasChatContent}
+					canCreateSkill={createSkillAvailable}
 					onSelect={(e) => {
 						const { type, data } = e;
 
@@ -168,6 +175,7 @@
 				<Knowledge
 					bind:this={suggestionElement}
 					{query}
+					fileUploadEnabled={isFileUploadEnabled}
 					bind:filteredItems
 					onSelect={(e) => {
 						const { type, data } = e;
@@ -193,6 +201,7 @@
 				<AtCommands
 					bind:this={suggestionElement}
 					{query}
+					fileUploadEnabled={isFileUploadEnabled}
 					bind:filteredItems
 					onSelect={(e) => {
 						const { type, data } = e;

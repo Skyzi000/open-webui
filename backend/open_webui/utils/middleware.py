@@ -86,8 +86,9 @@ from open_webui.utils.access_control import has_permission
 from open_webui.utils.access_control.files import get_owner_accessible_folder_files
 from open_webui.utils.access_control.folders import has_folder_access
 from open_webui.utils.ask_user import stage_ask_user_tool_calls
+from open_webui.utils.audit import log_model_usage
 from open_webui.utils.chat import generate_chat_completion
-from open_webui.utils.chat_id import is_saved_chat_id
+from open_webui.utils.chat_id import is_saved_chat_id, is_temporary_chat_id
 from open_webui.utils.code_interpreter import execute_code_jupyter
 from open_webui.utils.context_compaction import (
     CONTEXT_COMPACTION_TRANSIENT_MARKER_KEY,
@@ -109,6 +110,7 @@ from open_webui.utils.context_compaction import (
     restore_nested_checkpoint_markers,
     set_summary_history_ref,
     start_completed_turn_compaction_prefetch,
+    without_compaction_records,
 )
 from open_webui.utils.externalized_refs import (
     REF_EXEC_TOOL_NAME,
@@ -1167,9 +1169,10 @@ async def chat_completion_tools_handler(
                     tool_type = tool.get('type', '')
                     direct_tool = tool.get('direct', False)
 
-                    spec = tool.get('spec', {})
-                    allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
-                    tool_function_params = {k: v for k, v in tool_function_params.items() if k in allowed_params}
+                    if tool_type != 'mcp':
+                        spec = tool.get('spec', {})
+                        allowed_params = spec.get('parameters', {}).get('properties', {}).keys()
+                        tool_function_params = {k: v for k, v in tool_function_params.items() if k in allowed_params}
 
                     if tool.get('direct', False):
                         tool_result = await event_caller(
@@ -2617,12 +2620,25 @@ async def process_chat_payload(
                     if metadata.get('tool_approval_resume') == 'tools' or pending_tool_calls(output):
                         pending_assistant_message = assistant_message
 
+            # Guided regeneration: show the model the reply it is asked to revise.
+            regeneration_message_id = metadata.get('regeneration_message_id')
+            if regeneration_message_id:
+                regenerated_message = await Chats.get_message_by_id_and_message_id(chat_id, regeneration_message_id)
+                if regenerated_message and (regenerated_message.get('content') or regenerated_message.get('output')):
+                    db_messages.append({k: v for k, v in regenerated_message.items() if k in MESSAGE_REPLAY_KEYS})
+
             # DB history replaces the request's messages, so carry its first system message wherever it sits.
             system_message = next((m for m in form_data.get('messages', []) if m.get('role') == 'system'), None)
             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
             keep_tool_refs = True
 
-    if is_saved_chat_id(chat_id) and user_message_id:
+    messages = form_data.get('messages') or []
+    if metadata.get('regeneration_message_id') and messages and messages[-1].get('role') == 'assistant':
+        # The reply being revised is not on this branch; its compaction records would summarize away
+        # the question it answered and hide where the new reply starts using the summary.
+        messages[-1] = without_compaction_records(messages[-1])
+
+    if (is_saved_chat_id(chat_id) or is_temporary_chat_id(chat_id)) and user_message_id:
         form_data['messages'], compaction_state = await _prepare_compaction_or_default(
             form_data.get('messages', []), metadata
         )
@@ -2645,7 +2661,8 @@ async def process_chat_payload(
     form_data['messages'] = inject_message_file_images(form_data.get('messages', []))
 
     if regeneration_prompt:
-        form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
+        # The instruction is not a turn on the branch; compaction must not cut at it.
+        form_data['messages'].append({'role': 'user', 'content': regeneration_prompt, 'meta': {'internal': True}})
 
     # Compact the full chain, but prepare history separately from the response being resumed.
     if pending_assistant_message is not None:
@@ -2966,7 +2983,7 @@ async def process_chat_payload(
     # Otherwise, save any tools that filter inlets added for merging later.
     inlet_filter_tools = None if payload_tools is not None else form_data.get('tools', None)
 
-    # Selected and mentioned skills get bounded content; other skills remain available through view_skill.
+    # Mentions always load instructions; selected skills can optionally load through view_skill.
     chat_context = metadata.get('chat_context') or {}
     metadata['chat_context'] = chat_context
     skill_versions = chat_context.setdefault('skill_versions', {})
@@ -2975,6 +2992,8 @@ async def process_chat_payload(
     )
     activated_skill_ids = set(form_data.pop('skill_ids', None) or []) | mentioned_skill_ids
     skill_ids = sorted(activated_skill_ids | set(model.get('info', {}).get('meta', {}).get('skillIds', [])))
+    if payload_tools is None and await Config.get('skills.lazy_loading.enable', False):
+        activated_skill_ids = mentioned_skill_ids
     available_skills = []
     terminal_skills = []
     if is_note_chat:
@@ -3460,12 +3479,15 @@ async def process_chat_payload(
     cut_id = (compaction_state.get('prefetch_cut_message') or {}).get('id')
     planned = compaction_state.get('planned_compaction') or []
     planned_ids = {cut.get('id'): index for index, (cut, _) in enumerate(planned)}
+    question_id = metadata.get('user_message_id') if metadata.get('regeneration_message_id') else None
     for message in form_data.get('messages', []):
         # A pipeline filter returns rebuilt messages, so the cuts chosen before assembly are found again by id before ids go.
         if cut_id is not None and message.get('id') == cut_id:
             compaction_state['prefetch_cut_message'] = message
         if (index := planned_ids.get(message.get('id'))) is not None:
             planned[index] = (message, planned[index][1])
+        if question_id is not None and message.get('id') == question_id:
+            compaction_state['regeneration_question'] = message
         message.pop('id', None)
 
     # Check if file context extraction is enabled for this model (default True)
@@ -3702,8 +3724,10 @@ async def execute_tool_call(form_data, metadata, event_caller, tool_call):
         return params, f'Error: Tool "{name}" not found.', None, None, False
     tool_type = tool.get('type', '')
     direct_tool = tool.get('direct', False)
-    allowed_params = tool.get('spec', {}).get('parameters', {}).get('properties', {}).keys()
-    params = {key: value for key, value in params.items() if key in allowed_params}
+    # MCP servers validate their own arguments
+    if tool_type != 'mcp':
+        allowed_params = tool.get('spec', {}).get('parameters', {}).get('properties', {}).keys()
+        params = {key: value for key, value in params.items() if key in allowed_params}
 
     try:
         if (
@@ -4601,6 +4625,16 @@ async def non_streaming_chat_response_handler(response, ctx):
     if response_data is None:
         return response
 
+    usage = response_data.get('usage') or {}
+    timings = response_data.get('timings') or {}
+    if isinstance(usage, dict) and isinstance(timings, dict):
+        log_model_usage(
+            request,
+            user,
+            response_data.get('selected_model_id') or ctx['form_data']['model'],
+            {**usage, **timings},
+        )
+
     chat_id = metadata.get('chat_id') or ''
     save_to_chat = is_saved_chat_id(chat_id)
     continuing = bool(metadata.get('assistant_message_id'))
@@ -4856,7 +4890,6 @@ async def streaming_chat_response_handler(response, ctx):
     # and pyodide code interpreter. Server-side tools work without it.
     if event_emitter:
         task_id = str(uuid4())  # Create a unique task ID.
-        model_id = form_data.get('model', '')
 
         async def forward_continuation(candidate):
             response = await generate_chat_completion(
@@ -5428,9 +5461,10 @@ async def streaming_chat_response_handler(response, ctx):
                             },
                         )
 
-                async def stream_body_handler(response, form_data):
+                async def stream_body_handler(response, current_form_data):
                     nonlocal usage
                     nonlocal response_usage
+                    nonlocal current_usage
                     nonlocal finish_reason
                     nonlocal output
                     nonlocal prior_output
@@ -5438,6 +5472,8 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal stream_size
 
                     response_tool_calls = []
+                    current_usage = {}
+                    form_data['model'] = current_form_data['model']
 
                     delta_count = 0
                     delta_chunk_size = max(
@@ -5534,7 +5570,7 @@ async def streaming_chat_response_handler(response, ctx):
                         )
                         stream_size = 0
 
-                    filter_extra_params = {'__body__': form_data, **extra_params} if filter_functions else None
+                    filter_extra_params = {'__body__': current_form_data, **extra_params} if filter_functions else None
 
                     # Persist the confirmed snapshot (and any prior output) before
                     # the first chunk so an in-progress reload sees the send state.
@@ -5594,13 +5630,13 @@ async def streaming_chat_response_handler(response, ctx):
                                     await event_emitter(data.get('event', {}))
 
                                 if 'selected_model_id' in data:
-                                    model_id = data['selected_model_id']
+                                    form_data['model'] = data['selected_model_id']
                                     if save_to_chat:
                                         await Chats.upsert_message_to_chat_by_id_and_message_id(
                                             metadata['chat_id'],
                                             metadata['message_id'],
                                             {
-                                                'selectedModelId': model_id,
+                                                'selectedModelId': form_data['model'],
                                             },
                                             touch=False,
                                         )
@@ -5666,6 +5702,7 @@ async def streaming_chat_response_handler(response, ctx):
 
                                         # Normalize and capture usage for DB persistence
                                         if response_metadata.get('usage'):
+                                            current_usage = response_metadata['usage']
                                             usage = merge_usage(usage, response_metadata['usage'])
                                             raw_single_usage = response_metadata['usage']
                                             single_usage = normalize_usage(raw_single_usage)
@@ -5721,6 +5758,7 @@ async def streaming_chat_response_handler(response, ctx):
                                     raw_usage = data.get('usage', {}) or {}
                                     raw_usage.update(data.get('timings', {}))  # llama.cpp
                                     if raw_usage:
+                                        current_usage = raw_usage
                                         usage = merge_usage(usage, raw_usage)
                                         single_usage = normalize_usage(raw_usage)
                                         # Adopt the latest single-response usage only when the
@@ -6375,12 +6413,15 @@ async def streaming_chat_response_handler(response, ctx):
                             tool_calls.append(_split_tool_calls(responses_api_tool_calls))
 
                     await save_current_response_stream()
+                    return normalize_usage(current_usage)
 
                 output_start = len(prior_output)
+                current_usage = None
                 try:
                     await append_adoption_record()
-                    await stream_body_handler(response, form_data)
+                    current_usage = await stream_body_handler(response, form_data)
                 finally:
+                    log_model_usage(request, user, form_data['model'], current_usage)
                     if response.background:
                         await response.background()
 
@@ -6706,7 +6747,7 @@ async def streaming_chat_response_handler(response, ctx):
                         )
                         standalone_body = {
                             **continuation_body,
-                            'model': model_id,
+                            'model': form_data['model'],
                             'stream': True,
                             'metadata': metadata,
                             'messages': [*continuation_body['messages'], *continuation_messages],
@@ -6727,8 +6768,8 @@ async def streaming_chat_response_handler(response, ctx):
                             user,
                             standalone_body,
                             metadata,
-                            model_id,
-                            ctx['compaction_state'].get('models') or {model_id: model},
+                            form_data['model'],
+                            ctx['compaction_state'].get('models') or {form_data['model']: model},
                             ctx['compaction_state'],
                             **checkpoint,
                             projected_messages=snapshot,
@@ -6775,7 +6816,10 @@ async def streaming_chat_response_handler(response, ctx):
                             continuation_body = standalone_body
                             start_next_response()
                             await append_adoption_record()
-                            await stream_body_handler(res, send_body)
+                            try:
+                                current_usage = await stream_body_handler(res, send_body)
+                            finally:
+                                log_model_usage(request, user, form_data['model'], current_usage)
                         elif getattr(res, 'status_code', 200) >= 400:
                             await emit_message_error(get_message_error_content(get_response_error_detail(res)))
                             break
@@ -6946,7 +6990,7 @@ async def streaming_chat_response_handler(response, ctx):
                             )
                             standalone_body = {
                                 **continuation_body,
-                                'model': model_id,
+                                'model': form_data['model'],
                                 'stream': True,
                                 'metadata': metadata,
                                 'messages': [
@@ -6967,8 +7011,8 @@ async def streaming_chat_response_handler(response, ctx):
                                 user,
                                 standalone_body,
                                 metadata,
-                                model_id,
-                                ctx['compaction_state'].get('models') or {model_id: model},
+                                form_data['model'],
+                                ctx['compaction_state'].get('models') or {form_data['model']: model},
                                 ctx['compaction_state'],
                                 **checkpoint,
                                 projected_messages=snapshot,
@@ -6999,7 +7043,10 @@ async def streaming_chat_response_handler(response, ctx):
                                 continuation_body = standalone_body
                                 start_next_response()
                                 await append_adoption_record()
-                                await stream_body_handler(res, send_body)
+                                try:
+                                    await stream_body_handler(res, send_body)
+                                finally:
+                                    log_model_usage(request, user, form_data['model'], current_usage)
                             elif getattr(res, 'status_code', 200) >= 400:
                                 await emit_message_error(get_message_error_content(get_response_error_detail(res)))
                                 break
@@ -7132,6 +7179,8 @@ async def streaming_chat_response_handler(response, ctx):
             def wrap_item(item):
                 return f'data: {item}\n\n'
 
+            audit_enabled = bool(getattr(request.state, 'audit_request_id', None))
+            current_usage = None
             try:
                 message = {}
                 outlet_task = None
@@ -7139,10 +7188,11 @@ async def streaming_chat_response_handler(response, ctx):
                 outlet_enabled = ENABLE_API_OUTLET_FILTERS and bool(filter_functions)
                 if ENABLE_API_OUTLET_FILTERS and not outlet_enabled:
                     try:
-                        model_id = model.get('id') if isinstance(model, dict) else model
                         outlet_enabled = bool(
                             (isinstance(model, dict) and 'pipeline' in model)
-                            or get_sorted_filters(model_id, request.app.state.MODELS)
+                            or get_sorted_filters(
+                                model.get('id') if isinstance(model, dict) else model, request.app.state.MODELS
+                            )
                         )
                     except Exception:
                         outlet_enabled = True
@@ -7161,7 +7211,7 @@ async def streaming_chat_response_handler(response, ctx):
                         yield wrap_item(JSONCodec.dumps(event))
 
                 async for data in original_generator:
-                    if filter_functions:
+                    if filter_functions or audit_enabled:
                         line = data.decode('utf-8', 'replace') if isinstance(data, bytes) else data
                         if isinstance(line, str) and line.startswith('data:'):
                             payload = line.removeprefix('data:').strip()
@@ -7172,15 +7222,25 @@ async def streaming_chat_response_handler(response, ctx):
                                     event = None
 
                                 if isinstance(event, dict):
-                                    event, _ = await process_filter_functions(
-                                        request=request,
-                                        filter_context=filter_context,
-                                        filter_functions=filter_functions,
-                                        filter_type='stream',
-                                        form_data=event,
-                                        extra_params=extra_params,
-                                    )
-                                    data = wrap_item(JSONCodec.dumps(event)) if event else None
+                                    if audit_enabled:
+                                        form_data['model'] = event.get('selected_model_id') or form_data['model']
+                                        payload = (
+                                            event.get('response') if isinstance(event.get('response'), dict) else event
+                                        )
+                                        usage = payload.get('usage') or {}
+                                        timings = payload.get('timings') or {}
+                                        if isinstance(usage, dict) and isinstance(timings, dict) and (usage or timings):
+                                            current_usage = {**usage, **timings}
+                                    if filter_functions:
+                                        event, _ = await process_filter_functions(
+                                            request=request,
+                                            filter_context=filter_context,
+                                            filter_functions=filter_functions,
+                                            filter_type='stream',
+                                            form_data=event,
+                                            extra_params=extra_params,
+                                        )
+                                        data = wrap_item(JSONCodec.dumps(event)) if event else None
 
                     if data:
                         if outlet_enabled:
@@ -7201,6 +7261,8 @@ async def streaming_chat_response_handler(response, ctx):
                 # Separate the error frame from any unfinished upstream event.
                 yield f'\n\ndata: {JSONCodec.dumps({"error": {"message": "Chat completion stream failed"}})}\n\n'
                 yield 'data: [DONE]\n\n'
+            finally:
+                log_model_usage(request, user, form_data['model'], current_usage)
 
         return StreamingResponse(
             stream_wrapper(response.body_iterator, events),

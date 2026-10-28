@@ -1376,6 +1376,30 @@ def test_ollama_model_system_prompt_reaches_the_wire_once(monkeypatch, kind, exp
     assert [m['content'] for m in captured[0]['messages'] if m['role'] == 'system'] == expected
 
 
+@pytest.mark.parametrize('owned_by', ['openai', 'ollama'])
+def test_main_chat_sends_the_model_system_prompt_once(monkeypatch, owned_by):
+    model_params = {'system': 'MODEL SYSTEM'}
+    send_to_openai = chat.generate_openai_chat_completion
+    wire = _install_task_wire_harness(monkeypatch, model_params=model_params)
+    _captured, request, user, _seen_keys = _install_provider_sink_harness(
+        monkeypatch, {'wire-model': _EntryModelInfo(model_params)}, {'openai.enable': True, 'ollama.enable': True}
+    )
+    monkeypatch.setattr(chat, 'generate_openai_chat_completion', send_to_openai)
+    request.app.state.MODELS = {
+        'wire-model': {'id': 'wire-model', 'owned_by': owned_by, 'info': {'params': copy.deepcopy(model_params)}}
+    }
+    request.app.state.OPENAI_MODELS = {'wire-model': {'urlIdx': 0}}
+
+    _run_chat_completion(
+        request,
+        user,
+        _base_form_data('wire-model', [{'model_id': 'wire-model', 'message_id': 'm1'}], stream=False),
+    )
+
+    assert len(wire) == 1
+    assert [message['content'] for message in wire[0]['messages'] if message['role'] == 'system'] == ['MODEL SYSTEM']
+
+
 @pytest.mark.parametrize('kind', ['normal_chat', 'follow_up'])
 def test_unchanged_generation_paths_gain_no_fixed_limit(monkeypatch, kind):
     captured = _install_task_wire_harness(monkeypatch)
