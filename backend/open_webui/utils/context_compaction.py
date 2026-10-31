@@ -719,6 +719,20 @@ def _has_new_compaction_content(messages: list[dict], state: dict) -> bool:
     )
 
 
+def _image_parts_as_text(messages: list[dict]) -> list[dict]:
+    notes = {'image_url': {'type': 'text', 'text': '[image]'}, 'input_image': {'type': 'input_text', 'text': '[image]'}}
+
+    def part(item):
+        return dict(notes[item['type']]) if isinstance(item, dict) and item.get('type') in notes else item
+
+    return [
+        {**message, 'content': [part(item) for item in message['content']]}
+        if isinstance(message.get('content'), list)
+        else message
+        for message in messages
+    ]
+
+
 def _summary_provider_messages(messages: list[dict]) -> list[dict]:
     return [{key: message[key] for key in _SUMMARY_MESSAGE_KEYS if key in message} for message in messages]
 
@@ -2014,10 +2028,14 @@ async def _completed_turn_provider_messages(
         inject_message_file_images,
         process_messages_with_output,
         sanitize_tool_pairs,
+        strip_tool_images,
     )
 
     def prepare() -> list[dict]:
         prepared = inject_message_file_images(copy.deepcopy(messages))
+        for message in prepared:
+            if message.get('role') == 'assistant' and isinstance(message.get('output'), list):
+                message['output'] = strip_tool_images(message['output'], model)
         prepared = process_messages_with_output(
             prepared,
             reasoning_format=get_reasoning_format(model),
@@ -2268,12 +2286,14 @@ _TOKEN_COUNTER_KEYS = (
 
 
 def has_valid_token_measurement(usage: Any) -> bool:
-    """Whether a raw usage dict carries at least one explicit token counter.
+    """Whether a raw usage dict carries at least one explicit token counter and no invalid total.
 
-    Must run before normalize_usage, which fills missing counters with zeros;
-    otherwise an all-null or cost-only receipt would read as a valid zero.
+    Must run before normalize_usage, which drops an invalid total and rebuilds it from input and output,
+    so a receipt with a broken total would read as a valid measurement.
     """
     if not isinstance(usage, dict):
+        return False
+    if usage.get('total_tokens') is not None and not _valid_token_number(usage['total_tokens']):
         return False
     return any(_valid_token_number(usage.get(key)) for key in _TOKEN_COUNTER_KEYS)
 
@@ -2790,9 +2810,13 @@ async def _generate_summary(
             key: value for key, value in task_model_params.items() if value is not None and value != ''
         }
         task_model_params = _inherit_model_max_tokens(task_model_params, models[task_model_id])
+        payload_messages = _summary_provider_messages(summary_messages)
+        task_capabilities = models[task_model_id].get('info', {}).get('meta', {}).get('capabilities') or {}
+        if task_model_id != model_id and not task_capabilities.get('vision', True):
+            payload_messages = _image_parts_as_text(payload_messages)
         payload = {
             'model': task_model_id,
-            'messages': _summary_provider_messages(summary_messages),
+            'messages': payload_messages,
             'stream': False,
             'metadata': summary_metadata,
         }

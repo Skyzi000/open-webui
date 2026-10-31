@@ -899,7 +899,7 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
     executed = []
 
     async def execute(*args):
-        executed.append(args[-1]['id'])
+        executed.append(args[-1]['call_id'])
         return {}, 'catalog', None, None, False
 
     monkeypatch.setattr(middleware, 'execute_tool_call', execute)
@@ -957,6 +957,76 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
     assert output[1]['status'] == 'in_progress'
     assert output[-1]['call_id'] == 'reader-call'
     assert output[-1]['output'][0]['text'] == 'catalog'
+
+
+def test_ref_reader_runs_before_the_approval_pause_of_a_streamed_reply(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = []
+    asyncio.run(
+        refs.externalize_refs(
+            {'stream': True, 'messages': [{'role': 'tool', 'tool_call_id': 'old', 'content': 'large result ' * 100}]},
+            tools,
+            native=True,
+            threshold_tokens=500,
+            count_tokens=lambda value: len(value),
+        )
+    )
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'ask'},
+        'tools': tools,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['event_emitter'] = current['emitter']
+    paused = []
+
+    async def pause(_chat_id, _message_id, output, _form_data, _metadata, _context_usage=None):
+        paused.append(copy.deepcopy(output))
+
+    monkeypatch.setattr(middleware, 'pause_for_tool_approval', pause)
+
+    async def chunks():
+        calls = [
+            (refs.REF_EXEC_TOOL_NAME, 'reader-call', '{"command": "ls"}'),
+            ('view_file', 'write-call', '{}'),
+        ]
+        payload = {
+            'choices': [
+                {
+                    'delta': {
+                        'tool_calls': [
+                            {
+                                'index': index,
+                                'id': call_id,
+                                'type': 'function',
+                                'function': {'name': name, 'arguments': arguments},
+                            }
+                            for index, (name, call_id, arguments) in enumerate(calls)
+                        ]
+                    },
+                    'finish_reason': 'tool_calls',
+                }
+            ]
+        }
+        yield f'data: {middleware.JSONCodec.dumps(payload)}\n\n'.encode()
+        yield b'data: [DONE]\n\n'
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
+    )
+
+    output = paused[0]
+    reader = {item['type']: item for item in output if item.get('call_id') == 'reader-call'}
+    assert reader['function_call_output']['status'] == 'completed', reader['function_call_output']
+    assert reader['function_call']['status'] == 'completed'
+    assert 'duration' in reader['function_call']
+    assert not any(
+        item.get('type') == 'function_call_output' and item.get('call_id') == 'write-call' for item in output
+    )
 
 
 def test_direct_compaction_can_use_configured_server_summary_model():
@@ -1937,6 +2007,86 @@ def test_manual_compact_excludes_tip_tool_round_from_summary_input(monkeypatch):
     tool_calls = [call for message in expanded for call in (message.get('tool_calls') or [])]
     assert [call.get('id') for call in tool_calls] == ['call-1']
     assert [message.get('tool_call_id') for message in expanded if message.get('role') == 'tool'] == ['call-1']
+
+
+@pytest.mark.parametrize(
+    ('chat_vision', 'summary_model', 'summary_vision', 'image_sent'),
+    [(False, None, None, False), (True, 'summary', False, False), (True, 'summary', True, True)],
+)
+def test_manual_compact_sends_tool_images_only_to_a_summary_model_with_vision(
+    monkeypatch, chat_vision, summary_model, summary_vision, image_sent
+):
+    chats_router = importlib.import_module('open_webui.routers.chats')
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    image = 'data:image/png;base64,iVBORw0KGgo='
+    messages = _tool_round_tip_messages()
+    messages['a1']['output'] = [
+        {'type': 'function_call', 'call_id': 'shot', 'name': 'screenshot', 'arguments': '{}', 'status': 'completed'},
+        {
+            'type': 'function_call_output',
+            'call_id': 'shot',
+            'output': [{'type': 'input_text', 'text': 'ok'}, {'type': 'input_image', 'image_url': image}],
+            'status': 'completed',
+        },
+    ]
+    sent = []
+
+    async def get_chat(*_args, **_kwargs):
+        return SimpleNamespace(id='chat', current_message_id='a2', chat={})
+
+    async def get_messages(_chat_id):
+        return copy.deepcopy(messages)
+
+    async def load_config():
+        return {'enable': True, 'prompt_template': '', 'transient_patterns': (), 'externalized_refs_enable': False}
+
+    async def none(*_args, **_kwargs):
+        return None
+
+    async def saved(*_args, **_kwargs):
+        return True
+
+    async def get_many(*_keys):
+        return {'chat.context_compaction.model': summary_model} if summary_model else {}
+
+    async def prompt(text, _user):
+        return text
+
+    async def generate(_request, form_data=None, **_kwargs):
+        sent.append(json.dumps(form_data['messages']))
+        return {'choices': [{'message': {'content': 'summary'}, 'finish_reason': 'stop'}]}
+
+    monkeypatch.setattr(chats_router.Chats, 'get_chat_by_id_and_user_id', get_chat)
+    monkeypatch.setattr(chats_router.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(chats_router, 'has_active_tasks', none)
+    monkeypatch.setattr(chats_router, 'publish_event', none)
+    monkeypatch.setattr(chats_router, 'check_model_access', none)
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction.Chats, 'get_messages_map_by_chat_id', get_messages)
+    monkeypatch.setattr(compaction.ChatMessages, 'update_context_summary', saved)
+    monkeypatch.setattr(compaction.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(compaction, 'prompt_template', prompt)
+    monkeypatch.setattr(chat_module, 'generate_chat_completion', generate)
+    models = {
+        name: {'id': name, 'info': {'meta': {'capabilities': {'vision': vision}}, 'params': {}}}
+        for name, vision in (('m', chat_vision), ('summary', summary_vision))
+    }
+    request = SimpleNamespace(
+        state=SimpleNamespace(),
+        scope={'type': 'http', 'state': {}},
+        receive=None,
+        app=SimpleNamespace(state=SimpleNamespace(MODELS=models, redis=None)),
+    )
+
+    result = asyncio.run(
+        chats_router.compact_chat_by_id(
+            request, 'chat', chats_router.CompactChatForm(model='m'), SimpleNamespace(id='user-1', role='user'), None
+        )
+    )
+
+    assert result['compacted'] is True
+    assert (image in sent[0]) is image_sent
+    assert ('[image]' in sent[0]) is not image_sent
 
 
 def test_manual_compact_nested_tip_only_is_too_short(monkeypatch):
@@ -11059,7 +11209,7 @@ def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path)
                     },
                 )
             before = await read_rows()
-            assert before[3]['usage']['total_tokens'] == 150
+            assert before[3]['usage']['total_tokens'] == 90
             assert before[0]['history']['messages']['assistant']['usage']['total_tokens'] == 90
 
             real_upsert = chats_model.Chats.upsert_message_to_chat_by_id_and_message_id
@@ -11089,7 +11239,7 @@ def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path)
             if real_snapshot_update is not None:
                 refreshed = {**snapshot, 'tokens': 45}
                 await real_snapshot_update('chat', 'assistant', refreshed)
-                assert (await read_rows())[3]['usage']['total_tokens'] == 150
+                assert (await read_rows())[3]['usage']['total_tokens'] == 90
 
             await chats_model.Chats.upsert_message_to_chat_by_id_and_message_id(
                 'chat',
@@ -11102,7 +11252,7 @@ def test_send_commit_snapshot_does_not_replay_saved_usage(monkeypatch, tmp_path)
                     }
                 },
             )
-            assert (await read_rows())[3]['usage']['total_tokens'] == 180
+            assert (await read_rows())[3]['usage']['total_tokens'] == 30
         finally:
             await engine.dispose()
 
