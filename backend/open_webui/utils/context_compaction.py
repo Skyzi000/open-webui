@@ -1121,6 +1121,10 @@ async def _emit_compaction_status(
         data['message_id'] = message_id
     if summary is not None:
         data['summary'] = summary
+    if message_id is not None and summary is not None:
+        # Core clients that keep a temporary chat's summary (SideChat.svelte) read Core's event keys.
+        data['checkpoint_message_id'] = message_id
+        data['context_summary'] = summary
     if output_item_id is not None:
         data['output_item_id'] = output_item_id
     await event_emitter({'type': 'context_compaction', 'data': data})

@@ -348,8 +348,10 @@
 					<AdminSettingField
 						label={$i18n.t('settings.admin.interface.tokenThreshold.label')}
 						description={$i18n.t('settings.admin.interface.tokenThreshold.description')}
+						forId="context-compaction-token-threshold"
 					>
 						<input
+							id="context-compaction-token-threshold"
 							type="number"
 							min="1"
 							step="1"
@@ -361,8 +363,10 @@
 					<AdminSettingField
 						label={$i18n.t('settings.admin.interface.tokenCap.label')}
 						description={$i18n.t('settings.admin.interface.tokenCap.description')}
+						forId="context-compaction-token-cap"
 					>
 						<input
+							id="context-compaction-token-cap"
 							type="number"
 							min="1"
 							step="1"
@@ -376,8 +380,10 @@
 						description={$i18n.t(
 							'Fraction of the token threshold that starts background summary generation. Set to 0 to disable.'
 						)}
+						forId="context-compaction-soft-trigger-ratio"
 					>
 						<input
+							id="context-compaction-soft-trigger-ratio"
 							type="number"
 							min="0"
 							max="0.99"
@@ -438,8 +444,10 @@
 						description={$i18n.t(
 							'Native-tool text at or above this token count is replaced with an on-demand reference.'
 						)}
+						forId="externalized-refs-token-threshold"
 					>
 						<input
+							id="externalized-refs-token-threshold"
 							type="number"
 							min="1000"
 							step="1000"
@@ -478,8 +486,10 @@
 					<AdminSettingField
 						label={$i18n.t('settings.admin.interface.toolSearchThreshold.label')}
 						description={$i18n.t('settings.admin.interface.toolSearchThreshold.description')}
+						forId="tool-search-threshold"
 					>
 						<input
+							id="tool-search-threshold"
 							type="number"
 							min="0"
 							step="1"
@@ -491,8 +501,10 @@
 					<AdminSettingField
 						label={$i18n.t('settings.admin.interface.toolSearchAlwaysLoaded.label')}
 						description={$i18n.t('settings.admin.interface.toolSearchAlwaysLoaded.description')}
+						forId="tool-search-always-loaded"
 					>
 						<input
+							id="tool-search-always-loaded"
 							class={inputClass}
 							type="text"
 							placeholder={$i18n.t('settings.admin.interface.toolSearchAlwaysLoaded.placeholder')}
@@ -648,8 +660,10 @@
 						description={$i18n.t(
 							'settings.admin.interface.autocompleteGenerationInputMaxLength.description'
 						)}
+						forId="autocomplete-generation-input-max-length"
 					>
 						<input
+							id="autocomplete-generation-input-max-length"
 							type="number"
 							min="-1"
 							step="1"

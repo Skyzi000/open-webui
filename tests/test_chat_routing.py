@@ -123,6 +123,7 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
     monkeypatch.setattr(main, 'BYPASS_ADMIN_ACCESS_CONTROL', True)
     monkeypatch.setattr(main, 'ENABLE_CUSTOM_MODEL_FALLBACK', True)
     monkeypatch.setattr(middleware.Config, 'get_many', staticmethod(get_many_empty))
+    monkeypatch.setattr(main, 'get_user_id_from_session_pool', lambda session_id: 'user-1')
 
     request = SimpleNamespace(
         headers={},
@@ -144,7 +145,7 @@ def _base_form_data(model, message_ids, **overrides):
         'stream': True,
         'messages': [{'role': 'user', 'content': 'hi'}],
         'session_id': 'sess-1',
-        'chat_id': 'local:unit',
+        'chat_id': 'local:sess-1',
         'message_ids': message_ids,
     }
     form_data.update(overrides)
@@ -1305,7 +1306,7 @@ def test_continue_context_keeps_temporary_output_and_approved_results(monkeypatc
         _base_form_data(
             'model',
             [{'model_id': 'model', 'message_id': 'm1'}],
-            chat_id='saved' if saved else 'local:unit',
+            chat_id='saved' if saved else 'local:sess-1',
             assistant_message_id='m1',
             messages=[{'role': 'user', 'content': 'start'}, original],
         ),

@@ -1337,6 +1337,7 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
     monkeypatch.setattr(main, 'BYPASS_MODEL_ACCESS_CONTROL', False)
     monkeypatch.setattr(main, 'BYPASS_ADMIN_ACCESS_CONTROL', True)
     monkeypatch.setattr(main, 'ENABLE_CUSTOM_MODEL_FALLBACK', True)
+    monkeypatch.setattr(main, 'get_user_id_from_session_pool', lambda session_id: 'user-1')
 
     request = SimpleNamespace(
         headers={},
@@ -1353,7 +1354,7 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
             'model': model,
             'messages': [{'role': 'user', 'content': 'hi'}],
             'session_id': 'sess-1',
-            'chat_id': 'local:unit',
+            'chat_id': 'local:sess-1',
             'message_ids': message_ids,
         }
         result = asyncio.run(main.chat_completion(request, form_data, user))
@@ -3731,7 +3732,12 @@ def test_summary_request_repeats_the_prefix_the_chat_sent(monkeypatch, backgroun
         assert (during['messages'], during['tools']) == (before['messages'], before['tools'])
 
 
-def test_temporary_chat_hands_its_summary_to_the_client_and_reuses_it(monkeypatch):
+@pytest.mark.parametrize(
+    'id_key, summary_key',
+    [('message_id', 'summary'), ('checkpoint_message_id', 'context_summary')],
+    ids=['chat', 'side-chat'],
+)
+def test_temporary_chat_hands_its_summary_to_the_client_and_reuses_it(monkeypatch, id_key, summary_key):
     save_checkpoint = compaction._save_checkpoint
     middleware, current = _shared_prefix_harness(monkeypatch)
     socket_main = importlib.import_module('open_webui.socket.main')
@@ -3768,16 +3774,16 @@ def test_temporary_chat_hands_its_summary_to_the_client_and_reuses_it(monkeypatc
         return [message['content'] for message in _provider_messages(sent['messages'])]
 
     first = send(client_history)
-    handed = [event['data'] for event in events if 'summary' in event.get('data', {})]
+    handed = [event['data'] for event in events if summary_key in event.get('data', {})]
 
     assert len(current['summaries']) == 1
-    assert [(data['message_id'], data['summary']) for data in handed] == [('u3', 'summary')]
+    assert [(data[id_key], data[summary_key]) for data in handed] == [('u3', 'summary')]
     assert '<![CDATA[summary]]>' in first[1]
     assert first[2:] == ['latest question']
 
     for message in client_history:
-        if message['id'] == handed[0]['message_id']:
-            message['contextSummary'] = handed[0]['summary']
+        if message['id'] == handed[0][id_key]:
+            message['contextSummary'] = handed[0][summary_key]
     assert send(client_history) == first
     assert len(current['summaries']) == 1
 
@@ -8113,6 +8119,8 @@ def test_prefetch_finalize_notifies_phase_and_boundary(monkeypatch):
             'phase': 'prefetch',
             'message_id': 'u2',
             'summary': 'SUM',
+            'checkpoint_message_id': 'u2',
+            'context_summary': 'SUM',
         }
     ]
 
@@ -8223,6 +8231,8 @@ def test_completed_turn_prefetch_notifies_only_when_generating(monkeypatch):
         'phase': 'prefetch',
         'message_id': 'assistant',
         'summary': 'TURN-SUMMARY',
+        'checkpoint_message_id': 'assistant',
+        'context_summary': 'TURN-SUMMARY',
     }
 
     events.clear()
@@ -8291,6 +8301,8 @@ def test_blocking_compaction_success_carries_boundary(monkeypatch):
             'done': True,
             'message_id': 'u2',
             'summary': 'BLOCK-SUM',
+            'checkpoint_message_id': 'u2',
+            'context_summary': 'BLOCK-SUM',
         },
     ]
 
@@ -10776,6 +10788,23 @@ def test_non_stream_invalid_total_is_not_adopted(monkeypatch):
 
     assert result['state'] == _stream_confirmed_snapshot()
     assert result['completed']['usage'] is None
+
+
+def test_non_stream_responses_invalid_total_is_not_adopted(monkeypatch):
+    openai_router = importlib.import_module('open_webui.routers.openai')
+    harness = _stream_store_harness(monkeypatch)
+    response = openai_router.convert_responses_result(
+        {
+            'status': 'completed',
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'OK'}]}],
+            'usage': {'input_tokens': 80, 'output_tokens': 10, 'total_tokens': -1},
+        }
+    )
+
+    asyncio.run(harness['middleware'].non_streaming_chat_response_handler(response, harness['ctx']))
+
+    assert harness['state']['context_usage'] == _stream_confirmed_snapshot()
+    assert harness['ctx']['completed_compaction']['usage'] is None
 
 
 def test_non_stream_explicit_zero_is_adopted(monkeypatch):
