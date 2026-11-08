@@ -70,7 +70,10 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
             'params': copy.deepcopy(metadata.get('params')),
             'params_ref': metadata.get('params'),
             'options_ref': form_data.get('stream_options'),
-            'system_prompt': metadata.get('base_system_prompt'),
+            'system_prompt': next(
+                (message['content'] for message in form_data.get('messages', []) if message.get('role') == 'system'),
+                None,
+            ),
             'messages': copy.deepcopy(form_data.get('messages')),
         }
         if form_data.get('stream'):
@@ -106,8 +109,8 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
     async def get_model(model_id):
         return model_infos.get(model_id)
 
-    async def get_many_empty(*_keys):
-        return {}
+    async def get_many(*keys):
+        return {key: config_values.get(key) for key in keys}
 
     monkeypatch.setattr(chat, 'generate_openai_chat_completion', openai_sink)
     monkeypatch.setattr(main, 'build_chat_response_context', build_ctx)
@@ -122,11 +125,12 @@ def _install_provider_sink_harness(monkeypatch, model_infos, config_values=None)
     monkeypatch.setattr(main, 'BYPASS_MODEL_ACCESS_CONTROL', False)
     monkeypatch.setattr(main, 'BYPASS_ADMIN_ACCESS_CONTROL', True)
     monkeypatch.setattr(main, 'ENABLE_CUSTOM_MODEL_FALLBACK', True)
-    monkeypatch.setattr(middleware.Config, 'get_many', staticmethod(get_many_empty))
+    monkeypatch.setattr(middleware.Config, 'get_many', staticmethod(get_many))
     monkeypatch.setattr(main, 'get_user_id_from_session_pool', lambda session_id: 'user-1')
 
     request = SimpleNamespace(
         headers={},
+        client=None,
         state=SimpleNamespace(internal=False),
         app=SimpleNamespace(state=SimpleNamespace(MODELS={}, redis=None)),
     )
@@ -721,7 +725,7 @@ def test_tool_approval_request_wins_over_target_model_level(monkeypatch):
     assert captured['m2']['params']['tool_approval_mode'] == 'ask'
 
 
-def test_tool_approval_forced_by_automation_pins_full(monkeypatch):
+def test_automation_columns_resolve_tool_approval_like_other_chats(monkeypatch):
     models_map = {
         'primary-model': {'id': 'primary-model', 'owned_by': 'openai', 'info': {}},
         'sibling-model': {'id': 'sibling-model', 'owned_by': 'openai', 'info': {}},
@@ -749,9 +753,8 @@ def test_tool_approval_forced_by_automation_pins_full(monkeypatch):
         ),
     )
 
-    assert captured['m1']['params']['tool_approval_mode'] == 'full'
-    assert captured['m2']['params']['tool_approval_mode'] == 'full'
-    assert 'chat.tool_permissions.enable' not in seen_keys
+    assert captured['m1']['params']['tool_approval_mode'] == 'ask'
+    assert captured['m2']['params']['tool_approval_mode'] == 'ask'
 
 
 def test_tool_approval_forced_by_channel_chat_pins_full(monkeypatch):

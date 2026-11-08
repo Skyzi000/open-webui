@@ -898,7 +898,7 @@ def test_internal_ref_reader_executes_before_other_tools_pause(monkeypatch):
 
     executed = []
 
-    async def execute(*args):
+    async def execute(*args, **_kwargs):
         executed.append(args[-1]['call_id'])
         return {}, 'catalog', None, None, False
 
@@ -1341,6 +1341,7 @@ def test_chat_completion_binds_resolved_params_per_call(monkeypatch):
 
     request = SimpleNamespace(
         headers={},
+        client=None,
         state=SimpleNamespace(internal=False),
         app=SimpleNamespace(state=SimpleNamespace(MODELS={}, redis=None)),
     )
@@ -1496,6 +1497,7 @@ def test_chat_completion_sync_leg_binds_fallback_params(monkeypatch):
 
     request = SimpleNamespace(
         headers={},
+        client=None,
         state=SimpleNamespace(internal=False),
         app=SimpleNamespace(
             state=SimpleNamespace(
@@ -2968,13 +2970,14 @@ def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
     monkeypatch.setattr(middleware, 'get_message_list', lambda _messages, _message_id: [raw_message])
     monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
     monkeypatch.setattr(middleware, 'review_memory_after_turn', no_review)
+    monkeypatch.setattr(middleware, 'get_verified_user_by_id', _live_user)
 
     asyncio.run(
         middleware.background_tasks_handler(
             {
                 'request': SimpleNamespace(),
                 'form_data': {},
-                'user': SimpleNamespace(),
+                'user': SimpleNamespace(id='user-1'),
                 'metadata': {'chat_id': 'chat', 'message_id': 'a1'},
                 'tasks': {},
                 'event_emitter': emit,
@@ -2995,7 +2998,7 @@ def test_background_tasks_filter_db_only_fields_before_compaction(monkeypatch):
             {
                 'request': SimpleNamespace(),
                 'form_data': {},
-                'user': SimpleNamespace(),
+                'user': SimpleNamespace(id='user-1'),
                 'metadata': {'chat_id': 'chat', 'message_id': 'a1'},
                 'tasks': {},
                 'event_emitter': emit,
@@ -3166,12 +3169,17 @@ def test_request_start_summary_is_tracked_through_the_payload_path(monkeypatch, 
 
 
 @pytest.mark.parametrize(
-    ('reply_output', 'measured_with_summary'),
-    [(['text'], False), (['summary', 'text'], True), (['text', 'summary', 'text'], False)],
-    ids=['measured-before-summary', 'measured-with-summary', 'summary-adopted-by-a-later-leg'],
+    ('reply_output', 'measured_with_summary', 'reply_model'),
+    [
+        (['text'], False, None),
+        (['summary', 'text'], True, None),
+        (['text', 'summary', 'text'], False, None),
+        (['summary', 'text'], False, 'agent:terminal:claude-code:default'),
+    ],
+    ids=['measured-before-summary', 'measured-with-summary', 'summary-adopted-by-a-later-leg', 'coding-agent-reply'],
 )
 def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_current_summary(
-    monkeypatch, reply_output, measured_with_summary
+    monkeypatch, reply_output, measured_with_summary, reply_model
 ):
     middleware = importlib.import_module('open_webui.utils.middleware')
     answer = {
@@ -3190,6 +3198,7 @@ def test_reply_usage_starts_the_estimate_only_when_its_request_carried_the_curre
             'content': 'answer',
             'output': [_adoption_item('summary') if item == 'summary' else answer for item in reply_output],
             'usage': {'prompt_tokens': 2_000, 'completion_tokens': 5},
+            **({'model': reply_model} if reply_model else {}),
         },
         {'id': 'u2', 'role': 'user', 'content': 'next question'},
     ]
@@ -3362,6 +3371,7 @@ def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatc
     monkeypatch.setattr(socket_main, 'get_event_emitter', emitter)
     monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
     monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
+    monkeypatch.setattr(middleware, 'get_verified_user_by_id', _live_user)
     monkeypatch.setattr(middleware, 'review_memory_after_turn', noop)
     state = {
         'config': _compaction_config(
@@ -3375,7 +3385,7 @@ def test_turn_end_summary_gets_the_excerpts_of_the_summary_it_extends(monkeypatc
             {
                 'request': SimpleNamespace(),
                 'form_data': {'model': 'model'},
-                'user': SimpleNamespace(),
+                'user': SimpleNamespace(id='user-1'),
                 'metadata': {'chat_id': 'chat', 'message_id': 'a2'},
                 'tasks': {},
                 'event_emitter': noop,
@@ -4082,13 +4092,18 @@ def _turn_end_harness(monkeypatch, middleware, history=_PREFIX_HISTORY):
 
     monkeypatch.setattr(middleware.Chats, 'get_messages_map_by_chat_id', get_messages)
     monkeypatch.setattr(middleware, 'replay_cached_compaction_messages', replay)
+    monkeypatch.setattr(middleware, 'get_verified_user_by_id', _live_user)
+
+
+async def _live_user(user_id):
+    return SimpleNamespace(id=user_id)
 
 
 def _turn_end_ctx(state, emitter):
     return {
         'request': SimpleNamespace(state=SimpleNamespace(direct=False), scope={'type': 'http'}, receive=None),
         'form_data': {'model': 'model'},
-        'user': SimpleNamespace(),
+        'user': SimpleNamespace(id='user-1'),
         'metadata': {'chat_id': 'chat', 'message_id': 'message'},
         'tasks': {},
         'event_emitter': emitter,
@@ -5387,7 +5402,7 @@ def test_tool_stream_preserves_nested_checkpoint_and_citation_shape(monkeypatch)
     monkeypatch.setattr(
         middleware,
         'get_citation_source_from_tool_result',
-        lambda tool_name, **_kwargs: [source_for(tool_name)],
+        lambda tool_name, *_args, **_kwargs: [source_for(tool_name)],
     )
     monkeypatch.setattr(middleware, 'rag_template', rag)
     monkeypatch.setattr(middleware.Config, 'get', config_get)
@@ -5728,7 +5743,9 @@ def _run_payload_leg(
         form_data['files'] = files
     form_data.update(extra_form or {})
     model = {'id': 'model', 'info': {'meta': {'capabilities': {'file_context': file_context}}}}
-    return middleware.process_chat_payload(request, form_data, None, metadata, model)
+    return middleware.process_chat_payload(
+        request, form_data, SimpleNamespace(id='user-1', role='user'), metadata, model
+    )
 
 
 def _approved_stored():
@@ -11421,3 +11438,355 @@ def test_svg_attachments_are_not_sent_as_images():
         {'type': 'text', 'text': 'files'},
         {'type': 'image_url', 'image_url': {'url': '/png'}},
     ]
+
+
+@pytest.mark.parametrize('memory', [False, True], ids=['skills-list', 'skills-list-and-memory'])
+def test_request_start_compaction_keeps_the_question_ahead_of_hidden_context(monkeypatch, memory):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    skills_model = importlib.import_module('open_webui.models.skills')
+    summarized = []
+
+    async def generate_summary(_request, _user, _model_id, _models, compacted, *_args, **_kwargs):
+        summarized.append(_contents(compacted))
+        return 'summary'
+
+    async def load_config():
+        return _compaction_config(token_threshold=100, token_cap=100)
+
+    async def recall(*_args, **_kwargs):
+        return 'MEMORY'
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    async def config_get(key, default=None):
+        return True if key in ('memories.enable', 'memories.system_context.enable') else default
+
+    async def get_skills(*_args, **_kwargs):
+        return [SimpleNamespace(id='sk1', name='Skill One', description='does things', is_active=True)]
+
+    def estimate(body, **_kwargs):
+        return 120 if any(message.get('content') == 'question' for message in body['messages']) else 20
+
+    monkeypatch.setattr(compaction, '_generate_summary', generate_summary)
+    monkeypatch.setattr(compaction, '_load_config', load_config)
+    monkeypatch.setattr(compaction, 'estimate_provider_tokens', estimate)
+    monkeypatch.setattr(compaction, '_save_checkpoint', noop)
+    monkeypatch.setattr(middleware, 'recall_memories', recall)
+    monkeypatch.setattr(middleware.Chats, 'update_message_context_usage', noop)
+    _payload_leg_patches(monkeypatch, middleware, refs_runtime=(False, 1000))
+    _payload_leg_drain(
+        monkeypatch,
+        middleware,
+        None,
+        history=[
+            {'id': 'u0', 'role': 'user', 'content': 'old question'},
+            {'id': 'a0', 'role': 'assistant', 'content': 'old answer'},
+            {'id': 'u1', 'role': 'user', 'content': 'question'},
+        ],
+    )
+    monkeypatch.setattr(middleware, '_prepare_compaction_or_default', compaction.prepare_compaction_messages)
+    monkeypatch.setattr(middleware.Config, 'get', config_get)
+    monkeypatch.setattr(skills_model.Skills, 'get_skills', get_skills)
+
+    send, metadata, *_ = asyncio.run(
+        _run_payload_leg(
+            middleware,
+            [{'role': 'user', 'content': 'client copy'}],
+            seeded_metadata={'user_message_id': 'u1', 'session_id': 'sess'},
+            assistant_message_id=None,
+            extra_form={'features': {'memory': memory}},
+        )
+    )
+
+    hidden = [item['name'] for item in metadata['initial_output'] if item['type'] == 'function_call']
+    assert hidden == (['recall_memories', 'list_available_skills'] if memory else ['list_available_skills'])
+    question = next(index for index, message in enumerate(send['messages']) if message.get('content') == 'question')
+    assert [message['role'] for message in send['messages'][question:]] == [
+        'user',
+        *['assistant', 'tool'] * len(hidden),
+    ]
+    assert all('question' not in contents for contents in summarized)
+
+
+def test_ref_reader_runs_without_approval_in_auto_mode(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    refs = importlib.import_module('open_webui.utils.externalized_refs')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = []
+    asyncio.run(
+        refs.externalize_refs(
+            {'stream': True, 'messages': [{'role': 'tool', 'tool_call_id': 'old', 'content': 'large result ' * 100}]},
+            tools,
+            native=True,
+            threshold_tokens=500,
+            count_tokens=lambda value: len(value),
+        )
+    )
+    metadata = {'chat_id': 'chat', 'message_id': 'assistant', 'params': {'tool_approval_mode': 'auto'}, 'tools': tools}
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['event_emitter'] = current['emitter']
+    paused = []
+
+    async def pause(_chat_id, _message_id, output, _form_data, _metadata, _context_usage=None):
+        paused.append(copy.deepcopy(output))
+
+    monkeypatch.setattr(middleware, 'pause_for_tool_approval', pause)
+    calls = [(refs.REF_EXEC_TOOL_NAME, 'reader-call', '{"command": "ls"}'), ('view_file', 'write-call', '{}')]
+    reply = {
+        'choices': [
+            {
+                'delta': {
+                    'tool_calls': [
+                        {
+                            'index': index,
+                            'id': call_id,
+                            'type': 'function',
+                            'function': {'name': name, 'arguments': args},
+                        }
+                        for index, (name, call_id, args) in enumerate(calls)
+                    ]
+                },
+                'finish_reason': 'tool_calls',
+            }
+        ]
+    }
+
+    async def chunks():
+        yield f'data: {middleware.JSONCodec.dumps(reply)}\n\n'.encode()
+        yield b'data: [DONE]\n\n'
+
+    asyncio.run(
+        middleware.streaming_chat_response_handler(StreamingResponse(chunks(), media_type='text/event-stream'), ctx)
+    )
+
+    output = paused[0]
+    reader = {item['type']: item for item in output if item.get('call_id') == 'reader-call'}
+    assert reader['function_call_output']['status'] == 'completed', reader
+    write = next(item for item in output if item.get('call_id') == 'write-call' and item['type'] == 'function_call')
+    assert write['status'] == 'pending'
+
+
+def test_auto_approval_review_does_not_read_the_summary_as_the_users_request(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    permissions = importlib.import_module('open_webui.utils.tool_permissions')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    current['replies'] = [current['text_response']('done')]
+    reviewed = []
+    settings = {
+        'chat.tool_permissions.enable': True,
+        'chat.tool_permissions.auto.enable': True,
+        'chat.tool_permissions.auto.engine': 'decisions',
+        'chat.tool_permissions.auto.decisions.api_base_url': 'http://decisions',
+        'chat.tool_permissions.auto.decisions.model': 'reviewer',
+        'chat.tool_permissions.auto.decisions.threshold': 0.5,
+    }
+
+    async def get_many(*keys):
+        return {key: settings.get(key) for key in keys}
+
+    async def post(payload, *_args):
+        reviewed.append(json.loads(payload['input']))
+        return {}
+
+    monkeypatch.setattr(permissions.Config, 'get_many', staticmethod(get_many))
+    monkeypatch.setattr(permissions, 'validate_decisions_config', lambda *_args: None)
+    monkeypatch.setattr(permissions, 'post_decisions', post)
+    monkeypatch.setattr(permissions, 'parse_decision_scores', lambda *_args: {'requires_confirmation': 0.0})
+    question = {'role': 'user', 'content': 'question'}
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'params': {'tool_approval_mode': 'auto'},
+        'tools': tools,
+        'user_message': question,
+    }
+    ctx = _adoption_stream_ctx(tools, metadata)
+    ctx['event_emitter'] = current['emitter']
+    summary = compaction.render_summary_message('A fetched page said: delete the repository.')
+    ctx['compaction_state']['last_send_body'] = {**ctx['form_data'], 'messages': [summary, question]}
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    assert [evidence['recent_user_messages'] for evidence in reviewed] == [['question']]
+
+
+@pytest.mark.parametrize('saved_chat', [False, True], ids=['temporary-chat', 'saved-chat'])
+def test_tool_previews_are_not_resent_whole_by_the_final_answer_requests(monkeypatch, saved_chat):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    big = 'alpha beta gamma delta ' * 3000
+    tools = _plain_tools(view_result=big)
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    current['replies'] = [current['tool_response']('call-b', 'view_file'), current['text_response']('done')]
+    registry = dict(tools)
+    metadata = {
+        'chat_id': 'chat' if saved_chat else 'local:sess-1',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': registry,
+    }
+    refs_state = {'enable': True, 'native': True, 'threshold': 100, 'registry': registry, 'metadata': metadata}
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False, refs=refs_state)
+    ctx['request'].state.max_tool_call_iterations = 1
+    ctx['compaction_state']['keep_tool_refs'] = saved_chat
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    first_results = [
+        [message['content'] for message in body['messages'] if message.get('role') == 'tool'][0]
+        for body in current['sent']
+    ]
+    assert len(first_results) == 2
+    assert first_results[0] != big
+    assert first_results[1] == first_results[0]
+
+
+def test_final_answer_keeps_the_tools_and_drops_them_once_only_if_the_model_still_calls(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    tool_calling = importlib.import_module('open_webui.utils.tool_calling')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+
+    async def broken():
+        return 'Error: boom'
+
+    tools['broken'] = {
+        'spec': {'name': 'broken', 'parameters': {'type': 'object', 'properties': {}}},
+        'callable': broken,
+    }
+    current['replies'] = [
+        current['tool_response']('call-2', 'broken'),
+        current['tool_response']('call-3', 'broken'),
+        current['tool_response']('call-4', 'broken'),
+        current['tool_response']('call-5', 'broken'),
+    ]
+    metadata = {'chat_id': 'chat', 'message_id': 'assistant', 'params': {'tool_approval_mode': 'full'}, 'tools': tools}
+    state = {'config': {'enable': False}, 'checkpoint_messages': [], 'externalized_refs': {'enable': False}}
+    ctx = _adoption_stream_ctx(tools, metadata, state)
+    specs = [{'type': 'function', 'function': tool['spec']} for tool in tools.values()]
+    ctx['form_data'].update(tools=specs, tool_choice='required')
+    ctx['event_emitter'] = current['emitter']
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-1', 'broken'), ctx))
+
+    sent = current['sent']
+    instruction = {'role': 'user', 'content': tool_calling.FINAL_ANSWER_PROMPT}
+    assert len(sent) == 4
+    assert (sent[1]['tools'], sent[1]['tool_choice']) == (specs, 'required')
+    assert (sent[2]['tools'], sent[2]['tool_choice']) == (specs, 'none')
+    assert sent[2]['messages'] == [
+        *sent[1]['messages'],
+        *sent[2]['messages'][len(sent[1]['messages']) : -1],
+        instruction,
+    ]
+    assert (sent[3]['tools'], sent[3]['tool_choice']) == ([], 'none')
+    assert sent[3]['messages'][-1] == {'role': 'system', 'content': tool_calling.FINAL_ANSWER_PROMPT}
+    assert sent[3]['messages'][: len(sent[2]['messages']) - 1] == sent[2]['messages'][:-1]
+    output = current['saved'][-1]['output']
+    assert [item['call_id'] for item in output if item['type'] == 'function_call'] == [
+        'call-1',
+        'call-2',
+        'call-3',
+        'call-4',
+        'call-5',
+    ]
+
+
+def test_ref_preview_of_a_cited_result_keeps_every_marker(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    big = 'raw output with several words per line\n' * 3000
+    tools = _plain_tools(view_result='small', fetch_result=big)
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    pages = [
+        {
+            'source': {'id': f'https://example.com/page/{index:03d}', 'name': f'page {index}', 'type': 'tool'},
+            'document': [f'document {index}'],
+            'metadata': [{'source': f'https://example.com/page/{index:03d}'}],
+        }
+        for index in range(20)
+    ]
+    monkeypatch.setattr(
+        middleware,
+        'get_citation_source_from_tool_result',
+        lambda name, *_args, **_kwargs: pages if name == 'fetch_url' else [],
+    )
+    current['replies'] = [current['tool_response']('call-b', 'fetch_url'), current['text_response']('done')]
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+        'sources': [],
+    }
+    refs_state = {'enable': True, 'native': True, 'threshold': 1000, 'registry': tools, 'metadata': metadata}
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False, refs=refs_state)
+    ctx['model']['info']['meta']['capabilities']['citations'] = True
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    fetched = [message for message in current['sent'][-1]['messages'] if message['role'] == 'tool'][-1]['content']
+    assert '<auto_compact_ref_truncated>' in fetched
+    assert re.findall(r'<source id="(\d+)" name="page (\d+)"', fetched) == [
+        (str(index + 1), str(index)) for index in range(20)
+    ]
+
+
+@pytest.mark.parametrize('model_tools', [False, True], ids=['model-forces-a-tool', 'model-also-sets-tools'])
+def test_final_answer_without_tools_reaches_the_provider_without_them(monkeypatch, model_tools):
+    from test_chat_routing import _install_task_wire_harness, _task_wire_request, _task_wire_user
+
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    openai_router = importlib.import_module('open_webui.routers.openai')
+    chat_module = importlib.import_module('open_webui.utils.chat')
+    tools = _plain_tools()
+    current = _stream_leg_patches(monkeypatch, middleware, replies=[], tools=tools)
+    specs = [{'type': 'function', 'function': tool['spec']} for tool in tools.values()]
+    params = {'custom_params': {'tool_choice': 'required', **({'tools': specs[:1]} if model_tools else {})}}
+    _install_task_wire_harness(monkeypatch, model_params=params)
+    replies = [current['tool_response']('call-b', 'view_file'), current['text_response']('done')]
+    sent = []
+
+    class Content:
+        def __init__(self, response):
+            self.response = response
+
+        async def iter_chunks(self):
+            async for chunk in self.response.body_iterator:
+                yield chunk, True
+
+    class Response:
+        status = 200
+        headers = {'Content-Type': 'text/event-stream'}
+        closed = True
+
+        def __init__(self, response):
+            self.content = Content(response)
+
+    class Session:
+        async def request(self, **kwargs):
+            sent.append(json.loads(kwargs['data']))
+            return Response(replies.pop(0))
+
+    async def session():
+        return Session()
+
+    monkeypatch.setattr(openai_router, 'get_session', session)
+    monkeypatch.setattr(middleware, 'generate_chat_completion', chat_module.generate_chat_completion)
+    metadata = {
+        'chat_id': 'local:sess-1',
+        'message_id': 'assistant',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    ctx = _stream_leg_ctx(metadata, compaction_enabled=False)
+    ctx['form_data'].update(tools=specs, tool_choice='required')
+    ctx['request'] = _task_wire_request('model', params)
+    ctx['request'].state.max_tool_call_iterations = 1
+    ctx['request'].app.state.redis = None
+    ctx['user'] = _task_wire_user()
+
+    asyncio.run(middleware.streaming_chat_response_handler(current['tool_response']('call-a', 'view_file'), ctx))
+
+    assert len(sent) == 2
+    assert (len(sent[0]['tools']), sent[0]['tool_choice']) == (len(specs), 'none')
+    assert (sent[1]['tools'], sent[1]['tool_choice']) == ([], 'none')

@@ -257,7 +257,7 @@ def test_get_chat_by_id_overlays_normalized_context_summary(monkeypatch):
     monkeypatch.setattr(chats_router, 'get_response_streams_by_chat_id', get_streams)
 
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(redis=None)))
-    data = asyncio.run(chats_router.get_chat_by_id('chat-1', request, SimpleNamespace(id='user-1'), None))
+    data = asyncio.run(chats_router.get_chat_by_id('chat-1', request, SimpleNamespace(id='user-1', role='user'), None))
 
     message = data['chat']['history']['messages']['a1']
     assert message['contextSummary'] == 'normalized summary'

@@ -664,6 +664,13 @@ async def resolve_request_history(source: Any) -> RefEntry | None:
     )
 
 
+def is_summary_message(message: Any) -> bool:
+    content = message.get('content') if isinstance(message, dict) else None
+    return (
+        message.get('role') == 'user' and isinstance(content, str) and content.startswith('<auto_compaction_context>')
+    )
+
+
 def render_summary_message(summary: str, summary_meta: dict | None = None) -> dict:
     excerpts = (summary_meta or {}).get('historical_user_messages') or []
     excerpt_xml = ''.join(
@@ -943,6 +950,9 @@ async def prepare_compaction_messages(messages: list[dict], metadata: dict) -> t
         message = active_messages[index]
         if message.get('role') != 'assistant':
             continue
+        # A coding agent's usage measured its own session in the terminal, not this chat's prompt.
+        if str(message.get('model') or '').startswith('agent:'):
+            break
         info = message.get('info')
         usage = message.get('usage') or (info.get('usage') if isinstance(info, dict) else None)
         if _is_merged_cache_usage(usage):
@@ -1818,9 +1828,20 @@ async def compact_transient_provider_payload(
         await _emit_compaction_status(event_emitter, 'Context compacted', True)
         return candidate
 
-    # A guided regeneration's first send carries the revised reply and its instruction after the question, which stays the latest turn.
+    # A guided regeneration's first send carries the revised reply and its instruction after the question, and Core's
+    # hidden context results follow it as tool rounds the reply never made; the question stays the latest turn.
     question = state.get('regeneration_question') if checkpoint_output is None else None
     limit = next((index for index, message in enumerate(working) if message is question), None)
+    if limit is None and checkpoint_output is None and metadata.get('initial_output'):
+        limit = next(
+            (
+                index
+                for index in range(len(working) - 1, -1, -1)
+                if working[index].get('role') == 'user'
+                and not _is_transient_message(working[index], config['transient_patterns'])
+            ),
+            None,
+        )
     boundary = find_safe_compaction_boundary(
         projected_working,
         config['transient_patterns'],

@@ -463,7 +463,7 @@ async def lifespan(app: FastAPI):
                         'path': '/internal',
                         'query_string': b'',
                         'headers': Headers({}).raw,
-                        'client': ('127.0.0.1', 12345),
+                        'client': ('', 12345),
                         'server': ('127.0.0.1', 80),
                         'scheme': 'http',
                         'app': app,
@@ -625,6 +625,7 @@ app.state.SCIM_TOKEN = SCIM_TOKEN
 # Models
 
 app.state.BASE_MODELS = []
+app.state.BASE_MODELS_SNAPSHOT = None
 
 # WebUI
 
@@ -827,6 +828,10 @@ app.include_router(retrieval.router, prefix='/api/v1/retrieval', tags=['retrieva
 
 app.include_router(configs.router, prefix='/api/v1/configs', tags=['configs'])
 
+from open_webui.env import UVICORN_WORKERS, REDIS_URL
+from open_webui.routers import tether
+
+app.include_router(tether.router, prefix='/api/v1/tether', tags=['tether'])
 app.include_router(auths.router, prefix='/api/v1/auths', tags=['auths'])
 app.include_router(mfa.router, prefix='/api/v1/auths/mfa', tags=['auths'])
 app.include_router(users.router, prefix='/api/v1/users', tags=['users'])
@@ -870,7 +875,14 @@ if ENABLE_SCIM:
 
 @app.get('/api/models')
 @app.get('/api/v1/models')  # Experimental: Compatibility with OpenAI API
-async def get_models(request: Request, refresh: bool = False, user=Depends(get_verified_user)):
+async def get_models(
+    request: Request,
+    refresh: bool = False,
+    terminal_id: str | None = None,
+    chat_id: str | None = None,
+    cwd: str | None = None,
+    user=Depends(get_verified_user),
+):
     all_models = await get_all_models(request, refresh=refresh, user=user)
 
     # Keep filter pipelines off the model menu; they work backstage.
@@ -914,6 +926,13 @@ async def get_models(request: Request, refresh: bool = False, user=Depends(get_v
         log.debug(
             f'/api/models returned filtered models accessible to the user: {JSONCodec.dumps([model.get("id") for model in models])}'
         )
+    if terminal_id:
+        from open_webui.utils.agents.discovery import get_models as get_agent_models
+
+        try:
+            models.extend(await get_agent_models(request, user, terminal_id, chat_id, cwd=cwd))
+        except Exception as exc:
+            log.debug('Agent discovery unavailable: %s', type(exc).__name__)
     return {'data': models}
 
 
@@ -1102,16 +1121,49 @@ async def chat_completion(
     model_item = form_data.pop('model_item', {})
     tasks = form_data.pop('background_tasks', None)
 
+    from open_webui.utils.terminals import get_folder_terminal_defaults, initialize_terminal_directory
+
+    folder_defaults = {}
+    requested_directory = form_data.pop('terminal_cwd', None)
+    if 'parent_id' in form_data and form_data['parent_id'] is None and not form_data.get('chat_id'):
+        folder_defaults = await get_folder_terminal_defaults(user, form_data.get('folder_id'))
+        if 'terminal_id' not in form_data and folder_defaults.get('terminal_id'):
+            form_data['terminal_id'] = folder_defaults['terminal_id']
+        if requested_directory is None and form_data.get('terminal_id') == folder_defaults.get('terminal_id'):
+            requested_directory = folder_defaults.get('working_directory')
+    else:
+        requested_directory = None
+
+    agent_model = None
+    if isinstance(model_id, str) and model_id.startswith('agent:'):
+        from open_webui.utils.agents.discovery import get_models as get_agent_models
+
+        parts = model_id.split(':', 3)
+        if len(parts) != 4:
+            raise HTTPException(400, 'Invalid agent model')
+        candidates = await get_agent_models(
+            request,
+            user,
+            form_data.get('terminal_id'),
+            form_data.get('chat_id'),
+            provider=parts[2],
+            cwd=requested_directory,
+        )
+        agent_model = next((item for item in candidates if item['id'] == model_id), None)
+        if agent_model is None:
+            raise HTTPException(400, 'Agent model is unavailable in the selected terminal')
+        model_item = {}  # Never trust client-supplied model metadata or direct-provider flags.
+
     metadata = {}
     try:
         model_info = None
         fallback_model = None
         missing_base_model = False
         if not model_item.get('direct', False):
-            if model_id not in request.app.state.MODELS:
+            if agent_model is None and model_id not in request.app.state.MODELS:
                 raise Exception('Model not found')
 
-            model = request.app.state.MODELS[model_id]
+            model = agent_model or request.app.state.MODELS[model_id]
             model_info = await Models.get_model_by_id(model_id)
             missing_base_model = bool(
                 model_info and model_info.base_model_id and model_info.base_model_id not in request.app.state.MODELS
@@ -1130,7 +1182,11 @@ async def chat_completion(
                     fallback_model = request.app.state.MODELS.get(fallback_model_id)
 
             # Check if user has access to the model
-            if not BYPASS_MODEL_ACCESS_CONTROL and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL):
+            if (
+                agent_model is None
+                and not BYPASS_MODEL_ACCESS_CONTROL
+                and (user.role != 'admin' or not BYPASS_ADMIN_ACCESS_CONTROL)
+            ):
                 try:
                     access_model_info = (
                         model_info.model_copy(update={'base_model_id': None})
@@ -1228,6 +1284,9 @@ async def chat_completion(
             message_ids = [{'model_id': model_id, 'message_id': form_data.pop('id', None)}]
 
         user_message = form_data.pop('user_message', None) or form_data.pop('parent_message', None)
+        if any(str(entry.get('model_id', '')).startswith('agent:') for entry in message_ids):
+            if agent_model is None or len(message_ids) != 1 or message_ids[0]['model_id'] != model_id:
+                raise HTTPException(400, 'Use one agent at a time in a conversation')
         chat_id = form_data.pop('chat_id', None) or ''
         chat_variables = form_data.pop('chat_variables', None)
         existing_chat = await Chats.get_chat_by_id(chat_id) if is_saved_chat_id(chat_id) else None
@@ -1255,20 +1314,12 @@ async def chat_completion(
             tool_servers = None
 
         automation_id = form_data.pop('automation_id', None)
-        forced_by_context = bool(automation_id or chat_id.startswith('channel:'))
-        tool_permissions_enabled = (
-            False if forced_by_context else await Config.get('chat.tool_permissions.enable', False)
-        )
-        # Forced legs (automation / channel chat / feature off) pin 'full' for
-        # every column; per-call params only re-derive the non-forced case.
-        forced_tool_approval_full = forced_by_context or not tool_permissions_enabled
-        tool_approval_mode = (
-            'full'
-            if forced_by_context
-            else (form_data.get('params', {}).get('tool_approval_mode') if tool_permissions_enabled else 'full')
-            or 'full'
-        )
+        from open_webui.utils.tool_permissions import resolve_tool_approval_mode
 
+        tool_approval_mode = await resolve_tool_approval_mode(
+            form_data.get('params', {}).get('tool_approval_mode'),
+            is_channel_chat=chat_id.startswith('channel:'),
+        )
         approval_resume = getattr(request.state, 'tool_approval_resume', None)
         metadata = {
             'tool_approval_resume': approval_resume[2]
@@ -1276,6 +1327,7 @@ async def chat_completion(
             else None,
             'user_id': user.id,
             'user_agent': request.headers.get('user-agent', '') or '',
+            'client_ip': request.client.host if request.client else '',
             'internal': getattr(request.state, 'internal', False) is True,
             'chat_id': chat_id,
             'user_message': user_message,
@@ -1298,7 +1350,10 @@ async def chat_completion(
                 'messages': copy.deepcopy(
                     [message for message in form_data.get('messages', []) if message.get('role') == 'system']
                 ),
-                'params': {'system': request_params['system']} if 'system' in request_params else {},
+                'params': {
+                    **({'system': request_params['system']} if 'system' in request_params else {}),
+                    'tool_approval_mode': tool_approval_mode,
+                },
                 'chat_variables': copy.deepcopy(chat_variables),
             },
             'model': model,
@@ -1335,6 +1390,8 @@ async def chat_completion(
         initial_title_generation = None
         if is_new_chat and tasks and TASKS.TITLE_GENERATION in tasks:
             initial_title_generation = tasks.pop(TASKS.TITLE_GENERATION)
+        elif is_new_chat and agent_model:
+            initial_title_generation = False  # Still give agent chats a first-message title.
 
         if metadata.get('chat_id') and user:
             chat_id = metadata['chat_id']
@@ -1526,7 +1583,7 @@ async def chat_completion(
 
                         asyncio.create_task(run_initial_title_generation())
                 else:
-                    chat = await Chats.get_accessible_chat_by_id(chat_id, user, permission='write')
+                    chat = await Chats.get_accessible_chat_by_id(chat_id, user, permission='write', chat=existing_chat)
                     if not chat:
                         raise HTTPException(status_code=404, detail=ERROR_MESSAGES.NOT_FOUND)
 
@@ -1663,9 +1720,24 @@ async def chat_completion(
                         else await Models.get_model_by_id(form_data['model'])
                     )
                     controls = target.params.model_dump().get('model_controls', {}) if target else {}
+                    if model.get('agent'):
+                        controls = model.get('info', {}).get('params', {}).get('model_controls', {})
+                    form_data['params'] = apply_model_controls(
+                        copy.deepcopy(form_data.get('params') or {}),
+                        controls,
+                        model_controls.get(form_data['model'], {}),
+                    )
                     # process_chat_payload re-resolves this call's params, so it applies these afterwards.
                     model_control_args = (controls, model_controls.get(form_data['model'], {}))
                 ctx = None
+                if is_new_chat:
+                    await initialize_terminal_directory(
+                        request, user, metadata, form_data.get('terminal_id'), requested_directory
+                    )
+                if model.get('agent'):
+                    from open_webui.utils.agents.runner import run as run_agent
+
+                    return await run_agent(request, form_data, user, metadata, model)
                 # Saved chats load the message after approved tool calls run, so their results are kept
                 if metadata.get('assistant_message_id') and not is_saved_chat_id(metadata.get('chat_id')):
                     ctx = await build_chat_response_context(request, form_data, user, model, metadata, tasks, [], {})
@@ -1680,7 +1752,6 @@ async def chat_completion(
                     resolved_model_id=resolved_model_id,
                     resolved_model_params=resolved_model_params,
                     resolved_model_capabilities=resolved_model_capabilities,
-                    forced_tool_approval_full=forced_tool_approval_full,
                     model_control_args=model_control_args,
                 )
                 if compaction_state.get('paused'):
@@ -1868,7 +1939,14 @@ async def chat_completion(
 
             if is_saved_chat_id(chat_id):
                 await Chats.upsert_message_to_chat_by_id_and_message_id(
-                    chat_id, assistant_message_id, {'meta': {'task_id': per_model_metadata['task_id']}}, touch=False
+                    chat_id,
+                    assistant_message_id,
+                    {
+                        'meta': {'task_id': per_model_metadata['task_id']},
+                        # Agent models disappear with their terminal.
+                        **({'modelName': agent_model['name']} if agent_model else {}),
+                    },
+                    touch=False,
                 )
 
             # Per-model form_data: own model + restored caller stream surface
@@ -2360,8 +2438,14 @@ async def get_app_config(request: Request):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail='Invalid token',
             )
-        if data is not None and 'id' in data and await is_valid_token(data, request.app.state.redis):
-            user = await Users.get_user_by_id(data['id'])
+        if data is not None and 'id' in data:
+            try:
+                if await is_valid_token(data, request.app.state.redis):
+                    user = await Users.get_user_by_id(data['id'])
+            except HTTPException as e:
+                # A deleted or deactivated account gets the public config
+                if e.status_code != status.HTTP_401_UNAUTHORIZED:
+                    raise
 
     group_defaults = None
     if user is not None and user.role in ('admin', 'user'):
@@ -2410,6 +2494,7 @@ async def get_app_config(request: Request):
         'notifications.enable',
         'chat.context_compaction.enable',
         'chat.tool_permissions.enable',
+        'chat.tool_permissions.auto.enable',
         'web.search.enable',
         'web.search.confirmation.enable',
         'web.search.confirmation.content',
@@ -2446,6 +2531,9 @@ async def get_app_config(request: Request):
         'audio.stt.engine',
         'rag.file.max_size',
         'rag.file.max_count',
+        'rag.full_context',
+        'rag.bypass_embedding_and_retrieval',
+        'rag.full_context_char_threshold',
         'file.image_compression_width',
         'file.image_compression_height',
         'user.permissions',
@@ -2473,6 +2561,8 @@ async def get_app_config(request: Request):
         },
         'features': {
             'slim': USE_SLIM,
+            'auth_sessions': True,
+            'tether': ENABLE_WEBSOCKET_SUPPORT and (UVICORN_WORKERS == 1 or bool(REDIS_URL)),
             # Public: required by login/signup page pre-auth
             'auth': WEBUI_AUTH,
             'auth_trusted_header': bool(WEBUI_AUTH_TRUSTED_EMAIL_HEADER),
@@ -2519,6 +2609,9 @@ async def get_app_config(request: Request):
                     'enable_notifications': config.get('notifications.enable'),
                     'enable_context_compaction': config.get('chat.context_compaction.enable'),
                     'enable_tool_permissions': config.get('chat.tool_permissions.enable'),
+                    'enable_tool_permissions_auto': bool(
+                        config.get('chat.tool_permissions.enable') and config.get('chat.tool_permissions.auto.enable')
+                    ),
                     'enable_web_search': config.get('web.search.enable'),
                     'enable_web_search_confirmation': config.get('web.search.confirmation.enable'),
                     'web_search_confirmation_content': config.get('web.search.confirmation.content'),
@@ -2582,6 +2675,10 @@ async def get_app_config(request: Request):
                 'file': {
                     'max_size': config.get('rag.file.max_size'),
                     'max_count': config.get('rag.file.max_count'),
+                    'full_context': bool(
+                        config.get('rag.full_context') or config.get('rag.bypass_embedding_and_retrieval')
+                    ),
+                    'full_text_char_threshold': config.get('rag.full_context_char_threshold'),
                     'image_compression': {
                         'width': config.get('file.image_compression_width'),
                         'height': config.get('file.image_compression_height'),
