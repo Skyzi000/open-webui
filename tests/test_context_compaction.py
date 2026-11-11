@@ -23,6 +23,7 @@ os.environ['DATA_DIR'] = str(DATA_DIR)
 os.environ['STATIC_DIR'] = str(STATIC_DIR)
 
 compaction = importlib.import_module('open_webui.utils.context_compaction')
+response_utils = importlib.import_module('open_webui.utils.response')
 
 
 def test_strict_usage_uses_only_complete_input_measurements():
@@ -51,6 +52,48 @@ def test_strict_usage_uses_only_complete_input_measurements():
     ]
     for usage in rejected:
         assert compaction._strict_usage_input_tokens(usage) is None
+
+
+_CACHED_USAGE_SHAPES = [
+    (
+        {
+            'prompt_tokens': 49_121,
+            'completion_tokens': 520,
+            'total_tokens': 49_641,
+            'cache_creation_input_tokens': 48_861,
+            'cache_read_input_tokens': 0,
+        },
+        49_641,
+    ),
+    (
+        {
+            'prompt_tokens': 50_858,
+            'completion_tokens': 6_463,
+            'total_tokens': 57_321,
+            'cache_creation_input_tokens': 7_540,
+            'cache_read_input_tokens': 43_058,
+        },
+        57_321,
+    ),
+    (
+        {
+            'prompt_eval_count': 49_121,
+            'eval_count': 520,
+            'cache_creation_input_tokens': 48_861,
+            'cache_read_input_tokens': 0,
+        },
+        49_641,
+    ),
+    (
+        {
+            'input_tokens': 260,
+            'output_tokens': 520,
+            'cache_creation_input_tokens': 48_861,
+            'cache_read_input_tokens': 0,
+        },
+        49_641,
+    ),
+]
 
 
 def test_usage_total_tokens_shares_prefetch_trigger_accounting():
@@ -83,6 +126,8 @@ def test_usage_total_tokens_shares_prefetch_trigger_accounting():
         )
         == 70
     )
+    for raw, expected in _CACHED_USAGE_SHAPES:
+        assert compaction._usage_total_tokens(response_utils.normalize_usage(raw)) == expected
 
 
 def test_compact_functions_record_pending_candidate_only(monkeypatch):
@@ -8838,9 +8883,8 @@ def test_streamed_usage_replaces_snapshot_tokens_per_response(monkeypatch):
 
     asyncio.run(middleware.streaming_chat_response_handler(current['replies'][0], ctx))
 
-    # 70 + 5 + 5 + 10 = 90 cache-inclusive, above the naive total of 80.
     assert state['context_usage'] == {
-        'tokens': 90,
+        'tokens': 80,
         'threshold': 100,
         'soft_threshold': 50,
         'source': 'usage',
@@ -8852,7 +8896,7 @@ def test_streamed_usage_replaces_snapshot_tokens_per_response(monkeypatch):
     ]
     assert numeric_events == [
         {
-            'tokens': 90,
+            'tokens': 80,
             'threshold': 100,
             'soft_threshold': 50,
             'source': 'usage',
@@ -10850,6 +10894,159 @@ def test_non_stream_cache_inclusive_usage_is_adopted(monkeypatch):
     assert completed['cache_creation_input_tokens'] == 10
     assert completed['cache_read_input_tokens'] == 50
     assert compaction._usage_total_tokens(completed) == 90, 'the prefetch gate must see the cache-inclusive total'
+
+
+@pytest.mark.parametrize(('raw', 'tokens'), _CACHED_USAGE_SHAPES)
+def test_cached_prompt_is_counted_once(monkeypatch, raw, tokens):
+    with pytest.MonkeyPatch.context() as inner:
+        streamed = _completed_stream_observe(inner, [{'choices': [], 'usage': dict(raw)}])
+    answered = _non_stream_observe(monkeypatch, raw)
+
+    assert streamed['snapshot']['tokens'] == tokens
+    assert answered['state']['tokens'] == tokens
+
+
+def test_tool_rounds_report_the_last_call_while_the_saved_usage_adds_up(monkeypatch):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'assistant',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 180_000,
+            'token_cap': 180_000,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'assistant', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+
+    def reply(delta, finish_reason, usage):
+        chunk = {'choices': [{'delta': delta, 'finish_reason': finish_reason}], 'usage': usage}
+        return StreamingResponse(_chunk_iter(middleware, [chunk]), media_type='text/event-stream')
+
+    tool_call = {'index': 0, 'id': 'call-1', 'type': 'function', 'function': {'name': 'view_file', 'arguments': '{}'}}
+    first = reply(
+        {'tool_calls': [tool_call]},
+        'tool_calls',
+        {
+            'prompt_tokens': 60_000,
+            'completion_tokens': 900,
+            'total_tokens': 60_900,
+            'cache_creation_input_tokens': 59_000,
+            'cache_read_input_tokens': 0,
+        },
+    )
+    current['replies'] = [
+        reply(
+            {'content': 'done'},
+            'stop',
+            {
+                'prompt_tokens': 70_796,
+                'completion_tokens': 1_065,
+                'total_tokens': 71_861,
+                'cache_creation_input_tokens': 10_000,
+                'cache_read_input_tokens': 60_000,
+            },
+        )
+    ]
+
+    asyncio.run(middleware.streaming_chat_response_handler(first, ctx))
+
+    assert ctx['assistant_message']['usage']['input_tokens'] == 130_796
+    assert state['context_usage']['tokens'] == 71_861
+    assert compaction._usage_total_tokens(ctx['completed_compaction']['usage']) == 71_861
+
+
+@pytest.mark.parametrize(
+    ('raw', 'starts'),
+    [
+        *((raw, False) for raw, _tokens in _CACHED_USAGE_SHAPES),
+        (
+            {
+                'prompt_tokens': 95_000,
+                'completion_tokens': 500,
+                'total_tokens': 95_500,
+                'cache_creation_input_tokens': 5_000,
+                'cache_read_input_tokens': 90_000,
+            },
+            True,
+        ),
+        (
+            {
+                'input_tokens': 260,
+                'output_tokens': 500,
+                'cache_creation_input_tokens': 5_000,
+                'cache_read_input_tokens': 89_740,
+            },
+            True,
+        ),
+    ],
+)
+def test_turn_end_summary_starts_on_the_context_the_reply_used(monkeypatch, raw, starts):
+    middleware = importlib.import_module('open_webui.utils.middleware')
+    turn_end = middleware.background_tasks_handler
+    current, tools = _adoption_stream_harness(monkeypatch, middleware, summaries=[])
+    _turn_end_harness(monkeypatch, middleware)
+    monkeypatch.setattr(middleware, 'background_tasks_handler', turn_end)
+    started = []
+
+    async def completed_turn_checkpoint(*_args, **_kwargs):
+        started.append(True)
+
+    monkeypatch.setattr(compaction, '_completed_turn_checkpoint', completed_turn_checkpoint)
+    metadata = {
+        'chat_id': 'chat',
+        'message_id': 'message',
+        'user_prompt': 'start',
+        'params': {'tool_approval_mode': 'full'},
+        'tools': tools,
+    }
+    state = {
+        'config': {
+            'enable': True,
+            'token_threshold': 180_000,
+            'token_cap': 180_000,
+            'prompt_template': '',
+            'soft_trigger_ratio': 0.5,
+            'transient_patterns': (),
+            'externalized_refs_enable': False,
+        },
+        'checkpoint_messages': [
+            {'id': 'u1', 'role': 'user', 'content': 'start'},
+            {'id': 'message', 'role': 'assistant', 'content': ''},
+        ],
+        'externalized_refs': {'enable': False},
+    }
+    ctx = _adoption_stream_ctx(tools, metadata, state=state)
+    ctx['event_emitter'] = current['emitter']
+    ctx['user'] = SimpleNamespace(id='user-1', role='admin')
+
+    async def run():
+        chunk = {'choices': [{'delta': {'content': 'answer'}, 'finish_reason': 'stop'}], 'usage': dict(raw)}
+        response = StreamingResponse(_chunk_iter(middleware, [chunk]), media_type='text/event-stream')
+        await middleware.streaming_chat_response_handler(response, ctx)
+        task = state.get('completed_prefetch_task')
+        if task is not None:
+            await task
+
+    asyncio.run(run())
+
+    assert len(started) == (1 if starts else 0)
 
 
 async def _allow_chat_creation(*_args, **_kwargs):

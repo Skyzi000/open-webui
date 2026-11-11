@@ -2333,7 +2333,10 @@ def _usage_total_tokens(usage: Any) -> int | None:
         return None
     total = usage.get('total_tokens')
     total = total if _valid_token_number(total) else None
-    if any(key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')):
+    # OpenAI and Ollama prompt counters already include cached tokens; only Anthropic's input_tokens leaves them out.
+    if not any(key in usage for key in ('prompt_tokens', 'prompt_eval_count')) and any(
+        key in usage for key in ('cache_creation_input_tokens', 'cache_read_input_tokens')
+    ):
         parts = [
             usage.get(key, 0)
             for key in (
